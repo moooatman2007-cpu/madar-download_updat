@@ -101,7 +101,9 @@ class GroupsViewModel(
                     groupRepository.observeAllGroupDays(teacher.id)
                 ) { groups, students, days ->
                     val studentCountMap = groups.associate { group ->
-                        group.id to students.count { it.groupId == group.id && it.deletedAt == null }
+                        group.id to students.filter { it.teacherId == teacher.id || it.teacherId.isNullOrBlank() }
+                            .distinctBy { it.studentId }
+                            .count { it.groupId == group.id && it.deletedAt == null }
                     }
                     val daysMap = days.groupBy { it.groupId }.mapValues { entry ->
                         entry.value.map { it.dayOfWeek }

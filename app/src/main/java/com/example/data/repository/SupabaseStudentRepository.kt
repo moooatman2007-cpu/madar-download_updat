@@ -79,14 +79,42 @@ class SupabaseStudentRepository(
                 return@withContext emptyList()
             }
 
-            // Stale-While-Revalidate: save fetched into Room preserving local group assignments
+            // Safe Offline Sync Reconciliation with Outbox protection inside Transaction
+            val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
             val cachedEntities = studentDao?.getAllStudentsSync(teacherId) ?: emptyList()
             val localGroupMap = cachedEntities.associate { it.studentId to it.groupId }
+
+            val pendingOperations = outboxDao?.getUnsyncedOperationsForTeacher(teacherId) ?: emptyList()
+            val protectedStudentIds = pendingOperations
+                .filter { it.entityType.equals("STUDENT", ignoreCase = true) }
+                .map { it.entityId }
+                .toSet()
+
+            val fetchedIds = fetched.map { it.studentId }.toSet()
+
             val entitiesToUpsert = fetched.map { s ->
                 val localGroupId = localGroupMap[s.studentId] ?: s.groupId
                 s.copy(groupId = localGroupId).toEntity()
             }
-            studentDao?.upsertStudents(entitiesToUpsert)
+
+            if (db != null) {
+                db.withTransaction {
+                    studentDao?.upsertStudents(entitiesToUpsert)
+                    for (cached in cachedEntities) {
+                        if (!fetchedIds.contains(cached.studentId) && !protectedStudentIds.contains(cached.studentId)) {
+                            studentDao?.deleteStudentById(teacherId, cached.studentId)
+                        }
+                    }
+                }
+            } else {
+                studentDao?.upsertStudents(entitiesToUpsert)
+                for (cached in cachedEntities) {
+                    if (!fetchedIds.contains(cached.studentId) && !protectedStudentIds.contains(cached.studentId)) {
+                        studentDao?.deleteStudentById(teacherId, cached.studentId)
+                    }
+                }
+            }
+
             val mergedList = fetched.map { s ->
                 val localGroupId = localGroupMap[s.studentId] ?: s.groupId
                 s.copy(groupId = localGroupId)
@@ -96,6 +124,7 @@ class SupabaseStudentRepository(
             mergedList
         } catch (e: Exception) {
             e.printStackTrace()
+            // Network failure fallback: preserve local cache without modifying or deleting anything
             val cachedEntities = studentDao?.getAllStudentsSync(teacherId) ?: emptyList()
             val cached = if (cachedEntities.isNotEmpty()) cachedEntities.map { it.toDomain() } else _students.value
             _students.value = cached

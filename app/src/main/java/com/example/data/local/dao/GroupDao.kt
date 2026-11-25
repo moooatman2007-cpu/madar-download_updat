@@ -42,4 +42,7 @@ interface GroupDao {
 
     @Query("DELETE FROM groups WHERE teacher_id = :teacherId")
     suspend fun deleteGroupsByTeacher(teacherId: String)
+
+    @Query("SELECT * FROM groups WHERE teacher_id = :teacherId")
+    suspend fun getGroupsSync(teacherId: String): List<GroupEntity>
 }

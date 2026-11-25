@@ -65,15 +65,48 @@ class SupabaseGroupRepository(
             }.decodeList<SupabaseGroupDayDto>()
 
             if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
+                val db = try { com.example.data.local.DatabaseProvider.getDatabase() } catch (_: Exception) { null }
+                val cachedGroups = groupDao?.getGroupsSync(teacherId) ?: emptyList()
+                val pendingOps = outboxDao?.getUnsyncedOperationsForTeacher(teacherId) ?: emptyList()
+                val protectedGroupIds = pendingOps
+                    .filter { it.entityType.equals("GROUP", ignoreCase = true) || it.entityType.equals("GROUP_DAYS", ignoreCase = true) }
+                    .map { it.entityId }
+                    .toSet()
+
+                val remoteGroupIds = remoteGroups.map { it.id }.toSet()
                 val groupEntities = remoteGroups.map { it.toDomain().toEntity() }
                 val groupDayEntities = remoteGroupDays.map { it.toDomain().toEntity() }
 
-                for (g in groupEntities) {
-                    groupDao?.insertGroup(g)
-                }
-                groupDayDao?.deleteGroupDaysByTeacher(teacherId)
-                if (groupDayEntities.isNotEmpty()) {
-                    groupDayDao?.insertGroupDays(groupDayEntities)
+                if (db != null) {
+                    db.withTransaction {
+                        for (g in groupEntities) {
+                            groupDao?.insertGroup(g)
+                        }
+                        groupDayDao?.deleteGroupDaysByTeacher(teacherId)
+                        if (groupDayEntities.isNotEmpty()) {
+                            groupDayDao?.insertGroupDays(groupDayEntities)
+                        }
+                        for (cached in cachedGroups) {
+                            if (!remoteGroupIds.contains(cached.id) && !protectedGroupIds.contains(cached.id)) {
+                                groupDayDao?.deleteGroupDays(cached.id)
+                                groupDao?.deleteGroup(cached)
+                            }
+                        }
+                    }
+                } else {
+                    for (g in groupEntities) {
+                        groupDao?.insertGroup(g)
+                    }
+                    groupDayDao?.deleteGroupDaysByTeacher(teacherId)
+                    if (groupDayEntities.isNotEmpty()) {
+                        groupDayDao?.insertGroupDays(groupDayEntities)
+                    }
+                    for (cached in cachedGroups) {
+                        if (!remoteGroupIds.contains(cached.id) && !protectedGroupIds.contains(cached.id)) {
+                            groupDayDao?.deleteGroupDays(cached.id)
+                            groupDao?.deleteGroup(cached)
+                        }
+                    }
                 }
             }
             Result.success(Unit)
