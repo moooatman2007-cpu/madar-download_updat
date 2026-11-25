@@ -12,11 +12,11 @@ fun parseEnvFile(file: File): Map<String, String> {
   val envMap = mutableMapOf<String, String>()
   if (file.exists() && file.isFile) {
     for (line in file.readLines()) {
-      val trimmed = line.trim()
+      val trimmed = line.trim().removePrefix("\uFEFF")
       if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
         val splitIndex = trimmed.indexOf('=')
         if (splitIndex != -1) {
-          val key = trimmed.substring(0, splitIndex).trim()
+          val key = trimmed.substring(0, splitIndex).trim().removePrefix("\uFEFF")
           val value = trimmed.substring(splitIndex + 1).trim().trim('"', '\'')
           if (key.isNotEmpty()) {
             envMap[key] = value

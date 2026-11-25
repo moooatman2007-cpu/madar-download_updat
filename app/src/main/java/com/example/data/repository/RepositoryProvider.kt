@@ -53,6 +53,10 @@ object RepositoryProvider {
         SupabaseNotificationEventRepository()
     }
 
+    val subscriptionRepository: SubscriptionRepository by lazy {
+        SupabaseSubscriptionRepository()
+    }
+
     val syncManager: com.example.data.sync.SyncManager by lazy {
         val context = com.example.data.local.DatabaseProvider.context
         val outboxDao = try { com.example.data.local.DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null }

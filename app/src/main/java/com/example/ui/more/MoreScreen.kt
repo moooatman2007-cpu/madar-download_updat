@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.WorkspacePremium
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -96,6 +97,7 @@ fun MoreScreen(
     onLogoutSuccess: () -> Unit = {},
     onNavigateToGroups: () -> Unit = {},
     onNavigateToGrades: () -> Unit = {},
+    onNavigateToSubscriptions: () -> Unit = {},
     viewModel: MoreViewModel = viewModel(),
     modifier: Modifier = Modifier
 ) {
@@ -225,6 +227,21 @@ fun MoreScreen(
                             iconColor = Color(0xFF2563EB),
                             onClick = onNavigateToProfile,
                             testTag = "setting_account"
+                        )
+                        HorizontalDivider(
+                            color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
+                            modifier = Modifier.padding(horizontal = Dimens.Spacing16)
+                        )
+
+                        // 1.b الباقات والاشتراكات
+                        SettingMenuItem(
+                            icon = Icons.Default.WorkspacePremium,
+                            title = "الباقات والاشتراكات",
+                            subtitle = "إدارة الباقة الحالية وطلبات الترقية",
+                            iconBg = Color(0xFFFEF3C7),
+                            iconColor = Color(0xFFD97706),
+                            onClick = onNavigateToSubscriptions,
+                            testTag = "setting_subscriptions"
                         )
                         HorizontalDivider(
                             color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),

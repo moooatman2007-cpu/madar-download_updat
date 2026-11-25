@@ -14,7 +14,10 @@ data class Teacher(
     @SerialName("center_name") val centerName: String? = null,
     @SerialName("educational_stage") val educationalStage: String? = null,
     @SerialName("theme_mode") val themeMode: String = "SYSTEM",
-    @SerialName("account_status") val accountStatus: String = "pending"
+    @SerialName("account_status") val accountStatus: String = "pending",
+    @SerialName("plan_id") val planId: String? = null,
+    @SerialName("subscription_status") val subscriptionStatus: String? = null,
+    @SerialName("subscription_end_date") val subscriptionEndDate: String? = null
 )
 
 @Serializable

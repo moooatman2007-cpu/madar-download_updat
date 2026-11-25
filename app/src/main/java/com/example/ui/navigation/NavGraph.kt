@@ -55,6 +55,7 @@ import com.example.ui.attendance.FastAttendanceScreen
 import com.example.ui.start_lesson.StartLessonScreen
 import com.example.ui.groups.GroupsScreen
 import com.example.ui.grades.GradesScreen
+import com.example.ui.subscription.SubscriptionPlansScreen
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.status.SessionStatus
 
@@ -450,7 +451,17 @@ fun MainAppNavigation(
                     },
                     onNavigateToGrades = {
                         navController.navigate(Screen.Grades.route)
+                    },
+                    onNavigateToSubscriptions = {
+                        navController.navigate(Screen.SubscriptionPlans.route)
                     }
+                )
+            }
+
+            // Subscription Plans Destination
+            composable(Screen.SubscriptionPlans.route) {
+                SubscriptionPlansScreen(
+                    onNavigateBack = { navController.popBackStack() }
                 )
             }
 

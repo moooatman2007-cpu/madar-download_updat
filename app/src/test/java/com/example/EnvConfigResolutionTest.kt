@@ -15,11 +15,11 @@ class EnvConfigResolutionTest {
     private fun parseEnvContent(content: String): Map<String, String> {
         val envMap = mutableMapOf<String, String>()
         for (line in content.lines()) {
-            val trimmed = line.trim()
+            val trimmed = line.trim().removePrefix("\uFEFF")
             if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
                 val splitIndex = trimmed.indexOf('=')
                 if (splitIndex != -1) {
-                    val key = trimmed.substring(0, splitIndex).trim()
+                    val key = trimmed.substring(0, splitIndex).trim().removePrefix("\uFEFF")
                     val value = trimmed.substring(splitIndex + 1).trim().trim('"', '\'')
                     if (key.isNotEmpty()) {
                         envMap[key] = value
@@ -200,7 +200,37 @@ class EnvConfigResolutionTest {
             hasEnvFile = false,
             hasSystemEnvUrl = false
         )
- 
+
         assertTrue(errors.any { it.contains("Missing root '.env' file") })
+    }
+
+    @Test
+    fun testUtf8BomHandledCorrectlyInEnvContent() {
+        val envContentWithBom = "\uFEFFSUPABASE_URL=https://oknpfsvmopdsgsfbbdcs.supabase.co\nSUPABASE_PUBLISHABLE_KEY=dummy-key\nSUPABASE_EDGE_FUNCTION_URL=https://oknpfsvmopdsgsfbbdcs.supabase.co/functions/v1"
+        val envMap = parseEnvContent(envContentWithBom)
+
+        assertTrue("SUPABASE_URL key must be present without BOM corruption", envMap.containsKey("SUPABASE_URL"))
+        assertEquals("https://oknpfsvmopdsgsfbbdcs.supabase.co", envMap["SUPABASE_URL"])
+        assertEquals("dummy-key", envMap["SUPABASE_PUBLISHABLE_KEY"])
+        assertEquals("https://oknpfsvmopdsgsfbbdcs.supabase.co/functions/v1", envMap["SUPABASE_EDGE_FUNCTION_URL"])
+
+        val errors = validateConfig(
+            supabaseUrl = envMap["SUPABASE_URL"] ?: "",
+            supabaseKey = envMap["SUPABASE_PUBLISHABLE_KEY"] ?: "",
+            supabaseEdgeUrl = envMap["SUPABASE_EDGE_FUNCTION_URL"] ?: "",
+            hasEnvFile = true
+        )
+        assertTrue("Expected 0 errors with BOM when valid config provided, but found: $errors", errors.isEmpty())
+    }
+
+    @Test
+    fun testStandardEnvContentWithoutBomHandledCorrectly() {
+        val standardEnvContent = "SUPABASE_URL=https://oknpfsvmopdsgsfbbdcs.supabase.co\nSUPABASE_PUBLISHABLE_KEY=dummy-key\nSUPABASE_EDGE_FUNCTION_URL=https://oknpfsvmopdsgsfbbdcs.supabase.co/functions/v1"
+        val envMap = parseEnvContent(standardEnvContent)
+
+        assertTrue("SUPABASE_URL key must be present", envMap.containsKey("SUPABASE_URL"))
+        assertEquals("https://oknpfsvmopdsgsfbbdcs.supabase.co", envMap["SUPABASE_URL"])
+        assertEquals("dummy-key", envMap["SUPABASE_PUBLISHABLE_KEY"])
+        assertEquals("https://oknpfsvmopdsgsfbbdcs.supabase.co/functions/v1", envMap["SUPABASE_EDGE_FUNCTION_URL"])
     }
 }

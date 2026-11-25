@@ -145,10 +145,16 @@ class SupabaseEdgeFunctionUrlTest {
     @Test
     fun testLiveGetEdgeFunctionUrlProvidesExpectedEndpoints() {
         // Tests the actual method called by repositories and viewmodels
+        // Asserts against the actual single source of truth in SupabaseClientProvider
         val workerUrl = SupabaseClientProvider.getEdgeFunctionUrl("studentmanager-notification-worker")
         val sessionUrl = SupabaseClientProvider.getEdgeFunctionUrl("waha-session")
 
         val expectedBase = "${SupabaseClientProvider.baseUrl}/functions/v1"
+
+        // Guarantee that the baseUrl is not blank, not a placeholder, and starts with https://
+        org.junit.Assert.assertTrue("SupabaseClientProvider.baseUrl must start with https://", SupabaseClientProvider.baseUrl.startsWith("https://"))
+        org.junit.Assert.assertFalse("SupabaseClientProvider.baseUrl cannot be placeholder", SupabaseClientProvider.baseUrl.contains("placeholder", ignoreCase = true))
+
         assertEquals(
             "$expectedBase/studentmanager-notification-worker",
             workerUrl
@@ -157,5 +163,11 @@ class SupabaseEdgeFunctionUrlTest {
             "$expectedBase/waha-session",
             sessionUrl
         )
+
+        // Strict validation that constructed live endpoints are valid and non-placeholder
+        org.junit.Assert.assertTrue("workerUrl must start with expectedBase", workerUrl.startsWith(expectedBase))
+        org.junit.Assert.assertTrue("sessionUrl must start with expectedBase", sessionUrl.startsWith(expectedBase))
+        org.junit.Assert.assertFalse("workerUrl must not contain placeholder", workerUrl.contains("placeholder", ignoreCase = true))
+        org.junit.Assert.assertFalse("sessionUrl must not contain placeholder", sessionUrl.contains("placeholder", ignoreCase = true))
     }
 }
