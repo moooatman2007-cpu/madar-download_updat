@@ -32,10 +32,18 @@ import com.example.ui.theme.MidarBlue
 @Composable
 fun StatusScreen(
     status: String,
-    onLogout: () -> Unit
+    onLogout: () -> Unit,
+    logoutError: String? = null,
+    onDismissLogoutError: () -> Unit = {},
+    onRetrySync: () -> Unit = {},
+    onForceLogout: () -> Unit = {}
 ) {
     BackHandler {
-        onLogout()
+        if (logoutError != null) {
+            onDismissLogoutError()
+        } else {
+            onLogout()
+        }
     }
 
     val context = LocalContext.current
@@ -171,5 +179,37 @@ fun StatusScreen(
                 )
             }
         }
+    }
+
+    if (logoutError != null) {
+        AlertDialog(
+            onDismissRequest = onDismissLogoutError,
+            title = { Text("تعذر إتمام تسجيل الخروج", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(text = logoutError, style = MaterialTheme.typography.bodyMedium)
+                    OutlinedButton(
+                        onClick = onRetrySync,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("إعادة محاولة المزامنة")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onForceLogout,
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.testTag("status_force_logout_button")
+                ) {
+                    Text("خروج قسري")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismissLogoutError) {
+                    Text("إلغاء")
+                }
+            }
+        )
     }
 }

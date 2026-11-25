@@ -1,5 +1,6 @@
 package com.example.ui.auth
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -431,6 +432,16 @@ fun AuthScreen(
 
     val isLoginValid = remember(emailOrIdentifier, password) {
         emailOrIdentifier.isNotBlank() && password.isNotBlank()
+    }
+
+    BackHandler(enabled = showResetDialog || authMode == AuthMode.SIGNUP) {
+        if (showResetDialog) {
+            showResetDialog = false
+            resetEmailError = null
+        } else if (authMode == AuthMode.SIGNUP) {
+            authMode = AuthMode.LOGIN
+            viewModel.clearMessages()
+        }
     }
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {

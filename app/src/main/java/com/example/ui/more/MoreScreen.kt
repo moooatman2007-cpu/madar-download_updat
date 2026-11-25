@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.MenuBook
+import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Groups
@@ -46,6 +47,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -53,6 +55,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import android.content.Context
+import com.example.BuildConfig
+import com.example.data.repository.NotificationPreferences
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -91,6 +95,7 @@ fun MoreScreen(
     onNavigateToProfile: () -> Unit = {},
     onLogoutSuccess: () -> Unit = {},
     onNavigateToGroups: () -> Unit = {},
+    onNavigateToGrades: () -> Unit = {},
     viewModel: MoreViewModel = viewModel(),
     modifier: Modifier = Modifier
 ) {
@@ -186,7 +191,7 @@ fun MoreScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "معلم • Student Manager",
+                                text = "معلم • مدار للمدرس",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Color.White.copy(alpha = 0.7f)
                             )
@@ -233,15 +238,7 @@ fun MoreScreen(
                             subtitle = if (uiState.grades.isNotEmpty()) "الصفوف المسجلة (${uiState.grades.size})" else "إضافة صف أو تعديله",
                             iconBg = Color(0xFFEDE9FE),
                             iconColor = Color(0xFF7C3AED),
-                            onClick = {
-                                val gradeNames = uiState.grades.joinToString(" • ") { it.name }
-                                val msg = if (gradeNames.isNotBlank()) {
-                                    "الصفوف المسجلة: $gradeNames"
-                                } else {
-                                    "لا توجد صفوف مسجلة حاليًا"
-                                }
-                                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                            },
+                            onClick = onNavigateToGrades,
                             testTag = "setting_grades"
                         )
                         HorizontalDivider(
@@ -264,16 +261,25 @@ fun MoreScreen(
                             modifier = Modifier.padding(horizontal = Dimens.Spacing16)
                         )
 
-                        // 3. الإشعارات
+                        // 3. الإشعارات والرسوم الافتراضية
+                        val notifSubtitle = buildString {
+                            val activeAlerts = listOf(
+                                uiState.notificationPrefs.attendanceRemindersEnabled,
+                                uiState.notificationPrefs.absenceAlertsEnabled,
+                                uiState.notificationPrefs.monthlyReportAlertsEnabled
+                            ).count { it }
+                            append("التنبيهات المفعّلة ($activeAlerts/3)")
+                            if (uiState.defaultMonthlyFee > 0.0) {
+                                append(" • الاشتراك الافتراضي ${uiState.defaultMonthlyFee.toLong()} ج.م")
+                            }
+                        }
                         SettingMenuItem(
                             icon = Icons.Default.Notifications,
-                            title = "الإشعارات",
-                            subtitle = "تفضيلات التنبيهات",
+                            title = "الإشعارات والرسوم الافتراضية",
+                            subtitle = notifSubtitle,
                             iconBg = Color(0xFFFEF3C7),
                             iconColor = Color(0xFFD97706),
-                            onClick = {
-                                Toast.makeText(context, "إعدادات الإشعارات جاهزة للمرحلة الثانية", Toast.LENGTH_SHORT).show()
-                            },
+                            onClick = viewModel::openNotificationsDialog,
                             testTag = "setting_notifications"
                         )
                         HorizontalDivider(
@@ -304,12 +310,10 @@ fun MoreScreen(
                         SettingMenuItem(
                             icon = Icons.Default.Language,
                             title = "اللغة",
-                            subtitle = "العربية",
+                            subtitle = "العربية (الواجهة الافتراضية RTL)",
                             iconBg = Color(0xFFCCFBF1),
                             iconColor = Color(0xFF0D9488),
-                            onClick = {
-                                Toast.makeText(context, "اللغة الحالية: العربية (RTL)", Toast.LENGTH_SHORT).show()
-                            },
+                            onClick = viewModel::openLanguageDialog,
                             testTag = "setting_language"
                         )
                         HorizontalDivider(
@@ -317,15 +321,23 @@ fun MoreScreen(
                             modifier = Modifier.padding(horizontal = Dimens.Spacing16)
                         )
 
-                        // 6. اختبار اتصال WhatsApp Server (زر مؤقت)
+                        // 6. حالة المزامنة المحلية (Outbox)
+                        val totalUnsynced = uiState.pendingOutboxCount + uiState.failedOutboxCount
+                        val outboxSubtitle = when {
+                            uiState.failedOutboxCount > 0 ->
+                                "يوجد ${uiState.failedOutboxCount} عملية فاشلة و ${uiState.pendingOutboxCount} قيد الانتظار"
+                            uiState.pendingOutboxCount > 0 ->
+                                "يوجد ${uiState.pendingOutboxCount} عملية بانتظار المزامنة مع الخادم"
+                            else -> "جميع البيانات متزامنة مع الخادم ✓"
+                        }
                         SettingMenuItem(
-                            icon = Icons.Default.Notifications,
-                            title = "اختبار اتصال WhatsApp Server",
-                            subtitle = "فحص حالة خادم الواتساب عبر Supabase Edge Function",
-                            iconBg = Color(0xFFDCFCE7),
-                            iconColor = Color(0xFF16A34A),
-                            onClick = viewModel::testWahaConnection,
-                            testTag = "setting_waha_test"
+                            icon = Icons.Default.CloudSync,
+                            title = "حالة المزامنة",
+                            subtitle = outboxSubtitle,
+                            iconBg = if (totalUnsynced > 0) Color(0xFFFEF3C7) else Color(0xFFDCFCE7),
+                            iconColor = if (totalUnsynced > 0) Color(0xFFD97706) else Color(0xFF16A34A),
+                            onClick = viewModel::openOutboxDialog,
+                            testTag = "setting_outbox_sync"
                         )
                         HorizontalDivider(
                             color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
@@ -373,7 +385,7 @@ fun MoreScreen(
                         SettingMenuItem(
                             icon = Icons.Default.Info,
                             title = "حول التطبيق",
-                            subtitle = "الإصدار 1.0.0",
+                            subtitle = "الإصدار ${BuildConfig.VERSION_NAME}",
                             iconBg = Color(0xFFEFF6FF),
                             iconColor = Color(0xFF3B82F6),
                             onClick = viewModel::openAboutDialog,
@@ -402,7 +414,7 @@ fun MoreScreen(
             item {
                 Spacer(modifier = Modifier.height(Dimens.Spacing8))
                 Text(
-                    text = "Student Manager • v1.0.0",
+                    text = "مدار للمدرس • v${BuildConfig.VERSION_NAME}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                     textAlign = TextAlign.Center,
@@ -546,57 +558,316 @@ fun MoreScreen(
             )
         }
 
+        // Notifications & Default Fee Dialog
+        if (uiState.showNotificationsDialog) {
+            var attendanceReminders by remember(uiState.notificationPrefs) {
+                mutableStateOf(uiState.notificationPrefs.attendanceRemindersEnabled)
+            }
+            var absenceAlerts by remember(uiState.notificationPrefs) {
+                mutableStateOf(uiState.notificationPrefs.absenceAlertsEnabled)
+            }
+            var monthlyReportAlerts by remember(uiState.notificationPrefs) {
+                mutableStateOf(uiState.notificationPrefs.monthlyReportAlertsEnabled)
+            }
+            var feeInput by remember(uiState.defaultMonthlyFee) {
+                mutableStateOf(
+                    if (uiState.defaultMonthlyFee > 0.0) {
+                        if (uiState.defaultMonthlyFee % 1.0 == 0.0) {
+                            uiState.defaultMonthlyFee.toLong().toString()
+                        } else {
+                            uiState.defaultMonthlyFee.toString()
+                        }
+                    } else ""
+                )
+            }
+            var feeError by remember { mutableStateOf<String?>(null) }
+
+            AlertDialog(
+                onDismissRequest = viewModel::closeNotificationsDialog,
+                title = {
+                    Text(
+                        text = "الإشعارات والرسوم الافتراضية",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+                    )
+                },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing10)) {
+                        NotificationToggleRow(
+                            title = "تذكير الحضور اليومي",
+                            checked = attendanceReminders,
+                            onCheckedChange = { attendanceReminders = it }
+                        )
+                        NotificationToggleRow(
+                            title = "تنبيهات الغياب لأولياء الأمور",
+                            checked = absenceAlerts,
+                            onCheckedChange = { absenceAlerts = it }
+                        )
+                        NotificationToggleRow(
+                            title = "إشعارات التقارير الشهرية",
+                            checked = monthlyReportAlerts,
+                            onCheckedChange = { monthlyReportAlerts = it }
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                        OutlinedTextField(
+                            value = feeInput,
+                            onValueChange = {
+                                feeInput = it
+                                feeError = null
+                            },
+                            label = { Text("الاشتراك الشهري الافتراضي (ج.م)") },
+                            placeholder = { Text("مثال: 150") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                            singleLine = true,
+                            isError = feeError != null,
+                            supportingText = feeError?.let { { Text(it) } },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("default_monthly_fee_input")
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val trimmed = feeInput.trim()
+                            val parsed = if (trimmed.isEmpty()) 0.0 else trimmed.toDoubleOrNull()
+                            if (parsed == null || parsed < 0.0) {
+                                feeError = "يرجى إدخال مبلغ صحيح"
+                            } else {
+                                viewModel.saveNotificationAndFeeSettings(
+                                    prefs = NotificationPreferences(
+                                        attendanceRemindersEnabled = attendanceReminders,
+                                        absenceAlertsEnabled = absenceAlerts,
+                                        monthlyReportAlertsEnabled = monthlyReportAlerts
+                                    ),
+                                    defaultFee = parsed
+                                )
+                            }
+                        },
+                        modifier = Modifier.testTag("save_notifications_settings_button")
+                    ) {
+                        Text("حفظ")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = viewModel::closeNotificationsDialog) {
+                        Text("إلغاء")
+                    }
+                },
+                modifier = Modifier.testTag("notifications_settings_dialog")
+            )
+        }
+
+        // Language Dialog
+        if (uiState.showLanguageDialog) {
+            AlertDialog(
+                onDismissRequest = viewModel::closeLanguageDialog,
+                title = {
+                    Text(
+                        text = "لغة التطبيق",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+                    )
+                },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing8)) {
+                        Text(
+                            text = "اللغة المعتمدة حالياً هي العربية (من اليمين إلى اليسار RTL).",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = "جميع القوائم والتقارير والتنبيهات مصممة باللغة العربية الكاملة.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = viewModel::closeLanguageDialog) {
+                        Text("حسناً")
+                    }
+                },
+                modifier = Modifier.testTag("language_info_dialog")
+            )
+        }
+
+        // Outbox Status & Retry Dialog
+        if (uiState.showOutboxDialog) {
+            AlertDialog(
+                onDismissRequest = viewModel::closeOutboxDialog,
+                title = {
+                    Text(
+                        text = "حالة المزامنة المحلية",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+                    )
+                },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing10)) {
+                        Text(
+                            text = "بانتظار المزامنة: ${uiState.pendingOutboxCount} • فاشلة: ${uiState.failedOutboxCount}",
+                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                        if (uiState.unsyncedOutboxItems.isEmpty()) {
+                            Text(
+                                text = "لا توجد أي عمليات معلقة. جميع التعديلات محفوظة ومتزامنة مع الخادم.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            uiState.unsyncedOutboxItems.take(5).forEach { op ->
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(8.dp)) {
+                                        Text(
+                                            text = "${op.entityType} • ${op.operationType} (${op.status})",
+                                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                        if (!op.lastError.isNullOrBlank()) {
+                                            Text(
+                                                text = op.lastError,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.error,
+                                                maxLines = 2
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            if (uiState.unsyncedOutboxItems.size > 5) {
+                                Text(
+                                    text = "و ${uiState.unsyncedOutboxItems.size - 5} عمليات أخرى...",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
+                        if (!uiState.outboxMessage.isNullOrBlank()) {
+                            Text(
+                                text = uiState.outboxMessage!!,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = PrimaryIndigo
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    if (uiState.unsyncedOutboxItems.isNotEmpty()) {
+                        Button(
+                            onClick = viewModel::retryPendingOutbox,
+                            enabled = !uiState.isRetryingOutbox,
+                            modifier = Modifier.testTag("retry_outbox_button")
+                        ) {
+                            Text(if (uiState.isRetryingOutbox) "جاري المحاولة..." else "إعادة المحاولة الآن")
+                        }
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = viewModel::closeOutboxDialog) {
+                        Text("إغلاق")
+                    }
+                },
+                modifier = Modifier.testTag("outbox_status_dialog")
+            )
+        }
+
         // Logout Confirmation Dialog
         if (uiState.showLogoutDialog) {
             AlertDialog(
                 onDismissRequest = viewModel::closeLogoutDialog,
                 title = {
                     Text(
-                        text = "تسجيل الخروج",
+                        text = if (uiState.requireForceLogoutConfirm) "بيانات غير متزامنة" else "تسجيل الخروج",
                         style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
                     )
                 },
                 text = {
-                    Column {
+                    Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing10)) {
                         Text(
-                            text = "هل أنت متأكد أنك تريد تسجيل الخروج؟",
+                            text = if (uiState.requireForceLogoutConfirm) {
+                                "يوجد لديك تغييرات محلية لم تكتمل مزامنتها مع الخادم بعد. يمكنك إعادة محاولة المزامنة الآن أو تأكيد الخروج القسري مع حذف البيانات المحلية غير المرسلة."
+                            } else {
+                                "هل أنت متأكد أنك تريد تسجيل الخروج؟"
+                            },
                             style = MaterialTheme.typography.bodyMedium
                         )
                         if (uiState.logoutError != null) {
-                            Spacer(modifier = Modifier.height(Dimens.Spacing12))
                             Text(
                                 text = uiState.logoutError!!,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
+                        if (uiState.requireForceLogoutConfirm) {
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.retryPendingOutbox()
+                                },
+                                enabled = !uiState.isLoggingOut && !uiState.isRetryingOutbox,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("logout_retry_sync_button")
+                            ) {
+                                Text("إعادة محاولة المزامنة الآن")
+                            }
+                        }
                     }
                 },
                 confirmButton = {
-                    Button(
-                        onClick = {
-                            viewModel.performLogout(onSuccess = onLogoutSuccess)
-                        },
-                        enabled = !uiState.isLoggingOut,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = MaterialTheme.colorScheme.onError
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.testTag("confirm_logout_button")
-                    ) {
-                        if (uiState.isLoggingOut) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                color = MaterialTheme.colorScheme.onError,
-                                strokeWidth = 2.dp
+                    if (uiState.requireForceLogoutConfirm) {
+                        Button(
+                            onClick = {
+                                viewModel.confirmForceLogout(onSuccess = onLogoutSuccess)
+                            },
+                            enabled = !uiState.isLoggingOut,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.testTag("force_logout_button")
+                        ) {
+                            if (uiState.isLoggingOut) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    color = MaterialTheme.colorScheme.onError,
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(Dimens.Spacing8))
+                            }
+                            Text(
+                                text = "تأكيد الخروج القسري",
+                                fontWeight = FontWeight.Bold
                             )
-                            Spacer(modifier = Modifier.width(Dimens.Spacing8))
                         }
-                        Text(
-                            text = "تسجيل الخروج",
-                            fontWeight = FontWeight.Bold
-                        )
+                    } else {
+                        Button(
+                            onClick = {
+                                viewModel.performLogout(onSuccess = onLogoutSuccess)
+                            },
+                            enabled = !uiState.isLoggingOut,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.testTag("confirm_logout_button")
+                        ) {
+                            if (uiState.isLoggingOut) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    color = MaterialTheme.colorScheme.onError,
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(Dimens.Spacing8))
+                            }
+                            Text(
+                                text = "تسجيل الخروج",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 },
                 dismissButton = {
@@ -1439,6 +1710,33 @@ fun ThemeOptionRow(
             text = title,
             style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurface
+        )
+    }
+}
+
+@Composable
+private fun NotificationToggleRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = Dimens.Spacing4),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f)
+        )
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange
         )
     }
 }

@@ -599,4 +599,115 @@ class RoomMigrationTest {
 
         roomDb.close()
     }
+
+    private fun createV5Database(): SupportSQLiteDatabase {
+        val v4Db = createV4Database()
+        v4Db.execSQL("CREATE INDEX IF NOT EXISTS `index_students_teacher_id` ON `students` (`teacher_id`)")
+        v4Db.execSQL("CREATE INDEX IF NOT EXISTS `index_students_teacher_id_grade_id` ON `students` (`teacher_id`, `grade_id`)")
+        v4Db.version = 5
+        return v4Db
+    }
+
+    private fun createV6Database(): SupportSQLiteDatabase {
+        val v5Db = createV5Database()
+        AppDatabase.MIGRATION_5_6.migrate(v5Db)
+        v5Db.version = 6
+        return v5Db
+    }
+
+    @Test
+    fun testMigration5To6AddsHomeworkTableWithIndicesAndPreservesData() = runBlocking {
+        val v5Db = createV5Database()
+        v5Db.execSQL(
+            "INSERT INTO students (student_id, student_code, full_name, grade_id, parent_phone, has_whatsapp, teacher_id) " +
+                "VALUES ('s_v5', 'ST-500', 'طالب الخامس', 'g1', '01012345678', 1, 't5')"
+        )
+        v5Db.close()
+
+        val roomDb = Room.databaseBuilder(context, AppDatabase::class.java, testDbName)
+            .addMigrations(AppDatabase.MIGRATION_5_6, AppDatabase.MIGRATION_6_7)
+            .build()
+
+        val student = roomDb.studentDao().getStudentByIdSync("t5", "s_v5")
+        assertNotNull(student)
+        assertEquals("طالب الخامس", student?.fullName)
+
+        // Verify homework table & queries work after 5->6->7 migration
+        roomDb.homeworkDao().upsertSingleHomework(
+            com.example.data.local.entity.HomeworkEntity(
+                homeworkId = "hw_1",
+                studentId = "s_v5",
+                teacherId = "t5",
+                date = "2026-10-01",
+                title = "واجب تجريبي",
+                status = "COMPLETED",
+                note = null,
+                createdAt = 1000L,
+                updatedAt = 1000L
+            )
+        )
+        val homeworks = roomDb.homeworkDao().getHomeworkByStudentSync("t5", "s_v5")
+        assertEquals(1, homeworks.size)
+        assertEquals("واجب تجريبي", homeworks[0].title)
+
+        roomDb.close()
+    }
+
+    @Test
+    fun testMigration6To7AddsGroupsGroupDaysAndGroupIdColumnsPreservingData() = runBlocking {
+        val v6Db = createV6Database()
+        v6Db.execSQL(
+            "INSERT INTO students (student_id, student_code, full_name, grade_id, parent_phone, has_whatsapp, teacher_id) " +
+                "VALUES ('s_v6', 'ST-600', 'طالب السادس', 'g1', '01012345678', 1, 't6')"
+        )
+        v6Db.execSQL(
+            "INSERT INTO attendance (attendance_id, student_id, teacher_id, date, status, note, created_at, updated_at) " +
+                "VALUES ('att_v6', 's_v6', 't6', '2026-10-02', 'PRESENT', null, 1000, 1000)"
+        )
+        v6Db.close()
+
+        val roomDb = Room.databaseBuilder(context, AppDatabase::class.java, testDbName)
+            .addMigrations(AppDatabase.MIGRATION_6_7)
+            .build()
+
+        val student = roomDb.studentDao().getStudentByIdSync("t6", "s_v6")
+        assertNotNull(student)
+        assertEquals(null, student?.groupId)
+
+        val att = roomDb.attendanceDao().getAttendanceByStudentSync("t6", "s_v6")
+        assertEquals(1, att.size)
+        assertEquals(null, att[0].groupId)
+
+        // Insert a Group + GroupDay to confirm V7 schema integrity
+        roomDb.groupDao().insertGroup(
+            com.example.data.local.entity.GroupEntity(
+                id = "grp_v7",
+                teacherId = "t6",
+                gradeId = "g1",
+                name = "مجموعة العصر",
+                active = true,
+                startTime = "16:00",
+                endTime = "17:00",
+                capacity = 20,
+                location = "قاعة 1",
+                createdAt = 1000L,
+                updatedAt = 1000L
+            )
+        )
+        roomDb.groupDayDao().insertGroupDays(
+            listOf(
+                com.example.data.local.entity.GroupDayEntity(
+                    teacherId = "t6",
+                    groupId = "grp_v7",
+                    dayOfWeek = "SATURDAY"
+                )
+            )
+        )
+        val loadedGroup = roomDb.groupDao().getGroupById("t6", "grp_v7")
+        assertNotNull(loadedGroup)
+        assertEquals("مجموعة العصر", loadedGroup?.name)
+
+        roomDb.close()
+    }
 }
+

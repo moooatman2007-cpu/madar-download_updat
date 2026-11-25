@@ -6,14 +6,17 @@ import com.example.core.model.AttendanceStatus
 import com.example.core.model.BatchAttendanceItemDto
 import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Grade
+import com.example.core.model.Group
 import com.example.core.model.HomeworkStatus
 import com.example.core.model.NotificationEvent
 import com.example.core.model.NotificationEventType
 import com.example.core.model.Student
+import com.example.data.SupabaseClientProvider
 import com.example.data.repository.AttendanceRepository
 import com.example.data.repository.ExamRepository
 import com.example.data.repository.HomeworkRepository
 import com.example.data.repository.GradeRepository
+import com.example.data.repository.GroupRepository
 import com.example.data.repository.NotificationEventCreationResult
 import com.example.data.repository.NotificationEventRepository
 import com.example.data.repository.NotificationWorkerResult
@@ -23,8 +26,11 @@ import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
 import com.example.data.repository.SupabaseGradeRepository
 import com.example.data.repository.SupabaseStudentRepository
+import com.example.data.repository.TeacherRepository
 import com.example.ui.attendance.ScanFeedback
 import com.example.ui.attendance.ScanResultType
+import io.github.jan.supabase.auth.auth
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -34,6 +40,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.LocalDate
@@ -54,24 +63,24 @@ enum class StartLessonStep {
 }
 
 data class StudentRecitationInput(
-    val title: String = "تسميع الحصة",
+    val title: String = "",
     val content: String = "",
-    val scoreStr: String = "10",
+    val scoreStr: String = "",
     val maxScoreStr: String = "10",
     val note: String = "",
     val isRecorded: Boolean = false
 )
 
 data class StudentHomeworkInput(
-    val title: String = "واجب الحصة",
+    val title: String = "",
     val status: HomeworkStatus = HomeworkStatus.COMPLETED,
     val note: String = "",
     val isRecorded: Boolean = false
 )
 
 data class StudentExamInput(
-    val examName: String = "امتحان الحصة",
-    val scoreStr: String = "10",
+    val examName: String = "",
+    val scoreStr: String = "",
     val maxScoreStr: String = "10",
     val note: String = "",
     val isRecorded: Boolean = false
@@ -146,8 +155,12 @@ data class NotificationEventCreationSummary(
 data class StartLessonUiState(
     val currentStep: StartLessonStep = StartLessonStep.SELECT_GROUP,
     val grades: List<Grade> = emptyList(),
+    val groups: List<Group> = emptyList(),
+    val groupStudentCounts: Map<String, Int> = emptyMap(),
     val selectedGradeId: String? = null,
     val selectedGradeName: String = "",
+    val selectedGroupId: String? = null,
+    val selectedGroupName: String = "",
     val studentsInGroup: List<Student> = emptyList(),
     val presentStudentIds: Set<String> = emptySet(),
     val absentStudentIds: Set<String> = emptySet(),
@@ -195,7 +208,10 @@ class StartLessonViewModel(
     private val homeworkRepository: HomeworkRepository = RepositoryProvider.homeworkRepository,
     private val examRepository: ExamRepository = RepositoryProvider.examRepository,
     private val paymentRepository: PaymentRepository = RepositoryProvider.paymentRepository,
-    private val notificationEventRepository: NotificationEventRepository = RepositoryProvider.notificationEventRepository
+    private val notificationEventRepository: NotificationEventRepository = RepositoryProvider.notificationEventRepository,
+    private val groupRepository: GroupRepository = RepositoryProvider.groupRepository,
+    private val teacherRepository: TeacherRepository = RepositoryProvider.teacherRepository,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(StartLessonUiState())
@@ -209,29 +225,74 @@ class StartLessonViewModel(
         loadMonthlyPayments()
     }
 
+    private suspend fun resolveTeacherId(): String? {
+        return SupabaseClientProvider.mockTeacherId
+            ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+            ?: try { teacherRepository.fetchCurrentTeacher()?.id } catch (_: Exception) { null }
+    }
+
     private fun loadData() {
         viewModelScope.launch {
-            try {
-                (gradeRepository as? SupabaseGradeRepository)?.fetchGrades()
-                (studentRepository as? SupabaseStudentRepository)?.fetchStudents()
-            } catch (_: Exception) {}
+            val teacherId = resolveTeacherId()
+            launch {
+                try { (gradeRepository as? SupabaseGradeRepository)?.fetchGrades() } catch (_: Exception) {}
+            }
+            launch {
+                try { (studentRepository as? SupabaseStudentRepository)?.fetchStudents() } catch (_: Exception) {}
+            }
+            if (!teacherId.isNullOrBlank()) {
+                launch {
+                    try { groupRepository.refreshGroups(teacherId) } catch (_: Exception) {}
+                }
+            }
         }
 
         viewModelScope.launch {
+            val teacherId = resolveTeacherId()
+            val groupsFlow = if (!teacherId.isNullOrBlank()) {
+                groupRepository.observeGroups(teacherId)
+                    .map { list -> list.filter { it.active } }
+                    .onStart { emit(emptyList()) }
+                    .catch { emit(emptyList()) }
+            } else {
+                flowOf(emptyList())
+            }
+
             combine(
                 gradeRepository.getGrades(),
-                studentRepository.getStudents()
-            ) { grades, students ->
+                studentRepository.getStudents(),
+                groupsFlow
+            ) { grades, students, groups ->
                 val active = students.filter { it.deletedAt == null }
+                Triple(grades, active, groups)
+            }.collect { (grades, active, groups) ->
                 allStudentsList = active
-                studentCodeMap = active.associateBy { it.studentCode.trim().lowercase() }
-                Pair(grades, active)
-            }.collect { (grades, active) ->
+                studentCodeMap = active
+                    .filter { it.studentCode.isNotBlank() }
+                    .associateBy { it.studentCode.trim().lowercase() }
+                val countsByGroup = active
+                    .filter { !it.groupId.isNullOrBlank() }
+                    .groupingBy { it.groupId!! }
+                    .eachCount()
+
                 _uiState.update { state ->
-                    val gradeName = state.selectedGradeId?.let { id -> grades.firstOrNull { it.id == id }?.name } ?: ""
+                    val selectedGroup = state.selectedGroupId?.let { id -> groups.firstOrNull { it.id == id } }
+                    val resolvedGradeId = selectedGroup?.gradeId ?: state.selectedGradeId
+                    val gradeName = resolvedGradeId?.let { id -> grades.firstOrNull { it.id == id }?.name } ?: state.selectedGradeName
+                    val groupName = selectedGroup?.name ?: state.selectedGroupName
+                    val updatedStudents = when {
+                        state.selectedGroupId != null -> active.filter { it.groupId == state.selectedGroupId }
+                        state.selectedGradeId != null -> active.filter { it.gradeId == state.selectedGradeId }
+                        else -> state.studentsInGroup
+                    }
                     state.copy(
                         grades = grades,
-                        selectedGradeName = gradeName
+                        groups = groups,
+                        groupStudentCounts = countsByGroup,
+                        selectedGradeId = resolvedGradeId,
+                        selectedGradeName = gradeName,
+                        selectedGroupName = groupName,
+                        studentsInGroup = updatedStudents
                     )
                 }
             }
@@ -249,15 +310,79 @@ class StartLessonViewModel(
         }
     }
 
-    fun selectGrade(gradeId: String) {
-        val grade = _uiState.value.grades.firstOrNull { it.id == gradeId }
-        val students = allStudentsList.filter { it.gradeId == gradeId }
-        val recMap = students.associate { it.studentId to StudentRecitationInput() }
-        val hwMap = students.associate { it.studentId to StudentHomeworkInput() }
-        val exMap = students.associate { it.studentId to StudentExamInput() }
+    fun selectGroup(groupId: String) {
+        val state = _uiState.value
+        val group = state.groups.firstOrNull { it.id == groupId }
+        val gradeId = group?.gradeId
+        val gradeName = gradeId?.let { gid -> state.grades.firstOrNull { it.id == gid }?.name } ?: ""
+        val students = allStudentsList.filter { it.groupId == groupId }
+        val isSameGroup = state.selectedGroupId == groupId
+
+        val recMap = if (isSameGroup && state.recitationsMap.isNotEmpty()) {
+            students.associate { it.studentId to (state.recitationsMap[it.studentId] ?: StudentRecitationInput()) }
+        } else {
+            students.associate { it.studentId to StudentRecitationInput() }
+        }
+        val hwMap = if (isSameGroup && state.homeworkMap.isNotEmpty()) {
+            students.associate { it.studentId to (state.homeworkMap[it.studentId] ?: StudentHomeworkInput()) }
+        } else {
+            students.associate { it.studentId to StudentHomeworkInput() }
+        }
+        val exMap = if (isSameGroup && state.examsMap.isNotEmpty()) {
+            students.associate { it.studentId to (state.examsMap[it.studentId] ?: StudentExamInput()) }
+        } else {
+            students.associate { it.studentId to StudentExamInput() }
+        }
 
         _uiState.update {
             it.copy(
+                selectedGroupId = groupId,
+                selectedGroupName = group?.name ?: "المجموعة",
+                selectedGradeId = gradeId,
+                selectedGradeName = gradeName,
+                studentsInGroup = students,
+                recitationsMap = recMap,
+                homeworkMap = hwMap,
+                examsMap = exMap,
+                presentStudentIds = if (isSameGroup) it.presentStudentIds else emptySet(),
+                absentStudentIds = if (isSameGroup) it.absentStudentIds else emptySet(),
+                lateStudentIds = if (isSameGroup) it.lateStudentIds else emptySet(),
+                excusedStudentIds = if (isSameGroup) it.excusedStudentIds else emptySet(),
+                attendanceStatusMap = if (isSameGroup) it.attendanceStatusMap else emptyMap(),
+                recentScannedStudents = if (isSameGroup) it.recentScannedStudents else emptyList(),
+                scanFeedback = null
+            )
+        }
+        if (!isSameGroup) {
+            loadExistingAttendanceForGroup(groupId)
+        }
+    }
+
+    fun selectGrade(gradeId: String) {
+        val state = _uiState.value
+        val grade = state.grades.firstOrNull { it.id == gradeId }
+        val students = allStudentsList.filter { it.gradeId == gradeId }
+        val isSameGrade = state.selectedGroupId == null && state.selectedGradeId == gradeId
+        val recMap = if (isSameGrade && state.recitationsMap.isNotEmpty()) {
+            students.associate { it.studentId to (state.recitationsMap[it.studentId] ?: StudentRecitationInput()) }
+        } else {
+            students.associate { it.studentId to StudentRecitationInput() }
+        }
+        val hwMap = if (isSameGrade && state.homeworkMap.isNotEmpty()) {
+            students.associate { it.studentId to (state.homeworkMap[it.studentId] ?: StudentHomeworkInput()) }
+        } else {
+            students.associate { it.studentId to StudentHomeworkInput() }
+        }
+        val exMap = if (isSameGrade && state.examsMap.isNotEmpty()) {
+            students.associate { it.studentId to (state.examsMap[it.studentId] ?: StudentExamInput()) }
+        } else {
+            students.associate { it.studentId to StudentExamInput() }
+        }
+
+        _uiState.update {
+            it.copy(
+                selectedGroupId = null,
+                selectedGroupName = "",
                 selectedGradeId = gradeId,
                 selectedGradeName = grade?.name ?: "المجموعة",
                 studentsInGroup = students,
@@ -266,7 +391,45 @@ class StartLessonViewModel(
                 examsMap = exMap
             )
         }
-        loadExistingAttendanceForGrade(gradeId)
+        if (!isSameGrade) {
+            loadExistingAttendanceForGrade(gradeId)
+        }
+    }
+
+    fun loadExistingAttendanceForGroup(groupId: String) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingAttendance = true) }
+            try {
+                val state = _uiState.value
+                val date = state.currentDate
+                val records = attendanceRepository.getAttendanceForDateAndGroup(date, groupId)
+                val groupStudentIds = allStudentsList.filter { it.groupId == groupId }.map { it.studentId }.toSet()
+                val relevantRecords = records.filter { groupStudentIds.contains(it.studentId) }
+
+                val loadedPresent = relevantRecords.filter { it.status == AttendanceStatus.PRESENT || it.status == AttendanceStatus.LATE }
+                    .map { it.studentId }.toSet()
+                val loadedAbsent = relevantRecords.filter { it.status == AttendanceStatus.ABSENT }
+                    .map { it.studentId }.toSet()
+                val loadedLate = relevantRecords.filter { it.status == AttendanceStatus.LATE }
+                    .map { it.studentId }.toSet()
+                val loadedExcused = relevantRecords.filter { it.status == AttendanceStatus.EXCUSED }
+                    .map { it.studentId }.toSet()
+                val statusMap = relevantRecords.associate { it.studentId to it.status }
+
+                _uiState.update { currentState ->
+                    currentState.copy(
+                        presentStudentIds = loadedPresent,
+                        absentStudentIds = loadedAbsent,
+                        lateStudentIds = loadedLate,
+                        excusedStudentIds = loadedExcused,
+                        attendanceStatusMap = statusMap,
+                        isLoadingAttendance = false
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(isLoadingAttendance = false) }
+            }
+        }
     }
 
     fun loadExistingAttendanceForGrade(gradeId: String) {
@@ -387,7 +550,12 @@ class StartLessonViewModel(
             _uiState.update { it.copy(scanFeedback = ScanFeedback(null, ScanResultType.NOT_FOUND, trimmed)) }
             return
         }
-        if (student.gradeId != state.selectedGradeId) {
+        val inWrongScope = if (state.selectedGroupId != null) {
+            student.groupId != state.selectedGroupId
+        } else {
+            student.gradeId != state.selectedGradeId
+        }
+        if (inWrongScope) {
             _uiState.update { it.copy(scanFeedback = ScanFeedback(student, ScanResultType.WRONG_GROUP, trimmed)) }
             return
         }
@@ -430,7 +598,25 @@ class StartLessonViewModel(
         _uiState.update { state ->
             val map = state.recitationsMap.toMutableMap()
             val current = map[studentId] ?: StudentRecitationInput()
-            map[studentId] = update(current)
+            val updated = update(current)
+            val resolved = if (updated.isRecorded != current.isRecorded) {
+                updated
+            } else {
+                val hasInput = updated.title.isNotBlank() ||
+                    updated.content.isNotBlank() ||
+                    updated.scoreStr.isNotBlank() ||
+                    updated.note.isNotBlank()
+                updated.copy(isRecorded = hasInput)
+            }
+            map[studentId] = resolved
+            state.copy(recitationsMap = map)
+        }
+    }
+
+    fun clearRecitationInput(studentId: String) {
+        _uiState.update { state ->
+            val map = state.recitationsMap.toMutableMap()
+            map[studentId] = StudentRecitationInput()
             state.copy(recitationsMap = map)
         }
     }
@@ -444,7 +630,22 @@ class StartLessonViewModel(
         _uiState.update { state ->
             val map = state.homeworkMap.toMutableMap()
             val current = map[studentId] ?: StudentHomeworkInput()
-            map[studentId] = update(current)
+            val updated = update(current)
+            val resolved = if (updated.isRecorded != current.isRecorded) {
+                updated
+            } else {
+                val hasInput = updated.title.isNotBlank() || updated.note.isNotBlank()
+                updated.copy(isRecorded = current.isRecorded || hasInput)
+            }
+            map[studentId] = resolved
+            state.copy(homeworkMap = map)
+        }
+    }
+
+    fun clearHomeworkInput(studentId: String) {
+        _uiState.update { state ->
+            val map = state.homeworkMap.toMutableMap()
+            map[studentId] = StudentHomeworkInput()
             state.copy(homeworkMap = map)
         }
     }
@@ -458,7 +659,24 @@ class StartLessonViewModel(
         _uiState.update { state ->
             val map = state.examsMap.toMutableMap()
             val current = map[studentId] ?: StudentExamInput()
-            map[studentId] = update(current)
+            val updated = update(current)
+            val resolved = if (updated.isRecorded != current.isRecorded) {
+                updated
+            } else {
+                val hasInput = updated.examName.isNotBlank() ||
+                    updated.scoreStr.isNotBlank() ||
+                    updated.note.isNotBlank()
+                updated.copy(isRecorded = hasInput)
+            }
+            map[studentId] = resolved
+            state.copy(examsMap = map)
+        }
+    }
+
+    fun clearExamInput(studentId: String) {
+        _uiState.update { state ->
+            val map = state.examsMap.toMutableMap()
+            map[studentId] = StudentExamInput()
             state.copy(examsMap = map)
         }
     }
@@ -486,10 +704,10 @@ class StartLessonViewModel(
         val state = _uiState.value
         if (state.isSaving) return
 
-        // 1. Validate Recitation scores before persistence
+        // 1. Validate Recitation scores before persistence (only for explicitly recorded entries)
         if (!state.skipRecitation) {
             for ((studentId, rec) in state.recitationsMap) {
-                if (rec.content.isNotBlank() || rec.title.isNotBlank()) {
+                if (rec.isRecorded) {
                     val maxScore = rec.maxScoreStr.trim().toDoubleOrNull()?.takeIf { it > 0.0 } ?: 10.0
                     val score = rec.scoreStr.trim().toDoubleOrNull()
                     if (score == null || score < 0.0 || score > maxScore) {
@@ -497,7 +715,7 @@ class StartLessonViewModel(
                         _uiState.update {
                             it.copy(
                                 isSaving = false,
-                                errorMessage = "درجة التسميع غير صالحة لـ $studentName: يجب أن تكون بين 0 و $maxScore"
+                                errorMessage = "درجة التسميع غير صالحة لـ $studentName: يجب إدخال درجة بين 0 و $maxScore"
                             )
                         }
                         return
@@ -506,10 +724,10 @@ class StartLessonViewModel(
             }
         }
 
-        // 2. Validate Exam scores before persistence
+        // 2. Validate Exam scores before persistence (only for explicitly recorded entries)
         if (!state.skipExam) {
             for ((studentId, ex) in state.examsMap) {
-                if (ex.scoreStr.isNotBlank()) {
+                if (ex.isRecorded) {
                     val maxScore = ex.maxScoreStr.trim().toDoubleOrNull()?.takeIf { it > 0.0 } ?: 10.0
                     val score = ex.scoreStr.trim().toDoubleOrNull()
                     if (score == null || score < 0.0 || score > maxScore) {
@@ -517,7 +735,7 @@ class StartLessonViewModel(
                         _uiState.update {
                             it.copy(
                                 isSaving = false,
-                                errorMessage = "درجة الامتحان غير صالحة لـ $studentName: يجب أن تكون بين 0 و $maxScore"
+                                errorMessage = "درجة الامتحان غير صالحة لـ $studentName: يجب إدخال درجة بين 0 و $maxScore"
                             )
                         }
                         return
@@ -532,7 +750,7 @@ class StartLessonViewModel(
             try {
                 val date = state.currentDate
                 val students = state.studentsInGroup
-                val groupId: String? = null
+                val groupId: String? = state.selectedGroupId
 
                 // Identify students who are absent
                 val absentStudentIds = students
@@ -581,24 +799,24 @@ class StartLessonViewModel(
                     }
                 }
 
-                // 2. Record Recitations if not skipped (concurrent execution for high performance)
+                // 2. Record Recitations if not skipped and explicitly recorded by teacher
                 val recitationItems = mutableListOf<LessonSavedItem>()
                 if (!state.skipRecitation) {
                     coroutineScope {
                         val deferredRecitations = state.recitationsMap.mapNotNull { (studentId, rec) ->
-                            if (rec.content.isNotBlank() || rec.title.isNotBlank()) {
+                            if (rec.isRecorded) {
                                 val maxScore = rec.maxScoreStr.trim().toDoubleOrNull()?.takeIf { it > 0.0 } ?: 10.0
                                 val score = rec.scoreStr.trim().toDoubleOrNull()
                                 if (score != null && score >= 0.0 && score <= maxScore) {
-                                    async(Dispatchers.IO) {
+                                    async(ioDispatcher) {
                                         val recRes = recitationRepository.addRecitation(
                                             studentId = studentId,
                                             date = date,
-                                            title = rec.title.ifBlank { "تسميع الحصة" },
-                                            content = rec.content,
+                                            title = rec.title.trim().ifBlank { "تسميع الحصة" },
+                                            content = rec.content.trim(),
                                             score = score,
                                             maxScore = maxScore,
-                                            note = rec.note.ifBlank { null }
+                                            note = rec.note.trim().ifBlank { null }
                                         )
                                         recRes.getOrNull()?.let { syncRes ->
                                             val savedRec = syncRes.data
@@ -618,53 +836,55 @@ class StartLessonViewModel(
                     }
                 }
 
-                // 3. Record Homework if not skipped (concurrent execution)
+                // 3. Record Homework if not skipped and explicitly recorded by teacher
                 val homeworkItems = mutableListOf<LessonSavedItem>()
                 if (!state.skipHomework) {
                     coroutineScope {
-                        val deferredHomework = state.homeworkMap.map { (studentId, hw) ->
-                            async(Dispatchers.IO) {
-                                val hwRes = homeworkRepository.addHomework(
-                                    studentId = studentId,
-                                    date = date,
-                                    title = hw.title,
-                                    status = hw.status,
-                                    note = hw.note.ifBlank { null }
-                                )
-                                hwRes.getOrNull()?.let { syncRes ->
-                                    val savedHw = syncRes.data
-                                    val isOnline = syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD && isServerUUID(savedHw.homeworkId)
-                                    LessonSavedItem(
+                        val deferredHomework = state.homeworkMap.mapNotNull { (studentId, hw) ->
+                            if (hw.isRecorded) {
+                                async(ioDispatcher) {
+                                    val hwRes = homeworkRepository.addHomework(
                                         studentId = studentId,
-                                        sourceId = savedHw.homeworkId,
-                                        eventType = NotificationEventType.HOMEWORK,
-                                        isConfirmedOnline = isOnline
+                                        date = date,
+                                        title = hw.title.trim().ifBlank { "واجب الحصة" },
+                                        status = hw.status,
+                                        note = hw.note.trim().ifBlank { null }
                                     )
+                                    hwRes.getOrNull()?.let { syncRes ->
+                                        val savedHw = syncRes.data
+                                        val isOnline = syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD && isServerUUID(savedHw.homeworkId)
+                                        LessonSavedItem(
+                                            studentId = studentId,
+                                            sourceId = savedHw.homeworkId,
+                                            eventType = NotificationEventType.HOMEWORK,
+                                            isConfirmedOnline = isOnline
+                                        )
+                                    }
                                 }
-                            }
+                            } else null
                         }
                         homeworkItems.addAll(deferredHomework.awaitAll().filterNotNull())
                     }
                 }
 
-                // 4. Record Exam if not skipped (concurrent execution)
+                // 4. Record Exam if not skipped and explicitly recorded by teacher
                 val examItems = mutableListOf<LessonSavedItem>()
                 if (!state.skipExam) {
                     coroutineScope {
                         val deferredExams = state.examsMap.mapNotNull { (studentId, ex) ->
-                            if (ex.scoreStr.isNotBlank()) {
+                            if (ex.isRecorded && ex.scoreStr.isNotBlank()) {
                                 val maxScore = ex.maxScoreStr.trim().toDoubleOrNull()?.takeIf { it > 0.0 } ?: 10.0
                                 val score = ex.scoreStr.trim().toDoubleOrNull()
                                 if (score != null && score >= 0.0 && score <= maxScore) {
-                                    async(Dispatchers.IO) {
+                                    async(ioDispatcher) {
                                         val exRes = examRepository.addExam(
                                             studentId = studentId,
                                             date = date,
-                                            examName = ex.examName,
-                                            subject = state.selectedGradeName,
+                                            examName = ex.examName.trim().ifBlank { "امتحان الحصة" },
+                                            subject = state.selectedGradeName.ifBlank { state.selectedGroupName },
                                             score = score,
                                             maxScore = maxScore,
-                                            note = ex.note.ifBlank { null }
+                                            note = ex.note.trim().ifBlank { null }
                                         )
                                         exRes.getOrNull()?.let { syncRes ->
                                             val savedEx = syncRes.data
@@ -799,7 +1019,7 @@ class StartLessonViewModel(
 
                 val results = coroutineScope {
                     eligibleItems.map { item ->
-                        async(Dispatchers.IO) {
+                        async(ioDispatcher) {
                             if (item.eventType == NotificationEventType.RECITATION) {
                                 Pair(item, notificationEventRepository.approveRecitation(item.sourceId))
                             } else {
@@ -884,7 +1104,18 @@ class StartLessonViewModel(
 
                 val totalEligibleEvents = createdCount + alreadyExistsCount
                 if (totalEligibleEvents > 0) {
-                    val workerResult = notificationEventRepository.triggerNotificationWorker("ABSENCE")
+                    val distinctEventTypes = eligibleItems
+                        .filter { item ->
+                            failedList.none { it.sourceId == item.sourceId && it.eventType == item.eventType }
+                        }
+                        .map { it.eventType }
+                        .distinct()
+                    val workerEventTypeArg: String? = if (distinctEventTypes.size == 1) {
+                        distinctEventTypes.first().name
+                    } else {
+                        null
+                    }
+                    val workerResult = notificationEventRepository.triggerNotificationWorker(workerEventTypeArg)
                     when (workerResult) {
                         is NotificationWorkerResult.Success -> {
                             _uiState.update {

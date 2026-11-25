@@ -15,10 +15,14 @@ import com.example.data.sync.OutboxSyncScheduler
 import androidx.room.withTransaction
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
+import io.github.jan.supabase.postgrest.query.Order
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.OffsetDateTime
 import java.util.UUID
@@ -92,6 +96,56 @@ class SupabasePaymentRepository(
             android.util.Log.e("SupabasePaymentRepo", "Network call failed, falling back to local cache: ${e.message}")
             val cached = paymentDao?.getPaymentsByMonthSync(teacherId, year, month) ?: emptyList()
             cached.map { it.toDomain() }
+        }
+    }
+
+    override fun observePaymentsByStudent(studentId: String): Flow<List<LessonPayment>> {
+        val user = try { client.auth.currentUserOrNull() } catch (_: Exception) { null }
+        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+        if (teacherId.isNullOrBlank()) {
+            return flow { emit(emptyList()) }
+        }
+
+        if (paymentDao != null) {
+            return channelFlow {
+                launch(Dispatchers.IO) {
+                    getPaymentsForStudentHistory(studentId)
+                }
+                paymentDao.getPaymentsByStudent(teacherId, studentId)
+                    .map { list -> list.map { it.toDomain() } }
+                    .collect { send(it) }
+            }.flowOn(Dispatchers.IO)
+        }
+
+        return flow {
+            emit(getPaymentsForStudentHistory(studentId))
+        }.flowOn(Dispatchers.IO)
+    }
+
+    override suspend fun getPaymentsForStudentHistory(studentId: String): List<LessonPayment> = withContext(Dispatchers.IO) {
+        val user = try { client.auth.currentUserOrNull() } catch (_: Exception) { null }
+        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext emptyList()
+        try {
+            val remoteList = client.postgrest["lesson_payments"]
+                .select {
+                    filter {
+                        eq("teacher_id", teacherId)
+                        eq("student_id", studentId)
+                    }
+                    order("year", order = Order.DESCENDING)
+                    order("month", order = Order.DESCENDING)
+                }
+                .decodeList<SupabaseLessonPaymentDto>()
+                .map { it.toLessonPayment() }
+
+            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
+                paymentDao?.upsertPayments(remoteList.map { it.toEntity() })
+            }
+            remoteList.sortedWith(compareByDescending<LessonPayment> { it.year }.thenByDescending { it.month })
+        } catch (_: Exception) {
+            val cached = paymentDao?.getPaymentsByStudentSync(teacherId, studentId) ?: emptyList()
+            cached.map { it.toDomain() }
+                .sortedWith(compareByDescending<LessonPayment> { it.year }.thenByDescending { it.month })
         }
     }
 

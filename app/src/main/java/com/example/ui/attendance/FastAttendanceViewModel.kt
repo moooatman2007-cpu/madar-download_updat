@@ -213,7 +213,9 @@ class FastAttendanceViewModel(
     }
 
     private fun updateLookupMaps(activeStudents: List<Student>, selectedGradeId: String?, selectedGroupId: String?) {
-        studentCodeMap = activeStudents.associateBy { it.studentCode.trim().lowercase() }
+        studentCodeMap = activeStudents
+            .filter { it.studentCode.isNotBlank() }
+            .associateBy { it.studentCode.trim().lowercase() }
         val base = when {
             selectedGroupId != null -> activeStudents.filter { it.groupId == selectedGroupId }
             selectedGradeId != null -> activeStudents.filter { it.gradeId == selectedGradeId }
@@ -465,7 +467,6 @@ class FastAttendanceViewModel(
         val state = _uiState.value
         // O(1) Instant lookup
         val foundGlobalStudent = studentCodeMap[code.lowercase()]
-        System.err.println("DEBUG_SCAN: code='$code' found=$foundGlobalStudent keys=${studentCodeMap.keys}")
         if (foundGlobalStudent == null) {
             updateScanFeedback(ScanFeedback(
                 student = null,

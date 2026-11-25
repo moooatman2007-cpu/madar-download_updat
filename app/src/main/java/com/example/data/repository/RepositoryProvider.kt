@@ -14,7 +14,11 @@ object RepositoryProvider {
     }
 
     val settingsRepository: SettingsRepository by lazy {
-        MockSettingsRepository()
+        try {
+            DataStoreSettingsRepository(com.example.data.local.DatabaseProvider.context)
+        } catch (_: IllegalStateException) {
+            MockSettingsRepository()
+        }
     }
 
     val attendanceRepository: AttendanceRepository by lazy {

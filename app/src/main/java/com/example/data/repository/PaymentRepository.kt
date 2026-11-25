@@ -2,6 +2,7 @@ package com.example.data.repository
 
 import com.example.core.model.LessonPayment
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 
 interface PaymentRepository {
     /**
@@ -13,6 +14,16 @@ interface PaymentRepository {
      * Direct suspend function to fetch all payments for the month in one single query.
      */
     suspend fun getMonthlyPaymentsList(year: Int, month: Int): List<LessonPayment>
+
+    /**
+     * Observes all recorded monthly payments for a specific student ordered newest-first.
+     */
+    fun observePaymentsByStudent(studentId: String): Flow<List<LessonPayment>> = flowOf(emptyList())
+
+    /**
+     * Fetches all recorded monthly payments for a specific student ordered newest-first.
+     */
+    suspend fun getPaymentsForStudentHistory(studentId: String): List<LessonPayment> = emptyList()
 
     /**
      * Retrieves the payment record for a single student for a specific month and year.

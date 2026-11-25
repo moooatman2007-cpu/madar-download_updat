@@ -28,6 +28,9 @@ interface OutboxDao {
     @Query("SELECT * FROM outbox_operations WHERE teacher_id = :teacherId AND (status IS NULL OR status != 'SYNCED') ORDER BY created_at ASC")
     suspend fun getUnsyncedOperationsForTeacher(teacherId: String): List<OutboxEntity>
 
+    @Query("SELECT * FROM outbox_operations WHERE teacher_id = :teacherId AND (status IS NULL OR status != 'SYNCED') ORDER BY created_at ASC")
+    fun observeUnsyncedOperationsForTeacher(teacherId: String): Flow<List<OutboxEntity>>
+
     @Query("SELECT * FROM outbox_operations WHERE id = :id")
     suspend fun getOperationById(id: String): OutboxEntity?
 

@@ -1110,6 +1110,7 @@ class ReportsViewModel(
                 var alreadyExists = 0
                 var failed = 0
                 var skipped = 0
+                val succeededEventTypes = mutableSetOf<NotificationEventType>()
 
                 for (r in recipients) {
                     if (r.parentPhone.isNullOrBlank() || r.sourceId.isBlank() || r.studentId.isBlank()) {
@@ -1146,8 +1147,14 @@ class ReportsViewModel(
                     }
 
                     when (val result = notificationEventRepository.createNotificationEvent(domainEvent)) {
-                        is NotificationEventCreationResult.Created -> created++
-                        is NotificationEventCreationResult.AlreadyExists -> alreadyExists++
+                        is NotificationEventCreationResult.Created -> {
+                            created++
+                            succeededEventTypes.add(r.notificationType)
+                        }
+                        is NotificationEventCreationResult.AlreadyExists -> {
+                            alreadyExists++
+                            succeededEventTypes.add(r.notificationType)
+                        }
                         is NotificationEventCreationResult.Failed -> failed++
                     }
                 }
@@ -1172,7 +1179,8 @@ class ReportsViewModel(
 
                 val totalEligible = created + alreadyExists
                 if (totalEligible > 0) {
-                    val workerResult = notificationEventRepository.triggerNotificationWorker("MONTHLY_REPORT")
+                    val workerEventType = succeededEventTypes.singleOrNull()?.name
+                    val workerResult = notificationEventRepository.triggerNotificationWorker(workerEventType)
                     when (workerResult) {
                         is NotificationWorkerResult.Success -> {
                             _notificationMessage.value = if (created > 0) {
@@ -1317,13 +1325,13 @@ class ReportsViewModel(
             allHomework.filter { it.date in startDateStr..endDateStr }
         } else allHomework
 
-        val recitationsInScope = (if (recsFilteredByDate.isNotEmpty()) recsFilteredByDate else allRecitations)
+        val recitationsInScope = recsFilteredByDate
             .filter { it.studentId in studentIdsInScope }
 
-        val examsInScope = (if (examsFilteredByDate.isNotEmpty()) examsFilteredByDate else allExams)
+        val examsInScope = examsFilteredByDate
             .filter { it.studentId in studentIdsInScope }
 
-        val homeworkInScope = (if (hwFilteredByDate.isNotEmpty()) hwFilteredByDate else allHomework)
+        val homeworkInScope = hwFilteredByDate
             .filter { it.studentId in studentIdsInScope }
 
         val evaluatedStudents = studentsInScope.map { s ->
@@ -1372,9 +1380,6 @@ class ReportsViewModel(
             }
             if (hwCount < MIN_HOMEWORK_REQUIRED) {
                 unqualifiedReasons.add("واجبات: $hwCount/$MIN_HOMEWORK_REQUIRED")
-            }
-            if (attCount < 3) {
-                unqualifiedReasons.add("الحضور: $attCount/3")
             }
             if (attCount < 3) {
                 unqualifiedReasons.add("الحضور: $attCount/3")

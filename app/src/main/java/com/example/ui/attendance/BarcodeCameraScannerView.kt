@@ -21,21 +21,28 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.FlashlightOff
+import androidx.compose.material.icons.filled.FlashlightOn
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -91,7 +98,7 @@ fun BarcodeCameraScannerView(
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "نحتاج إلى السماح باستخدام الكاميرا\nلاستخدام الحضور بالباركود.",
+                    text = "نحتاج إلى السماح باستخدام الكاميرا\nلمسح رمز QR أو الباركود.",
                     textAlign = TextAlign.Center,
                     style = MaterialTheme.typography.bodyMedium.copy(
                         fontSize = 15.sp,
@@ -117,35 +124,38 @@ private fun CameraPreviewScanner(
     onBarcodeScanned: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val currentOnBarcodeScanned by rememberUpdatedState(onBarcodeScanned)
     val coroutineScope = rememberCoroutineScope()
 
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
-    // Configure ML Kit once specifically for Code 128 (and standard formats) with optimized speed
+    // Configure ML Kit once for both 2D QR Codes and 1D Code 128 barcodes
     val options = remember {
         BarcodeScannerOptions.Builder()
-            .setBarcodeFormats(Barcode.FORMAT_CODE_128)
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE, Barcode.FORMAT_CODE_128)
             .build()
     }
     val barcodeScanner: BarcodeScanner = remember { BarcodeScanning.getClient(options) }
 
-    // Use Atomic references for debounce tracking (500ms debounce window) so updates do NOT trigger Compose recomposition
+    // Same-code cooldown (2500ms) while allowing different student codes immediately
     val lastScannedCodeRef = remember { AtomicReference("") }
     val lastScannedTimeRef = remember { AtomicLong(0L) }
     val cameraControlRef = remember { AtomicReference<androidx.camera.core.CameraControl?>(null) }
-    val isTorchOnRef = remember { androidx.compose.runtime.mutableStateOf(false) }
+    var isTorchOn by remember { mutableStateOf(false) }
+    var hasFlashUnit by remember { mutableStateOf(false) }
+    var cameraError by remember { mutableStateOf<String?>(null) }
+    var retryNonce by remember { mutableIntStateOf(0) }
 
     DisposableEffect(Unit) {
         onDispose {
             try {
+                cameraControlRef.get()?.enableTorch(false)
+            } catch (_: Exception) {}
+            try {
                 cameraExecutor.shutdown()
                 barcodeScanner.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -158,134 +168,171 @@ private fun CameraPreviewScanner(
             .background(Color.Black),
         contentAlignment = Alignment.Center
     ) {
-        AndroidView(
-            factory = { ctx ->
-                val previewView = PreviewView(ctx).apply {
-                    scaleType = PreviewView.ScaleType.FILL_CENTER
-                    setOnTouchListener { view, event ->
-                        if (event.action == android.view.MotionEvent.ACTION_DOWN) {
-                            val factory = (view as PreviewView).meteringPointFactory
-                            val point = factory.createPoint(event.x, event.y)
-                            val action = androidx.camera.core.FocusMeteringAction.Builder(point, androidx.camera.core.FocusMeteringAction.FLAG_AF).build()
-                            cameraControlRef.get()?.startFocusAndMetering(action)
-                            true
-                        } else false
-                    }
+        if (cameraError != null) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(
+                    imageVector = Icons.Default.CameraAlt,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(40.dp)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = cameraError ?: "تعذر تشغيل الكاميرا",
+                    color = Color.White,
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(onClick = {
+                    cameraError = null
+                    retryNonce++
+                }) {
+                    Text("إعادة المحاولة")
                 }
-
-                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-                cameraProviderFuture.addListener({
-                    try {
-                        val cameraProvider = cameraProviderFuture.get()
-
-                        val preview = Preview.Builder().build().also {
-                            it.setSurfaceProvider(previewView.surfaceProvider)
-                        }
-
-                        val imageAnalysis = ImageAnalysis.Builder()
-                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                            .build()
-
-                        imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                            val frameStartTime = System.currentTimeMillis()
-                            val mediaImage = imageProxy.image
-                            if (mediaImage != null) {
-                                val inputImage = InputImage.fromMediaImage(
-                                    mediaImage,
-                                    imageProxy.imageInfo.rotationDegrees
-                                )
-
-                                val mlStartTime = System.currentTimeMillis()
-                                barcodeScanner.process(inputImage)
-                                    .addOnSuccessListener { barcodes ->
-                                        val mlDuration = System.currentTimeMillis() - mlStartTime
-                                        if (barcodes.isNotEmpty() && com.example.BuildConfig.DEBUG) {
-                                            android.util.Log.d("BarcodePerf", "Frame processed in ${System.currentTimeMillis() - frameStartTime}ms (ML Kit took ${mlDuration}ms)")
-                                        }
-
-                                        for (barcode in barcodes) {
-                                            val rawValue = barcode.rawValue ?: continue
-                                            if (rawValue.isNotBlank()) {
-                                                val currentTime = System.currentTimeMillis()
-                                                val lastCode = lastScannedCodeRef.get()
-                                                val lastTime = lastScannedTimeRef.get()
-
-                                                // 500ms strict debouncing for rapid scanning
-                                                if (rawValue != lastCode || (currentTime - lastTime > 500)) {
-                                                    lastScannedCodeRef.set(rawValue)
-                                                    lastScannedTimeRef.set(currentTime)
-
-                                                    if (com.example.BuildConfig.DEBUG) {
-                                                        android.util.Log.d("BarcodePerf", "Barcode detected: $rawValue")
-                                                    }
-
-                                                    // Dispatch callback instantly on Main UI thread bound to Composable lifecycle
-                                                    coroutineScope.launch {
-                                                        currentOnBarcodeScanned(rawValue)
-                                                    }
-                                                    break
-                                                }
-                                            }
-                                        }
-                                    }
-                                    .addOnFailureListener { e ->
-                                        if (com.example.BuildConfig.DEBUG) {
-                                            android.util.Log.e("BarcodePerf", "Barcode scan failure", e)
-                                        }
-                                    }
-                                    .addOnCompleteListener {
-                                        imageProxy.close()
-                                    }
-                            } else {
-                                imageProxy.close()
+            }
+        } else {
+            androidx.compose.runtime.key(retryNonce) {
+                AndroidView(
+                    factory = { ctx ->
+                        val previewView = PreviewView(ctx).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            setOnTouchListener { view, event ->
+                                if (event.action == android.view.MotionEvent.ACTION_DOWN) {
+                                    val factory = (view as PreviewView).meteringPointFactory
+                                    val point = factory.createPoint(event.x, event.y)
+                                    val action = androidx.camera.core.FocusMeteringAction.Builder(
+                                        point,
+                                        androidx.camera.core.FocusMeteringAction.FLAG_AF
+                                    ).build()
+                                    cameraControlRef.get()?.startFocusAndMetering(action)
+                                    true
+                                } else false
                             }
                         }
 
-                        cameraProvider.unbindAll()
-                        val camera = cameraProvider.bindToLifecycle(
-                            lifecycleOwner,
-                            CameraSelector.DEFAULT_BACK_CAMERA,
-                            preview,
-                            imageAnalysis
-                        )
-                        // Enable camera control
-                        val cameraControl = camera.cameraControl
-                        cameraControlRef.set(cameraControl)
-                        cameraControl.setLinearZoom(0f) // Start with no zoom
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }, ContextCompat.getMainExecutor(ctx))
+                        val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                        cameraProviderFuture.addListener({
+                            try {
+                                val cameraProvider = cameraProviderFuture.get()
 
-                previewView
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+                                val preview = Preview.Builder().build().also {
+                                    it.setSurfaceProvider(previewView.surfaceProvider)
+                                }
 
-        // Overlay target box
-        Box(
-            modifier = Modifier
-                .size(240.dp, 100.dp)
-                .border(2.dp, Color.Green.copy(alpha = 0.8f), RoundedCornerShape(8.dp))
-                .background(Color.Transparent)
-        )
-        // Torch control
-        androidx.compose.material3.TextButton(
-            onClick = {
-                val control = cameraControlRef.get()
-                if (control != null) {
-                    val newState = !isTorchOnRef.value
-                    control.enableTorch(newState)
-                    isTorchOnRef.value = newState
-                }
-            },
-            modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
-        ) {
-            androidx.compose.material3.Text(
-                text = if (isTorchOnRef.value) "OFF" else "ON",
-                color = Color.White
+                                val imageAnalysis = ImageAnalysis.Builder()
+                                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                                    .build()
+
+                                imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                                    val mediaImage = imageProxy.image
+                                    if (mediaImage != null) {
+                                        val inputImage = InputImage.fromMediaImage(
+                                            mediaImage,
+                                            imageProxy.imageInfo.rotationDegrees
+                                        )
+
+                                        barcodeScanner.process(inputImage)
+                                            .addOnSuccessListener { barcodes ->
+                                                for (barcode in barcodes) {
+                                                    val rawValue = barcode.rawValue?.trim() ?: continue
+                                                    if (rawValue.isNotBlank()) {
+                                                        val currentTime = System.currentTimeMillis()
+                                                        val lastCode = lastScannedCodeRef.get()
+                                                        val lastTime = lastScannedTimeRef.get()
+
+                                                        if (rawValue != lastCode || (currentTime - lastTime > 2500L)) {
+                                                            lastScannedCodeRef.set(rawValue)
+                                                            lastScannedTimeRef.set(currentTime)
+
+                                                            coroutineScope.launch {
+                                                                currentOnBarcodeScanned(rawValue)
+                                                            }
+                                                            break
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            .addOnFailureListener { e ->
+                                                if (com.example.BuildConfig.DEBUG) {
+                                                    android.util.Log.w("BarcodeScanner", "Frame analysis failed: ${e.javaClass.simpleName}")
+                                                }
+                                            }
+                                            .addOnCompleteListener {
+                                                imageProxy.close()
+                                            }
+                                    } else {
+                                        imageProxy.close()
+                                    }
+                                }
+
+                                cameraProvider.unbindAll()
+                                val camera = cameraProvider.bindToLifecycle(
+                                    lifecycleOwner,
+                                    CameraSelector.DEFAULT_BACK_CAMERA,
+                                    preview,
+                                    imageAnalysis
+                                )
+                                cameraControlRef.set(camera.cameraControl)
+                                hasFlashUnit = camera.cameraInfo.hasFlashUnit()
+                                camera.cameraControl.setLinearZoom(0f)
+                            } catch (_: Exception) {
+                                cameraError = "تعذر تشغيل الكاميرا، تأكد من عدم استخدامها في تطبيق آخر"
+                            }
+                        }, ContextCompat.getMainExecutor(ctx))
+
+                        previewView
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            // Viewfinder box sized for both QR (square) and Code 128 (horizontal)
+            Box(
+                modifier = Modifier
+                    .size(210.dp, 160.dp)
+                    .border(2.dp, Color.Green.copy(alpha = 0.85f), RoundedCornerShape(12.dp))
+                    .background(Color.Transparent)
             )
+
+            if (hasFlashUnit) {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color.Black.copy(alpha = 0.55f),
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(12.dp)
+                ) {
+                    androidx.compose.material3.TextButton(
+                        onClick = {
+                            val control = cameraControlRef.get() ?: return@TextButton
+                            val newState = !isTorchOn
+                            try {
+                                control.enableTorch(newState)
+                                isTorchOn = newState
+                            } catch (_: Exception) {}
+                        },
+                        modifier = Modifier.testTag("scanner_torch_button")
+                    ) {
+                        Icon(
+                            imageVector = if (isTorchOn) Icons.Default.FlashlightOn else Icons.Default.FlashlightOff,
+                            contentDescription = if (isTorchOn) "إطفاء الفلاش" else "تشغيل الفلاش",
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(6.dp))
+                        Text(
+                            text = if (isTorchOn) "إيقاف الفلاش" else "تشغيل الفلاش",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                }
+            }
         }
     }
 }

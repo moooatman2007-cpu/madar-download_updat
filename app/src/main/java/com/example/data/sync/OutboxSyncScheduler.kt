@@ -13,6 +13,14 @@ import java.util.concurrent.TimeUnit
 
 object OutboxSyncScheduler {
     fun scheduleSync() {
+        enqueue(ExistingWorkPolicy.KEEP)
+    }
+
+    fun retryNow() {
+        enqueue(ExistingWorkPolicy.REPLACE)
+    }
+
+    private fun enqueue(policy: ExistingWorkPolicy) {
         try {
             val user = try { SupabaseClientProvider.client.auth.currentUserOrNull() } catch (_: Exception) { null }
             val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
@@ -33,7 +41,7 @@ object OutboxSyncScheduler {
 
             WorkManager.getInstance(context).enqueueUniqueWork(
                 "outbox_sync",
-                ExistingWorkPolicy.KEEP,
+                policy,
                 request
             )
         } catch (e: Exception) {

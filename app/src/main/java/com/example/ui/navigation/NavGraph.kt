@@ -20,8 +20,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -52,6 +54,7 @@ import com.example.ui.students.StudentBarcodesScreen
 import com.example.ui.attendance.FastAttendanceScreen
 import com.example.ui.start_lesson.StartLessonScreen
 import com.example.ui.groups.GroupsScreen
+import com.example.ui.grades.GradesScreen
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.status.SessionStatus
 
@@ -244,19 +247,42 @@ fun MainAppNavigation(
                 val status = backStackEntry.arguments?.getString("status") ?: "pending"
                 val scope = rememberCoroutineScope()
                 val context = androidx.compose.ui.platform.LocalContext.current
-                StatusScreen(status = status, onLogout = {
-                    scope.launch {
-                        val result = AccountSessionManager.logout()
-                        if (result.isSuccess) {
-                            navController.navigate(Screen.Auth.route) {
-                                popUpTo(0) { inclusive = true }
+                var statusLogoutError by remember { mutableStateOf<String?>(null) }
+                StatusScreen(
+                    status = status,
+                    logoutError = statusLogoutError,
+                    onDismissLogoutError = { statusLogoutError = null },
+                    onRetrySync = {
+                        com.example.data.sync.OutboxSyncScheduler.retryNow()
+                        statusLogoutError = null
+                        android.widget.Toast.makeText(context, "تم إرسال طلب المزامنة الفورية", android.widget.Toast.LENGTH_SHORT).show()
+                    },
+                    onForceLogout = {
+                        scope.launch {
+                            val res = AccountSessionManager.logout(force = true)
+                            statusLogoutError = null
+                            if (res.isSuccess) {
+                                navController.navigate(Screen.Auth.route) {
+                                    popUpTo(0) { inclusive = true }
+                                }
+                            } else {
+                                statusLogoutError = res.exceptionOrNull()?.localizedMessage ?: "حدث خطأ أثناء تسجيل الخروج القسري"
                             }
-                        } else {
-                            val errorMsg = result.exceptionOrNull()?.localizedMessage ?: "حدث خطأ أثناء تسجيل الخروج"
-                            android.widget.Toast.makeText(context, errorMsg, android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    onLogout = {
+                        scope.launch {
+                            val result = AccountSessionManager.logout()
+                            if (result.isSuccess) {
+                                navController.navigate(Screen.Auth.route) {
+                                    popUpTo(0) { inclusive = true }
+                                }
+                            } else {
+                                statusLogoutError = result.exceptionOrNull()?.localizedMessage ?: "حدث خطأ أثناء تسجيل الخروج"
+                            }
                         }
                     }
-                })
+                )
             }
 
             // Reset Password Screen
@@ -421,7 +447,17 @@ fun MainAppNavigation(
                     },
                     onNavigateToGroups = {
                         navController.navigate(Screen.Groups.route)
+                    },
+                    onNavigateToGrades = {
+                        navController.navigate(Screen.Grades.route)
                     }
+                )
+            }
+
+            // Grades Destination
+            composable(Screen.Grades.route) {
+                GradesScreen(
+                    onNavigateBack = { navController.popBackStack() }
                 )
             }
 

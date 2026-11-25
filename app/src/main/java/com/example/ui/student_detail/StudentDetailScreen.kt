@@ -229,7 +229,14 @@ fun StudentDetailScreen(
                                     isPaid = uiState.isPaymentPaid,
                                     isToggling = uiState.isTogglingPayment,
                                     onNavigateMonth = viewModel::navigateMonth,
-                                    onTogglePayment = viewModel::toggleMonthlyPayment
+                                    onTogglePayment = viewModel::toggleMonthlyPayment,
+                                    selectedYear = uiState.selectedYear,
+                                    selectedMonth = uiState.selectedMonth,
+                                    defaultMonthlyFee = uiState.defaultMonthlyFee,
+                                    paymentHistory = uiState.studentPaymentHistory,
+                                    selectedYearFilter = uiState.selectedPaymentYearFilter,
+                                    onSelectYearFilter = viewModel::setPaymentYearFilter,
+                                    onSavePaymentDetails = viewModel::saveMonthlyPayment
                                 )
                             }
                             StudentDetailTab.ATTENDANCE -> {
@@ -304,9 +311,17 @@ fun StudentDetailScreen(
 
             // Dialogs & Bottom Sheets
             if (uiState.showAttendanceDialog) {
+                val todayDay = java.util.Calendar.getInstance().get(java.util.Calendar.DAY_OF_MONTH)
+                val maxDay = java.time.YearMonth.of(uiState.selectedYear, uiState.selectedMonth).lengthOfMonth()
                 AddEditAttendanceDialog(
                     initialAttendance = uiState.attendanceToEdit,
-                    defaultDate = String.format("%04d-%02d-18", uiState.selectedYear, uiState.selectedMonth),
+                    defaultDate = String.format(
+                        java.util.Locale.US,
+                        "%04d-%02d-%02d",
+                        uiState.selectedYear,
+                        uiState.selectedMonth,
+                        todayDay.coerceIn(1, maxDay)
+                    ),
                     onDismiss = viewModel::closeAttendanceDialog,
                     onSave = viewModel::saveAttendance
                 )

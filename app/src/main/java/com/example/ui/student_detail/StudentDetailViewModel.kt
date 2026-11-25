@@ -29,10 +29,12 @@ import com.example.data.repository.RepositoryProvider
 import com.example.core.model.NotificationEvent
 import com.example.data.repository.NotificationEventCreationResult
 import com.example.data.repository.NotificationEventRepository
+import com.example.data.repository.SettingsRepository
 import com.example.data.repository.StudentRepository
 import io.github.jan.supabase.auth.auth
 import com.example.util.DateUtils
 import android.content.Context
+import java.time.YearMonth
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -81,6 +83,9 @@ data class StudentDetailUiState(
     val monthlyPayment: LessonPayment? = null,
     val isPaymentPaid: Boolean = false,
     val isTogglingPayment: Boolean = false,
+    val defaultMonthlyFee: Double = 0.0,
+    val studentPaymentHistory: List<LessonPayment> = emptyList(),
+    val selectedPaymentYearFilter: Int? = null,
 
     // Attendance State
     val attendances: List<Attendance> = emptyList(),
@@ -148,7 +153,8 @@ class StudentDetailViewModel(
     private val homeworkRepository: HomeworkRepository = RepositoryProvider.homeworkRepository,
     private val paymentRepository: PaymentRepository = RepositoryProvider.paymentRepository,
     private val groupRepository: GroupRepository = RepositoryProvider.groupRepository,
-    private val notificationEventRepository: NotificationEventRepository = RepositoryProvider.notificationEventRepository
+    private val notificationEventRepository: NotificationEventRepository = RepositoryProvider.notificationEventRepository,
+    private val settingsRepository: SettingsRepository = RepositoryProvider.settingsRepository
 ) : ViewModel() {
 
     private val studentIdArg: String? = savedStateHandle?.get<String>("studentId")
@@ -162,6 +168,8 @@ class StudentDetailViewModel(
     private var loadStudentJob: Job? = null
     private var refreshJob: Job? = null
     private var globalDataJob: Job? = null
+    private var paymentHistoryJob: Job? = null
+    private var settingsJob: Job? = null
 
     init {
         updateMonthName()
@@ -272,6 +280,34 @@ class StudentDetailViewModel(
                     )
                 }
                 
+                // Observe default monthly fee setting
+                settingsJob?.cancel()
+                settingsJob = launch {
+                    settingsRepository.getDefaultMonthlyFee().collectLatest { fee ->
+                        _uiState.update { it.copy(defaultMonthlyFee = fee.coerceAtLeast(0.0)) }
+                    }
+                }
+
+                // Observe student's payment history (sorted newest-first)
+                paymentHistoryJob?.cancel()
+                paymentHistoryJob = launch {
+                    paymentRepository.observePaymentsByStudent(studentId).collectLatest { history ->
+                        val sortedHistory = history.sortedWith(
+                            compareByDescending<LessonPayment> { it.year }.thenByDescending { it.month }
+                        )
+                        _uiState.update { state ->
+                            val currentMonthRecord = sortedHistory.firstOrNull {
+                                it.year == state.selectedYear && it.month == state.selectedMonth
+                            }
+                            state.copy(
+                                studentPaymentHistory = sortedHistory,
+                                monthlyPayment = if (state.isTogglingPayment) state.monthlyPayment else (currentMonthRecord ?: state.monthlyPayment),
+                                isPaymentPaid = if (state.isTogglingPayment) state.isPaymentPaid else (currentMonthRecord?.isPaid ?: state.isPaymentPaid)
+                            )
+                        }
+                    }
+                }
+
                 // Load global data for overview and populate monthly slices locally from Room cache
                 globalDataJob?.cancel()
                 var isInitialLoad = true
@@ -310,28 +346,30 @@ class StudentDetailViewModel(
                         val allEx = data.sortedEx
                         val allHw = data.sortedHw
 
-                        val allDates = (allAtt.map { it.date } + allRec.map { it.date } + allEx.map { it.date } + allHw.map { it.date }).filter { it.length >= 7 }
-                        val latestDate = allDates.maxOrNull()
                         var targetYear = _uiState.value.selectedYear
                         var targetMonth = _uiState.value.selectedMonth
-                        if (latestDate != null) {
-                            val curPeriod = String.format(Locale.US, "%04d-%02d", targetYear, targetMonth)
-                            val hasDataInCurrent = allAtt.any { it.date.startsWith(curPeriod) } ||
-                                    allRec.any { it.date.startsWith(curPeriod) } ||
-                                    allEx.any { it.date.startsWith(curPeriod) } ||
-                                    allHw.any { it.date.startsWith(curPeriod) }
-                            if (!hasDataInCurrent) {
-                                try {
-                                    val parts = latestDate.split("-")
-                                    if (parts.size >= 2) {
-                                        targetYear = parts[0].toInt()
-                                        targetMonth = parts[1].toInt()
-                                    }
-                                } catch (_: Exception) {}
+                        if (isInitialLoad) {
+                            val allDates = (allAtt.map { it.date } + allRec.map { it.date } + allEx.map { it.date } + allHw.map { it.date }).filter { it.length >= 7 }
+                            val latestDate = allDates.maxOrNull()
+                            if (latestDate != null) {
+                                val curPeriod = String.format(Locale.US, "%04d-%02d", targetYear, targetMonth)
+                                val hasDataInCurrent = allAtt.any { it.date.startsWith(curPeriod) } ||
+                                        allRec.any { it.date.startsWith(curPeriod) } ||
+                                        allEx.any { it.date.startsWith(curPeriod) } ||
+                                        allHw.any { it.date.startsWith(curPeriod) }
+                                if (!hasDataInCurrent) {
+                                    try {
+                                        val parts = latestDate.split("-")
+                                        if (parts.size >= 2) {
+                                            targetYear = parts[0].toInt()
+                                            targetMonth = parts[1].toInt().coerceIn(1, 12)
+                                        }
+                                    } catch (_: Exception) {}
+                                }
                             }
                         }
 
-                        _uiState.update { 
+                        _uiState.update {
                             it.copy(
                                 selectedYear = targetYear,
                                 selectedMonth = targetMonth,
@@ -456,18 +494,25 @@ class StudentDetailViewModel(
                     }
                 }
 
-                // Load Monthly Payment
+                // Load Monthly Payment & refresh history
                 launch {
                     val payment = paymentRepository.getPaymentForStudent(studentId, year, month)
-                    _uiState.update {
-                        it.copy(
+                    val history = paymentRepository.getPaymentsForStudentHistory(studentId)
+                    _uiState.update { state ->
+                        val mergedHistory = if (history.isNotEmpty()) history else state.studentPaymentHistory
+                        state.copy(
                             monthlyPayment = payment,
-                            isPaymentPaid = payment?.isPaid ?: false
+                            isPaymentPaid = payment?.isPaid ?: false,
+                            studentPaymentHistory = mergedHistory
                         )
                     }
                 }
             }
         }
+    }
+
+    fun setPaymentYearFilter(year: Int?) {
+        _uiState.update { it.copy(selectedPaymentYearFilter = year) }
     }
 
     fun toggleMonthlyPayment() {
@@ -477,6 +522,7 @@ class StudentDetailViewModel(
         val month = _uiState.value.selectedMonth
         val oldPayment = _uiState.value.monthlyPayment
         val oldIsPaid = _uiState.value.isPaymentPaid
+        val targetAmount = oldPayment?.amount?.takeIf { it > 0.0 } ?: _uiState.value.defaultMonthlyFee
 
         val newIsPaid = !oldIsPaid
 
@@ -489,14 +535,20 @@ class StudentDetailViewModel(
         }
 
         viewModelScope.launch {
-            val result = paymentRepository.togglePaymentStatus(studentId, year, month)
+            val result = paymentRepository.togglePaymentStatus(studentId, year, month, amount = targetAmount)
             if (result.isSuccess) {
                 val updatedPayment = result.getOrNull()
-                _uiState.update {
-                    it.copy(
+                val updatedHistory = paymentRepository.getPaymentsForStudentHistory(studentId)
+                _uiState.update { state ->
+                    val mergedHistory = mergePaymentIntoHistory(
+                        base = if (updatedHistory.isNotEmpty()) updatedHistory else state.studentPaymentHistory,
+                        updated = updatedPayment
+                    )
+                    state.copy(
                         monthlyPayment = updatedPayment,
                         isPaymentPaid = updatedPayment?.isPaid ?: newIsPaid,
-                        isTogglingPayment = false
+                        isTogglingPayment = false,
+                        studentPaymentHistory = mergedHistory
                     )
                 }
                 val statusStr = if (updatedPayment?.isPaid == true) "مدفوع" else "غير مدفوع"
@@ -516,6 +568,78 @@ class StudentDetailViewModel(
         }
     }
 
+    fun saveMonthlyPayment(
+        year: Int = _uiState.value.selectedYear,
+        month: Int = _uiState.value.selectedMonth,
+        isPaid: Boolean,
+        amount: Double
+    ) {
+        if (_uiState.value.isTogglingPayment) return
+        val studentId = _uiState.value.student?.studentId ?: return
+        val safeAmount = amount.coerceAtLeast(0.0)
+        val oldPayment = _uiState.value.monthlyPayment
+        val oldIsPaid = _uiState.value.isPaymentPaid
+
+        _uiState.update {
+            it.copy(
+                isTogglingPayment = true,
+                isPaymentPaid = if (year == it.selectedYear && month == it.selectedMonth) isPaid else it.isPaymentPaid
+            )
+        }
+
+        viewModelScope.launch {
+            val result = paymentRepository.setPaymentStatus(
+                studentId = studentId,
+                year = year,
+                month = month,
+                isPaid = isPaid,
+                amount = safeAmount
+            )
+            if (result.isSuccess) {
+                val updatedPayment = result.getOrNull()
+                val updatedHistory = paymentRepository.getPaymentsForStudentHistory(studentId)
+                _uiState.update { state ->
+                    val isSelectedMonth = (year == state.selectedYear && month == state.selectedMonth)
+                    val mergedHistory = mergePaymentIntoHistory(
+                        base = if (updatedHistory.isNotEmpty()) updatedHistory else state.studentPaymentHistory,
+                        updated = updatedPayment
+                    )
+                    state.copy(
+                        monthlyPayment = if (isSelectedMonth) updatedPayment else state.monthlyPayment,
+                        isPaymentPaid = if (isSelectedMonth) (updatedPayment?.isPaid ?: isPaid) else state.isPaymentPaid,
+                        isTogglingPayment = false,
+                        studentPaymentHistory = mergedHistory
+                    )
+                }
+                val statusStr = if (isPaid) "مدفوع" else "غير مدفوع"
+                _events.emit(StudentDetailEvent.ShowMessage("تم حفظ سجل الدفع ($statusStr) بنجاح"))
+            } else {
+                _uiState.update {
+                    it.copy(
+                        monthlyPayment = oldPayment,
+                        isPaymentPaid = oldIsPaid,
+                        isTogglingPayment = false
+                    )
+                }
+                val errorMsg = result.exceptionOrNull()?.message ?: "فشل حفظ سجل الدفع"
+                _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
+            }
+        }
+    }
+
+    private fun mergePaymentIntoHistory(
+        base: List<LessonPayment>,
+        updated: LessonPayment?
+    ): List<LessonPayment> {
+        val list = if (updated == null) {
+            base
+        } else {
+            val withoutTarget = base.filterNot { it.year == updated.year && it.month == updated.month }
+            withoutTarget + updated
+        }
+        return list.sortedWith(compareByDescending<LessonPayment> { it.year }.thenByDescending { it.month })
+    }
+
     // ===================================
     // ATTENDANCE ACTIONS
     // ===================================
@@ -523,7 +647,14 @@ class StudentDetailViewModel(
     fun openAddAttendanceDialog(date: String? = null) {
         val targetDate = date ?: run {
             val cal = Calendar.getInstance()
-            String.format("%04d-%02d-%02d", _uiState.value.selectedYear, _uiState.value.selectedMonth, cal.get(Calendar.DAY_OF_MONTH).coerceIn(1, 28))
+            val maxDay = YearMonth.of(_uiState.value.selectedYear, _uiState.value.selectedMonth).lengthOfMonth()
+            String.format(
+                Locale.US,
+                "%04d-%02d-%02d",
+                _uiState.value.selectedYear,
+                _uiState.value.selectedMonth,
+                cal.get(Calendar.DAY_OF_MONTH).coerceIn(1, maxDay)
+            )
         }
         val existing = _uiState.value.attendances.find { it.date == targetDate }
         _uiState.update {

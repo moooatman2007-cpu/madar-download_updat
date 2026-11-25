@@ -29,11 +29,20 @@ object SupabaseClientProvider {
         }
         return ctx?.let {
             try {
-                val prefs = it.getSharedPreferences("supabase_session", Context.MODE_PRIVATE)
-                SharedPreferencesSettings(prefs)
+                val encryptedSettings = com.example.data.auth.KeystoreEncryptedSettings(it)
+                // Probe encryption/decryption path so environments without AndroidKeyStore (e.g. JVM tests) fallback cleanly.
+                encryptedSettings.hasKey("__probe__")
+                java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                encryptedSettings
             } catch (t: Throwable) {
-                Log.e("SupabaseClient", "Failed to create SharedPreferencesSettings", t)
-                null
+                Log.w("SupabaseClient", "AndroidKeyStore unavailable, falling back to SharedPreferencesSettings", t)
+                try {
+                    val prefs = it.getSharedPreferences("supabase_session", Context.MODE_PRIVATE)
+                    SharedPreferencesSettings(prefs)
+                } catch (inner: Throwable) {
+                    Log.e("SupabaseClient", "Failed to create SharedPreferencesSettings", inner)
+                    null
+                }
             }
         }
     }

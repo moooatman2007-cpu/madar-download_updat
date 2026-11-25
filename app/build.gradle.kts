@@ -55,7 +55,7 @@ fun validateSupabaseConfig(
     errors.add("Missing or empty 'SUPABASE_URL' (neither set in environment variables nor in root .env).")
   } else if (supabaseUrl.contains("placeholder", ignoreCase = true)) {
     errors.add("'SUPABASE_URL' contains placeholder value.")
-  } else if (!supabaseUrl.startsWith("https://") && !supabaseUrl.startsWith("http://")) {
+  } else if (!supabaseUrl.startsWith("https://")) {
     errors.add("'SUPABASE_URL' must start with 'https://'.")
   }
 
@@ -69,6 +69,8 @@ fun validateSupabaseConfig(
     errors.add("Missing or empty 'SUPABASE_EDGE_FUNCTION_URL' (neither set in environment variables nor in root .env).")
   } else if (supabaseEdgeUrl.contains("placeholder", ignoreCase = true)) {
     errors.add("'SUPABASE_EDGE_FUNCTION_URL' contains placeholder value.")
+  } else if (!supabaseEdgeUrl.startsWith("https://")) {
+    errors.add("'SUPABASE_EDGE_FUNCTION_URL' must start with 'https://'.")
   }
 
   return errors
@@ -262,7 +264,7 @@ dependencies {
   implementation(libs.androidx.compose.ui.graphics)
   implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.core.ktx)
-  // implementation(libs.androidx.datastore.preferences)
+  implementation(libs.androidx.datastore.preferences)
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.runtime.ktx)
   implementation(libs.androidx.lifecycle.viewmodel.compose)

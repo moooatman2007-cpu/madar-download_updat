@@ -184,7 +184,7 @@ object BarcodeGenerator {
             textAlign = Paint.Align.CENTER
             isAntiAlias = true
         }
-        canvas.drawText("تطبيق مَدَار — بطاقة الطالبة", width / 2f, headerHeight * 0.65f, headerTextPaint)
+        canvas.drawText("تطبيق مَدَار — بطاقة الطالب", width / 2f, headerHeight * 0.65f, headerTextPaint)
 
         // Student Full Name
         val namePaint = Paint().apply {
@@ -209,9 +209,9 @@ object BarcodeGenerator {
         }
 
         // QR Code
-        val qrCodeContent = student.studentCode.trim().ifBlank { "ST-000" }
+        val qrCodeContent = student.studentCode.trim()
         val qrSize = (width * 0.58f).toInt().coerceAtLeast(200)
-        val qrBitmap = generateQRCodeBitmap(qrCodeContent, qrSize)
+        val qrBitmap = if (qrCodeContent.isNotBlank()) generateQRCodeBitmap(qrCodeContent, qrSize) else null
 
         if (qrBitmap != null) {
             val qrLeft = (width - qrBitmap.width) / 2f
@@ -252,7 +252,8 @@ object BarcodeGenerator {
             textAlign = Paint.Align.CENTER
             isAntiAlias = true
         }
-        canvas.drawText("الكود: $qrCodeContent", width / 2f, (badgeTop + badgeBottom) / 2f + (width * 0.015f), codeTextPaint)
+        val badgeText = if (qrCodeContent.isNotBlank()) "الكود: $qrCodeContent" else "لا يوجد كود مسجل"
+        canvas.drawText(badgeText, width / 2f, (badgeTop + badgeBottom) / 2f + (width * 0.015f), codeTextPaint)
 
         // Footer Hint
         val footerPaint = Paint().apply {
@@ -396,7 +397,7 @@ object BarcodeGenerator {
                 type = "image/png"
                 putExtra(Intent.EXTRA_STREAM, uri)
                 putExtra(Intent.EXTRA_SUBJECT, title)
-                putExtra(Intent.EXTRA_TEXT, "بطاقة رمز QR الخاصة بالطالبة: $studentName")
+                putExtra(Intent.EXTRA_TEXT, "بطاقة رمز QR الخاصة بالطالب: $studentName")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
 

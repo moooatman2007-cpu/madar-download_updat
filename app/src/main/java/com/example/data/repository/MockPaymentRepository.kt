@@ -24,6 +24,18 @@ class MockPaymentRepository(
         return payments.value.filter { it.year == year && it.month == month }
     }
 
+    override fun observePaymentsByStudent(studentId: String): Flow<List<LessonPayment>> {
+        return payments.asStateFlow().map { list ->
+            list.filter { it.studentId == studentId }
+                .sortedWith(compareByDescending<LessonPayment> { it.year }.thenByDescending { it.month })
+        }
+    }
+
+    override suspend fun getPaymentsForStudentHistory(studentId: String): List<LessonPayment> {
+        return payments.value.filter { it.studentId == studentId }
+            .sortedWith(compareByDescending<LessonPayment> { it.year }.thenByDescending { it.month })
+    }
+
     override suspend fun getPaymentForStudent(studentId: String, year: Int, month: Int): LessonPayment? {
         return payments.value.find { it.studentId == studentId && it.year == year && it.month == month }
     }

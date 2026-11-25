@@ -71,12 +71,17 @@ fun StudentQrDialog(
     val coroutineScope = rememberCoroutineScope()
     var isSaving by remember { mutableStateOf(false) }
 
-    val qrContent = student.studentCode.ifBlank { "ST-000" }
+    val qrContent = student.studentCode.trim()
+    val hasValidCode = qrContent.isNotBlank()
 
     // Generate Compose ImageBitmap for high-speed, crisp display
     val qrImageBitmap by produceState<ImageBitmap?>(initialValue = null, key1 = qrContent) {
-        value = withContext(Dispatchers.Default) {
-            BarcodeGenerator.generateQRCodeImageBitmap(qrContent, 600)
+        value = if (hasValidCode) {
+            withContext(Dispatchers.Default) {
+                BarcodeGenerator.generateQRCodeImageBitmap(qrContent, 600)
+            }
+        } else {
+            null
         }
     }
 
@@ -106,7 +111,7 @@ fun StudentQrDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "رمز QR للطالبة",
+                        text = "رمز QR للطالب",
                         style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
                         color = MaterialTheme.colorScheme.onSurface
                     )
@@ -153,7 +158,14 @@ fun StudentQrDialog(
                     contentAlignment = Alignment.Center
                 ) {
                     val currentBitmap = qrImageBitmap
-                    if (currentBitmap != null) {
+                    if (!hasValidCode) {
+                        Text(
+                            text = "لا يوجد كود مسجل لهذا الطالب حتى الآن",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    } else if (currentBitmap != null) {
                         Image(
                             bitmap = currentBitmap,
                             contentDescription = "رمز QR ${student.fullName}",
@@ -179,7 +191,7 @@ fun StudentQrDialog(
                     modifier = Modifier.padding(horizontal = Dimens.Spacing8)
                 ) {
                     Text(
-                        text = "كود الطالبة: $qrContent",
+                        text = if (hasValidCode) "كود الطالب: $qrContent" else "بانتظار تعيين الكود",
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                         color = PrimaryIndigo,
                         modifier = Modifier.padding(horizontal = Dimens.Spacing16, vertical = Dimens.Spacing6)
@@ -234,7 +246,7 @@ fun StudentQrDialog(
                                 }
                             }
                         },
-                        enabled = !isSaving,
+                        enabled = !isSaving && hasValidCode,
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
                         modifier = Modifier
@@ -278,6 +290,7 @@ fun StudentQrDialog(
                                 Toast.makeText(context, "فشل بدء الطباعة: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
                             }
                         },
+                        enabled = hasValidCode,
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
                             .weight(1f)
@@ -313,11 +326,12 @@ fun StudentQrDialog(
                             BarcodeGenerator.shareBitmap(
                                 context = context,
                                 bitmap = cardBitmap,
-                                title = "رمز QR للطالبة ${student.fullName}",
+                                title = "رمز QR للطالب ${student.fullName}",
                                 studentName = student.fullName
                             )
                         }
                     },
+                    enabled = hasValidCode,
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier
                         .fillMaxWidth()

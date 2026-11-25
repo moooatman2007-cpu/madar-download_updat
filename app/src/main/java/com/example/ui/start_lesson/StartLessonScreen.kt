@@ -1,6 +1,7 @@
 package com.example.ui.start_lesson
 
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -71,6 +72,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.core.model.Grade
+import com.example.core.model.Group
 import com.example.core.model.HomeworkStatus
 import com.example.core.model.Student
 import com.example.ui.attendance.BarcodeCameraScannerView
@@ -139,6 +141,46 @@ fun StartLessonScreen(
         StartLessonStep.NOTIFICATION_REVIEW -> 1.0f
     }
 
+    val handleBack: () -> Unit = {
+        if (!uiState.isSaving && !uiState.isSubmittingNotifications) {
+            when (uiState.currentStep) {
+                StartLessonStep.SELECT_GROUP -> onNavigateBack()
+                StartLessonStep.ATTENDANCE -> viewModel.goToStep(StartLessonStep.SELECT_GROUP)
+                StartLessonStep.ATTENDANCE_SUMMARY -> viewModel.goToStep(StartLessonStep.ATTENDANCE)
+                StartLessonStep.RECITATION_CHOICE -> viewModel.goToStep(StartLessonStep.ATTENDANCE_SUMMARY)
+                StartLessonStep.RECITATION -> viewModel.goToStep(StartLessonStep.RECITATION_CHOICE)
+                StartLessonStep.HOMEWORK_CHOICE -> {
+                    if (uiState.skipRecitation) {
+                        viewModel.goToStep(StartLessonStep.RECITATION_CHOICE)
+                    } else {
+                        viewModel.goToStep(StartLessonStep.RECITATION)
+                    }
+                }
+                StartLessonStep.HOMEWORK -> viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE)
+                StartLessonStep.EXAM_CHOICE -> {
+                    if (uiState.skipHomework) {
+                        viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE)
+                    } else {
+                        viewModel.goToStep(StartLessonStep.HOMEWORK)
+                    }
+                }
+                StartLessonStep.EXAM -> viewModel.goToStep(StartLessonStep.EXAM_CHOICE)
+                StartLessonStep.REVIEW -> {
+                    if (uiState.skipExam) {
+                        viewModel.goToStep(StartLessonStep.EXAM_CHOICE)
+                    } else {
+                        viewModel.goToStep(StartLessonStep.EXAM)
+                    }
+                }
+                StartLessonStep.NOTIFICATION_REVIEW -> onNavigateBack()
+            }
+        }
+    }
+
+    BackHandler(onBack = handleBack)
+
+    val activeScopeLabel = uiState.selectedGroupName.ifBlank { uiState.selectedGradeName }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -149,9 +191,9 @@ fun StartLessonScreen(
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onSurface
                         )
-                        if (uiState.selectedGradeName.isNotBlank() && uiState.currentStep != StartLessonStep.SELECT_GROUP) {
+                        if (activeScopeLabel.isNotBlank() && uiState.currentStep != StartLessonStep.SELECT_GROUP) {
                             Text(
-                                text = "المجموعة: ${uiState.selectedGradeName}",
+                                text = "المجموعة: $activeScopeLabel",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = PrimaryIndigo
                             )
@@ -160,39 +202,7 @@ fun StartLessonScreen(
                 },
                 navigationIcon = {
                     IconButton(
-                        onClick = {
-                            when (uiState.currentStep) {
-                                StartLessonStep.SELECT_GROUP -> onNavigateBack()
-                                StartLessonStep.ATTENDANCE -> viewModel.goToStep(StartLessonStep.SELECT_GROUP)
-                                StartLessonStep.ATTENDANCE_SUMMARY -> viewModel.goToStep(StartLessonStep.ATTENDANCE)
-                                StartLessonStep.RECITATION_CHOICE -> viewModel.goToStep(StartLessonStep.ATTENDANCE_SUMMARY)
-                                StartLessonStep.RECITATION -> viewModel.goToStep(StartLessonStep.RECITATION_CHOICE)
-                                StartLessonStep.HOMEWORK_CHOICE -> {
-                                    if (uiState.skipRecitation) {
-                                        viewModel.goToStep(StartLessonStep.RECITATION_CHOICE)
-                                    } else {
-                                        viewModel.goToStep(StartLessonStep.RECITATION)
-                                    }
-                                }
-                                StartLessonStep.HOMEWORK -> viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE)
-                                StartLessonStep.EXAM_CHOICE -> {
-                                    if (uiState.skipHomework) {
-                                        viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE)
-                                    } else {
-                                        viewModel.goToStep(StartLessonStep.HOMEWORK)
-                                    }
-                                }
-                                StartLessonStep.EXAM -> viewModel.goToStep(StartLessonStep.EXAM_CHOICE)
-                                StartLessonStep.REVIEW -> {
-                                    if (uiState.skipExam) {
-                                        viewModel.goToStep(StartLessonStep.EXAM_CHOICE)
-                                    } else {
-                                        viewModel.goToStep(StartLessonStep.EXAM)
-                                    }
-                                }
-                                StartLessonStep.NOTIFICATION_REVIEW -> onNavigateBack()
-                            }
-                        },
+                        onClick = handleBack,
                         modifier = Modifier.testTag("start_lesson_back_button")
                     ) {
                         Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "رجوع")
@@ -277,6 +287,8 @@ fun StartLessonScreen(
 
 @Composable
 fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonViewModel) {
+    val gradesById = uiState.grades.associateBy { it.id }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -284,15 +296,15 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
         verticalArrangement = Arrangement.spacedBy(Dimens.Spacing16)
     ) {
         Text(
-            text = "اختر المجموعة أو الصف لبدء الحصة:",
+            text = "اختر المجموعة الدراسية لبدء الحصة:",
             style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
             color = MaterialTheme.colorScheme.onSurface
         )
 
-        if (uiState.grades.isEmpty()) {
+        if (uiState.groups.isEmpty()) {
             EmptyStateView(
-                title = "لا توجد مجموعات مسجلة",
-                description = "يرجى إضافة صفوف أو مجموعات أولاً",
+                title = "لا توجد مجموعات مفعّلة",
+                description = "يرجى إضافة مجموعة دراسية وتعيين طلابها من قسم المجموعات أولاً",
                 buttonText = null
             )
         } else {
@@ -300,8 +312,16 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
                 verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12),
                 modifier = Modifier.weight(1f)
             ) {
-                items(uiState.grades, key = { it.id }) { grade ->
-                    val isSelected = uiState.selectedGradeId == grade.id
+                items(uiState.groups, key = { it.id }) { group: Group ->
+                    val isSelected = uiState.selectedGroupId == group.id
+                    val gradeName = gradesById[group.gradeId]?.name ?: ""
+                    val studentCount = uiState.groupStudentCounts[group.id] ?: 0
+                    val timeLabel = if (group.startTime.isNotBlank() && group.endTime.isNotBlank()) {
+                        "${group.startTime} - ${group.endTime}"
+                    } else {
+                        ""
+                    }
+
                     Card(
                         shape = RoundedCornerShape(16.dp),
                         colors = CardDefaults.cardColors(
@@ -310,8 +330,8 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
                         border = if (isSelected) androidx.compose.foundation.BorderStroke(2.dp, PrimaryIndigo) else null,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { viewModel.selectGrade(grade.id) }
-                            .testTag("start_lesson_grade_card_${grade.id}")
+                            .clickable { viewModel.selectGroup(group.id) }
+                            .testTag("start_lesson_group_card_${group.id}")
                     ) {
                         Row(
                             modifier = Modifier
@@ -320,7 +340,11 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
                                 Box(
                                     contentAlignment = Alignment.Center,
                                     modifier = Modifier
@@ -336,14 +360,23 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
                                 }
                                 Column {
                                     Text(
-                                        text = grade.name,
+                                        text = group.name,
                                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                        color = MaterialTheme.colorScheme.onSurface
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val metaParts = listOfNotNull(
+                                        gradeName.takeIf { it.isNotBlank() },
+                                        "الطلاب: $studentCount",
+                                        timeLabel.takeIf { it.isNotBlank() }
                                     )
                                     Text(
-                                        text = "عدد الطلاب: ${grade.studentCount}",
+                                        text = metaParts.joinToString(" • "),
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                             }
@@ -358,7 +391,7 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
 
             Button(
                 onClick = { viewModel.goToStep(StartLessonStep.ATTENDANCE) },
-                enabled = uiState.selectedGradeId != null,
+                enabled = uiState.selectedGroupId != null,
                 colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
                 shape = RoundedCornerShape(16.dp),
                 modifier = Modifier
@@ -403,7 +436,8 @@ fun StepAttendanceContent(uiState: StartLessonUiState, viewModel: StartLessonVie
             ) {
                 Column {
                     Text("تسجيل حضور المجموعة", style = MaterialTheme.typography.labelMedium, color = Color.White.copy(alpha = 0.7f))
-                    Text("${uiState.selectedGradeName} ($total طالب)", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold), color = Color.White)
+                    val scopeLabel = uiState.selectedGroupName.ifBlank { uiState.selectedGradeName }
+                    Text("$scopeLabel ($total طالب)", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold), color = Color.White)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Surface(shape = RoundedCornerShape(8.dp), color = EmeraldGreenLight, contentColor = EmeraldGreen) {
@@ -630,8 +664,12 @@ fun StepRecitationContent(uiState: StartLessonUiState, viewModel: StartLessonVie
                 style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
             )
             OutlinedButton(
-                onClick = { viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE) },
-                shape = RoundedCornerShape(12.dp)
+                onClick = {
+                    viewModel.setSkipRecitation(true)
+                    viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE)
+                },
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.testTag("start_lesson_skip_recitation_button")
             ) {
                 Icon(imageVector = Icons.Default.SkipNext, contentDescription = null)
                 Spacer(modifier = Modifier.width(4.dp))
@@ -639,6 +677,12 @@ fun StepRecitationContent(uiState: StartLessonUiState, viewModel: StartLessonVie
             }
         }
 
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "لا يتم إنشاء سجل تسميع لأي طالب إلا إذا أدخلت التسميع له صراحةً.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
         Spacer(modifier = Modifier.height(8.dp))
 
         LazyColumn(
@@ -654,21 +698,66 @@ fun StepRecitationContent(uiState: StartLessonUiState, viewModel: StartLessonVie
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text(text = student.fullName, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold), color = PrimaryIndigo)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = student.fullName,
+                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                color = PrimaryIndigo
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (rec.isRecorded) {
+                                    Text(
+                                        text = "سيتم الحفظ ✓",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = EmeraldGreen
+                                    )
+                                    IconButton(
+                                        onClick = { viewModel.clearRecitationInput(student.studentId) },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Clear,
+                                            contentDescription = "مسح تسميع ${student.fullName}",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                } else {
+                                    Text(
+                                        text = "غير مسجل",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             OutlinedTextField(
                                 value = rec.title,
-                                onValueChange = { t -> viewModel.updateRecitationInput(studentId = student.studentId) { it.copy(title = t) } },
-                                label = { Text("عنوان التسميع") },
+                                onValueChange = { t ->
+                                    viewModel.setSkipRecitation(false)
+                                    viewModel.updateRecitationInput(studentId = student.studentId) {
+                                        it.copy(title = t)
+                                    }
+                                },
+                                label = { Text("عنوان التسميع (مثال: سورة النبأ)") },
                                 modifier = Modifier.weight(1.5f),
                                 singleLine = true,
                                 shape = RoundedCornerShape(8.dp)
                             )
                             OutlinedTextField(
                                 value = rec.scoreStr,
-                                onValueChange = { s -> viewModel.updateRecitationInput(studentId = student.studentId) { it.copy(scoreStr = s) } },
-                                label = { Text("الدرجة") },
+                                onValueChange = { s ->
+                                    viewModel.setSkipRecitation(false)
+                                    viewModel.updateRecitationInput(studentId = student.studentId) {
+                                        it.copy(scoreStr = s)
+                                    }
+                                },
+                                label = { Text("الدرجة (من ${rec.maxScoreStr.ifBlank { "10" }})") },
                                 modifier = Modifier.weight(1f),
                                 singleLine = true,
                                 shape = RoundedCornerShape(8.dp)
@@ -682,7 +771,10 @@ fun StepRecitationContent(uiState: StartLessonUiState, viewModel: StartLessonVie
         Spacer(modifier = Modifier.height(12.dp))
 
         Button(
-            onClick = { viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE) },
+            onClick = {
+                viewModel.setSkipRecitation(false)
+                viewModel.goToStep(StartLessonStep.HOMEWORK_CHOICE)
+            },
             colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
             shape = RoundedCornerShape(16.dp),
             modifier = Modifier
@@ -711,8 +803,12 @@ fun StepHomeworkContent(uiState: StartLessonUiState, viewModel: StartLessonViewM
                 style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
             )
             OutlinedButton(
-                onClick = { viewModel.goToStep(StartLessonStep.EXAM_CHOICE) },
-                shape = RoundedCornerShape(12.dp)
+                onClick = {
+                    viewModel.setSkipHomework(true)
+                    viewModel.goToStep(StartLessonStep.EXAM_CHOICE)
+                },
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.testTag("start_lesson_skip_homework_button")
             ) {
                 Icon(imageVector = Icons.Default.SkipNext, contentDescription = null)
                 Spacer(modifier = Modifier.width(4.dp))
@@ -720,6 +816,12 @@ fun StepHomeworkContent(uiState: StartLessonUiState, viewModel: StartLessonViewM
             }
         }
 
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "اختر حالة الواجب أو أدخل عنوانه للطلاب الذين تريد تسجيل الواجب لهم فقط.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
         Spacer(modifier = Modifier.height(8.dp))
 
         LazyColumn(
@@ -735,32 +837,95 @@ fun StepHomeworkContent(uiState: StartLessonUiState, viewModel: StartLessonViewM
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text(text = student.fullName, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold), color = PrimaryIndigo)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = student.fullName,
+                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                color = PrimaryIndigo
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = if (hw.isRecorded) "سيتم الحفظ ✓" else "غير مسجل",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = if (hw.isRecorded) FontWeight.Bold else FontWeight.Normal
+                                    ),
+                                    color = if (hw.isRecorded) EmeraldGreen else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                if (hw.isRecorded) {
+                                    IconButton(
+                                        onClick = { viewModel.clearHomeworkInput(student.studentId) },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Clear,
+                                            contentDescription = "مسح واجب ${student.fullName}",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = hw.title,
+                            onValueChange = { t ->
+                                viewModel.setSkipHomework(false)
+                                viewModel.updateHomeworkInput(student.studentId) {
+                                    it.copy(title = t)
+                                }
+                            },
+                            label = { Text("عنوان الواجب (مثال: واجب الحصة)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            shape = RoundedCornerShape(8.dp)
+                        )
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                            OutlinedTextField(
-                                value = hw.title,
-                                onValueChange = { t -> viewModel.updateHomeworkInput(student.studentId) { it.copy(title = t) } },
-                                label = { Text("عنوان الواجب") },
-                                modifier = Modifier.weight(1.5f),
-                                singleLine = true,
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                            Button(
+                            val isDone = hw.isRecorded && hw.status == HomeworkStatus.COMPLETED
+                            val isNotDone = hw.isRecorded && hw.status == HomeworkStatus.NOT_COMPLETED
+                            OutlinedButton(
                                 onClick = {
-                                    val nextStatus = when (hw.status) {
-                                        HomeworkStatus.COMPLETED -> HomeworkStatus.NOT_COMPLETED
-                                        else -> HomeworkStatus.COMPLETED
+                                    viewModel.setSkipHomework(false)
+                                    if (isDone) {
+                                        viewModel.clearHomeworkInput(student.studentId)
+                                    } else {
+                                        viewModel.updateHomeworkInput(student.studentId) {
+                                            it.copy(status = HomeworkStatus.COMPLETED, isRecorded = true)
+                                        }
                                     }
-                                    viewModel.updateHomeworkInput(student.studentId) { it.copy(status = nextStatus) }
                                 },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (hw.status == HomeworkStatus.COMPLETED) EmeraldGreen else DangerRed
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    containerColor = if (isDone) EmeraldGreen else Color.Transparent,
+                                    contentColor = if (isDone) Color.White else EmeraldGreen
                                 ),
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                Text(if (hw.status == HomeworkStatus.COMPLETED) "مكتمل ✓" else "غير مكتمل ✗", fontSize = 12.sp)
+                                Text("مكتمل ✓", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.setSkipHomework(false)
+                                    if (isNotDone) {
+                                        viewModel.clearHomeworkInput(student.studentId)
+                                    } else {
+                                        viewModel.updateHomeworkInput(student.studentId) {
+                                            it.copy(status = HomeworkStatus.NOT_COMPLETED, isRecorded = true)
+                                        }
+                                    }
+                                },
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    containerColor = if (isNotDone) DangerRed else Color.Transparent,
+                                    contentColor = if (isNotDone) Color.White else DangerRed
+                                ),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("غير مكتمل ✗", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -771,7 +936,10 @@ fun StepHomeworkContent(uiState: StartLessonUiState, viewModel: StartLessonViewM
         Spacer(modifier = Modifier.height(12.dp))
 
         Button(
-            onClick = { viewModel.goToStep(StartLessonStep.EXAM_CHOICE) },
+            onClick = {
+                viewModel.setSkipHomework(false)
+                viewModel.goToStep(StartLessonStep.EXAM_CHOICE)
+            },
             colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
             shape = RoundedCornerShape(16.dp),
             modifier = Modifier
@@ -800,8 +968,12 @@ fun StepExamContent(uiState: StartLessonUiState, viewModel: StartLessonViewModel
                 style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
             )
             OutlinedButton(
-                onClick = { viewModel.goToStep(StartLessonStep.REVIEW) },
-                shape = RoundedCornerShape(12.dp)
+                onClick = {
+                    viewModel.setSkipExam(true)
+                    viewModel.goToStep(StartLessonStep.REVIEW)
+                },
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.testTag("start_lesson_skip_exam_button")
             ) {
                 Icon(imageVector = Icons.Default.SkipNext, contentDescription = null)
                 Spacer(modifier = Modifier.width(4.dp))
@@ -809,6 +981,12 @@ fun StepExamContent(uiState: StartLessonUiState, viewModel: StartLessonViewModel
             }
         }
 
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "لا يتم حفظ نتيجة امتحان إلا للطلاب الذين تم إدخال بياناتهم.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
         Spacer(modifier = Modifier.height(8.dp))
 
         LazyColumn(
@@ -824,21 +1002,66 @@ fun StepExamContent(uiState: StartLessonUiState, viewModel: StartLessonViewModel
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text(text = student.fullName, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold), color = PrimaryIndigo)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = student.fullName,
+                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                color = PrimaryIndigo
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (ex.isRecorded) {
+                                    Text(
+                                        text = "سيتم الحفظ ✓",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = EmeraldGreen
+                                    )
+                                    IconButton(
+                                        onClick = { viewModel.clearExamInput(student.studentId) },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Clear,
+                                            contentDescription = "مسح امتحان ${student.fullName}",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                } else {
+                                    Text(
+                                        text = "غير مسجل",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             OutlinedTextField(
                                 value = ex.examName,
-                                onValueChange = { t -> viewModel.updateExamInput(student.studentId) { it.copy(examName = t) } },
-                                label = { Text("اسم الامتحان") },
+                                onValueChange = { t ->
+                                    viewModel.setSkipExam(false)
+                                    viewModel.updateExamInput(student.studentId) {
+                                        it.copy(examName = t)
+                                    }
+                                },
+                                label = { Text("اسم الامتحان (مثال: اختبار الحصة)") },
                                 modifier = Modifier.weight(1.5f),
                                 singleLine = true,
                                 shape = RoundedCornerShape(8.dp)
                             )
                             OutlinedTextField(
                                 value = ex.scoreStr,
-                                onValueChange = { s -> viewModel.updateExamInput(student.studentId) { it.copy(scoreStr = s) } },
-                                label = { Text("الدرجة") },
+                                onValueChange = { s ->
+                                    viewModel.setSkipExam(false)
+                                    viewModel.updateExamInput(student.studentId) {
+                                        it.copy(scoreStr = s)
+                                    }
+                                },
+                                label = { Text("الدرجة (من ${ex.maxScoreStr.ifBlank { "10" }})") },
                                 modifier = Modifier.weight(1f),
                                 singleLine = true,
                                 shape = RoundedCornerShape(8.dp)
@@ -852,7 +1075,10 @@ fun StepExamContent(uiState: StartLessonUiState, viewModel: StartLessonViewModel
         Spacer(modifier = Modifier.height(12.dp))
 
         Button(
-            onClick = { viewModel.goToStep(StartLessonStep.REVIEW) },
+            onClick = {
+                viewModel.setSkipExam(false)
+                viewModel.goToStep(StartLessonStep.REVIEW)
+            },
             colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
             shape = RoundedCornerShape(16.dp),
             modifier = Modifier
@@ -869,6 +1095,10 @@ fun StepReviewContent(uiState: StartLessonUiState, viewModel: StartLessonViewMod
     val total = uiState.studentsInGroup.size
     val present = uiState.presentStudentIds.size
     val absent = (total - present).coerceAtLeast(0)
+    val recordedRecitations = uiState.recitationsMap.values.count { it.isRecorded }
+    val recordedHomework = uiState.homeworkMap.values.count { it.isRecorded }
+    val recordedExams = uiState.examsMap.values.count { it.isRecorded }
+    val groupDisplayName = uiState.selectedGroupName.ifBlank { uiState.selectedGradeName }
 
     Column(
         modifier = Modifier
@@ -893,10 +1123,17 @@ fun StepReviewContent(uiState: StartLessonUiState, viewModel: StartLessonViewMod
                 verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12)
             ) {
                 Text(
-                    text = "المجموعة: ${uiState.selectedGradeName}",
+                    text = "المجموعة: $groupDisplayName",
                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                     color = PrimaryIndigo
                 )
+                if (uiState.selectedGradeName.isNotBlank() && uiState.selectedGroupName.isNotBlank()) {
+                    Text(
+                        text = "الصف: ${uiState.selectedGradeName}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Text(
                     text = "إجمالي الطلاب: $total",
                     style = MaterialTheme.typography.bodyLarge
@@ -909,15 +1146,33 @@ fun StepReviewContent(uiState: StartLessonUiState, viewModel: StartLessonViewMod
 
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("التسميع:")
-                    Text("مسجل (${uiState.recitationsMap.size} طالب)")
+                    Text(
+                        when {
+                            uiState.skipRecitation -> "تم التخطي"
+                            recordedRecitations == 0 -> "لم يُسجَّل لأي طالب"
+                            else -> "مسجل ($recordedRecitations طالب)"
+                        }
+                    )
                 }
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("الواجب:")
-                    Text("مسجل (${uiState.homeworkMap.size} طالب)")
+                    Text(
+                        when {
+                            uiState.skipHomework -> "تم التخطي"
+                            recordedHomework == 0 -> "لم يُسجَّل لأي طالب"
+                            else -> "مسجل ($recordedHomework طالب)"
+                        }
+                    )
                 }
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("الامتحان:")
-                    Text("مسجل (${uiState.examsMap.size} طالب)")
+                    Text(
+                        when {
+                            uiState.skipExam -> "تم التخطي"
+                            recordedExams == 0 -> "لم يُسجَّل لأي طالب"
+                            else -> "مسجل ($recordedExams طالب)"
+                        }
+                    )
                 }
             }
         }

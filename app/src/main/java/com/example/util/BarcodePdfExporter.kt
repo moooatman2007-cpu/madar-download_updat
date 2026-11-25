@@ -132,16 +132,20 @@ object BarcodePdfExporter {
             val cardRect = RectF(left, top, right, bottom)
             canvas.drawRoundRect(cardRect, 10f, 10f, cardBorderPaint)
 
-            // Draw Barcode (Code 128 with QR fallback)
-            val barcodeCode = student.studentCode.ifBlank { "ST-000" }
-            val barcodeBitmap = BarcodeGenerator.generateCode128Bitmap(
-                content = barcodeCode,
-                width = (right - left - 24f).toInt().coerceAtLeast(100),
-                height = (cardHeight * 0.45f).toInt().coerceAtLeast(50)
-            ) ?: BarcodeGenerator.generateQRCodeBitmap(
-                content = barcodeCode,
-                size = (cardHeight * 0.45f).toInt().coerceAtLeast(60)
-            )
+            // Draw Barcode (Code 128 with QR fallback) only if studentCode is non-blank
+            val barcodeCode = student.studentCode.trim()
+            val barcodeBitmap = if (barcodeCode.isNotBlank()) {
+                BarcodeGenerator.generateCode128Bitmap(
+                    content = barcodeCode,
+                    width = (right - left - 24f).toInt().coerceAtLeast(100),
+                    height = (cardHeight * 0.45f).toInt().coerceAtLeast(50)
+                ) ?: BarcodeGenerator.generateQRCodeBitmap(
+                    content = barcodeCode,
+                    size = (cardHeight * 0.45f).toInt().coerceAtLeast(60)
+                )
+            } else {
+                null
+            }
 
             if (barcodeBitmap != null) {
                 val bcLeft = left + (cardWidth - 16f - barcodeBitmap.width) / 2f
@@ -157,7 +161,7 @@ object BarcodePdfExporter {
 
             // Student Code
             val codeY = nameY + 16f
-            canvas.drawText(barcodeCode, centerX, codeY, codePaint)
+            canvas.drawText(barcodeCode.ifBlank { "بدون كود" }, centerX, codeY, codePaint)
         }
     }
 

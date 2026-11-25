@@ -48,6 +48,7 @@ sealed class Screen(val route: String) {
     data object StudentBarcodes : Screen("student_barcodes")
     data object StartLesson : Screen("start_lesson")
     data object Groups : Screen("groups")
+    data object Grades : Screen("grades")
     data object AddGroup : Screen("add_group")
     data object EditGroup : Screen("edit_group/{groupId}") {
         fun createRoute(groupId: String): String = "edit_group/$groupId"

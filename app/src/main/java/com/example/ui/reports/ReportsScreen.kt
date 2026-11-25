@@ -2201,7 +2201,7 @@ fun LazyListScope.studentReportContent(
             Row(horizontalArrangement = Arrangement.spacedBy(Dimens.Spacing12)) {
                 ReportMetricCard(
                     title = "الحضور",
-                    value = String.format(Locale.US, "%.0f%%", report.attendancePercent),
+                    value = String.format(Locale.US, "%.1f%%", report.attendancePercent),
                     subtitle = "حاضر: ${report.presentCount} | غائب: ${report.absentCount}",
                     color = EmeraldGreen,
                     icon = Icons.Default.CheckCircle,
@@ -2209,7 +2209,7 @@ fun LazyListScope.studentReportContent(
                 )
                 ReportMetricCard(
                     title = "التسميع",
-                    value = String.format(Locale.US, "%.0f%%", report.recitationAvg),
+                    value = String.format(Locale.US, "%.1f%%", report.recitationAvg),
                     subtitle = "عدد المرات: ${report.recitationCount}",
                     color = PrimaryIndigo,
                     icon = Icons.Default.AutoStories,
@@ -2219,7 +2219,7 @@ fun LazyListScope.studentReportContent(
             Row(horizontalArrangement = Arrangement.spacedBy(Dimens.Spacing12)) {
                 ReportMetricCard(
                     title = "الواجبات",
-                    value = String.format(Locale.US, "%.0f%%", report.homeworkPercent),
+                    value = String.format(Locale.US, "%.1f%%", report.homeworkPercent),
                     subtitle = "تم: ${report.homeworkCompletedCount} | لم يتم: ${report.homeworkIncompleteCount}",
                     color = ElectricBlue,
                     icon = Icons.AutoMirrored.Filled.Assignment,
@@ -2227,7 +2227,7 @@ fun LazyListScope.studentReportContent(
                 )
                 ReportMetricCard(
                     title = "الامتحانات",
-                    value = String.format(Locale.US, "%.0f%%", report.examAvg),
+                    value = String.format(Locale.US, "%.1f%%", report.examAvg),
                     subtitle = "عدد الامتحانات: ${report.examCount}",
                     color = VioletPurple,
                     icon = Icons.Default.School,
