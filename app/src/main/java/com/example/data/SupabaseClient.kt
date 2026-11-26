@@ -12,6 +12,7 @@ import io.github.jan.supabase.postgrest.Postgrest
 import io.github.jan.supabase.storage.Storage
 import io.github.jan.supabase.serializer.KotlinXSerializer
 import kotlinx.serialization.json.Json
+import kotlin.time.Duration.Companion.seconds
 
 object SupabaseClientProvider {
     @Volatile
@@ -137,6 +138,7 @@ object SupabaseClientProvider {
             supabaseUrl = if (supabaseUrl.isNotBlank()) supabaseUrl else "https://placeholder.supabase.co",
             supabaseKey = if (supabaseKey.isNotBlank()) supabaseKey else "placeholder-key"
         ) {
+            requestTimeout = 60.seconds
             install(Auth) {
                 scheme = "studentmanager"
                 host = "login-callback"

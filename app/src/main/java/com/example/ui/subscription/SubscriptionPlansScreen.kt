@@ -1,55 +1,57 @@
 package com.example.ui.subscription
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.HourglassTop
+import androidx.compose.material.icons.automirrored.filled.ReceiptLong
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.WorkspacePremium
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -61,17 +63,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.core.model.SubscriptionPlan
-import com.example.core.model.TeacherSubscriptionRequest
-import com.example.ui.theme.AmberWarning
-import com.example.ui.theme.AmberWarningLight
-import com.example.ui.theme.DarkNavyCard
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.DangerRedLight
 import com.example.ui.theme.Dimens
 import com.example.ui.theme.EmeraldGreen
-import com.example.ui.theme.EmeraldGreenLight
 import com.example.ui.theme.PrimaryIndigo
+import com.example.util.ReceiptFileProcessor
+import com.example.util.WhatsAppReceiptSharer
+import com.example.util.WhatsAppShareResult
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -81,22 +82,32 @@ fun SubscriptionPlansScreen(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
 
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+    var copiedRecently by remember { mutableStateOf(false) }
+    var whatsappNotInstalled by remember { mutableStateOf(false) }
+
+    val receiptPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
-            try {
-                val inputStream = context.contentResolver.openInputStream(uri)
-                val bytes = inputStream?.readBytes()
-                inputStream?.close()
-                if (bytes != null) {
-                    val fileName = uri.lastPathSegment?.substringAfterLast("/") ?: "receipt.jpg"
-                    viewModel.setReceipt(bytes, fileName)
-                }
-            } catch (_: Exception) {
-                // Ignore read failure
-            }
+            viewModel.onReceiptUriPicked(context, uri)
+        }
+    }
+
+    LaunchedEffect(copiedRecently) {
+        if (copiedRecently) {
+            delay(3000L)
+            copiedRecently = false
+        }
+    }
+
+    val confirmation = uiState.submittedConfirmation
+    if (confirmation != null) {
+        BackHandler {
+            whatsappNotInstalled = false
+            viewModel.dismissConfirmation()
         }
     }
 
@@ -110,7 +121,17 @@ fun SubscriptionPlansScreen(
                     )
                 },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
+                    IconButton(
+                        onClick = {
+                            if (confirmation != null) {
+                                whatsappNotInstalled = false
+                                viewModel.dismissConfirmation()
+                            } else {
+                                onNavigateBack()
+                            }
+                        },
+                        modifier = Modifier.testTag("subscription_back_button")
+                    ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "رجوع"
@@ -118,11 +139,13 @@ fun SubscriptionPlansScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = { viewModel.loadData() }) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "تحديث"
-                        )
+                    if (confirmation == null) {
+                        IconButton(onClick = { viewModel.loadData() }) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "تحديث"
+                            )
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -130,10 +153,96 @@ fun SubscriptionPlansScreen(
                 )
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         containerColor = MaterialTheme.colorScheme.background,
         modifier = Modifier.testTag("subscription_plans_screen")
     ) { innerPadding ->
         when {
+            confirmation != null -> {
+                val waMessage = remember(confirmation) {
+                    WhatsAppReceiptSharer.buildSubscriptionWhatsAppMessage(
+                        teacherName = confirmation.teacherName,
+                        planName = confirmation.planName,
+                        price = confirmation.price,
+                        billingPeriod = confirmation.billingPeriod,
+                        durationDays = confirmation.durationDays,
+                        transferReference = confirmation.transferReference,
+                        registeredPhone = confirmation.teacherRegisteredPhone
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = Dimens.Spacing20, vertical = Dimens.Spacing16)
+                ) {
+                    SubscriptionSuccessConfirmationView(
+                        confirmation = confirmation,
+                        transferNumber = uiState.transferNumber,
+                        whatsappNotInstalled = whatsappNotInstalled,
+                        onSendViaWhatsApp = {
+                            val result = WhatsAppReceiptSharer.shareReceiptToWhatsApp(
+                                context = context,
+                                receiptCachePath = confirmation.receiptCachePath,
+                                receiptMimeType = confirmation.receiptMimeType,
+                                message = waMessage
+                            )
+                            when (result) {
+                                WhatsAppShareResult.OpenedWhatsApp -> {
+                                    whatsappNotInstalled = false
+                                }
+                                WhatsAppShareResult.WhatsAppNotInstalled -> {
+                                    whatsappNotInstalled = true
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar("تطبيق WhatsApp غير مثبت، يمكنك نسخ الرسالة أو مشاركة الإيصال بالأسفل.")
+                                    }
+                                }
+                                is WhatsAppShareResult.Failed -> {
+                                    whatsappNotInstalled = true
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar(result.message)
+                                    }
+                                }
+                            }
+                        },
+                        onOpenDirectWhatsAppChat = {
+                            val result = WhatsAppReceiptSharer.openDirectWhatsAppChat(
+                                context = context,
+                                message = waMessage
+                            )
+                            if (result != WhatsAppShareResult.OpenedWhatsApp) {
+                                whatsappNotInstalled = true
+                            }
+                        },
+                        onCopyWhatsAppMessage = {
+                            copyToClipboard(context, "بيانات طلب الاشتراك", waMessage)
+                            coroutineScope.launch {
+                                snackbarHostState.showSnackbar("تم نسخ نص الرسالة")
+                            }
+                        },
+                        onShareViaOtherApp = {
+                            val opened = WhatsAppReceiptSharer.shareReceiptViaChooser(
+                                context = context,
+                                receiptCachePath = confirmation.receiptCachePath,
+                                receiptMimeType = confirmation.receiptMimeType,
+                                message = waMessage
+                            )
+                            if (!opened) {
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("تعذر فتح قائمة المشاركة على هذا الجهاز.")
+                                }
+                            }
+                        },
+                        onDone = {
+                            whatsappNotInstalled = false
+                            viewModel.dismissConfirmation()
+                        }
+                    )
+                }
+            }
+
             uiState.isLoading -> {
                 Box(
                     modifier = Modifier
@@ -172,52 +281,31 @@ fun SubscriptionPlansScreen(
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(innerPadding),
+                        .padding(innerPadding)
+                        .imePadding(),
                     contentPadding = PaddingValues(
                         horizontal = Dimens.Spacing20,
                         vertical = Dimens.Spacing16
                     ),
                     verticalArrangement = Arrangement.spacedBy(Dimens.Spacing16)
                 ) {
-                    // Success / Error Banner
-                    if (!uiState.submitSuccessMessage.isNullOrBlank()) {
-                        item {
-                            Surface(
-                                shape = RoundedCornerShape(Dimens.Radius12),
-                                color = EmeraldGreenLight,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(Dimens.Spacing16),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircle,
-                                        contentDescription = null,
-                                        tint = EmeraldGreen
-                                    )
-                                    Spacer(modifier = Modifier.width(Dimens.Spacing12))
-                                    Text(
-                                        text = uiState.submitSuccessMessage!!,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = EmeraldGreen,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                            }
+                    // 1. Subscription Request Title + Current Subscription Status
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12)) {
+                            Text(
+                                text = "طلب الاشتراك",
+                                style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.testTag("subscription_request_title")
+                            )
+                            CurrentSubscriptionBanner(
+                                currentPlan = uiState.currentPlan,
+                                subscriptionStatus = uiState.subscriptionStatus,
+                                endDate = uiState.subscriptionEndDate
+                            )
                         }
                     }
 
-                    // Current Subscription Banner
-                    item {
-                        CurrentSubscriptionBanner(
-                            currentPlan = uiState.currentPlan,
-                            subscriptionStatus = uiState.subscriptionStatus,
-                            endDate = uiState.subscriptionEndDate
-                        )
-                    }
-
-                    // Pending Request Banner
                     if (uiState.pendingRequest != null) {
                         item {
                             PendingRequestCard(
@@ -227,24 +315,189 @@ fun SubscriptionPlansScreen(
                         }
                     }
 
-                    // Plans Section Header
+                    // 2. Transfer Number (01040129414) + Copy Button + Selected Price (Before plan selection)
+                    item {
+                        TransferInstructionsCard(
+                            transferNumber = uiState.transferNumber,
+                            selectedPlan = uiState.selectedPlan,
+                            selectedPrice = uiState.selectedPlanPrice,
+                            selectedDurationDays = uiState.selectedPlanDurationDays,
+                            selectedBillingPeriod = uiState.selectedBillingPeriod,
+                            copiedRecently = copiedRecently,
+                            onCopyNumber = {
+                                copyToClipboard(context, "رقم التحويل", uiState.transferNumber)
+                                copiedRecently = true
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar("تم نسخ رقم التحويل")
+                                }
+                            }
+                        )
+                    }
+
+                    // 3. Plan Selection
                     item {
                         Text(
-                            text = "الباقات المتاحة",
+                            text = "اختيار الباقة",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onSurface
                         )
                     }
 
-                    // Plan Cards
                     items(uiState.plans, key = { it.id }) { plan ->
                         val isCurrent = uiState.currentPlan?.id == plan.id
-                        PlanCard(
+                        val isSelected = uiState.selectedPlan?.id == plan.id
+                        PlanSelectionCard(
                             plan = plan,
                             isCurrent = isCurrent,
+                            isSelected = isSelected,
                             hasPendingRequest = uiState.hasPendingRequest,
                             onSelect = { viewModel.selectPlan(plan) }
                         )
+                    }
+
+                    // 4..8. Selected Plan Details, Payment Inputs, Receipt Upload & Submit Button
+                    val selectedPlan = uiState.selectedPlan
+                    if (selectedPlan != null) {
+                        val isFree = uiState.isSelectedPlanFree
+                        val price = uiState.selectedPlanPrice ?: 0.0
+                        val durationDays = uiState.selectedPlanDurationDays ?: 30
+
+                        // 4. Display Price and Duration
+                        item {
+                            SelectedPlanSummaryCard(
+                                selectedPlan = selectedPlan,
+                                selectedBillingPeriod = uiState.selectedBillingPeriod,
+                                isFree = isFree,
+                                price = price,
+                                durationDays = durationDays,
+                                onSelectBillingPeriod = viewModel::selectBillingPeriod
+                            )
+                        }
+
+                        if (!isFree) {
+                            // 5. Payer Phone Number
+                            item {
+                                OutlinedTextField(
+                                    value = uiState.payerPhone,
+                                    onValueChange = viewModel::updatePayerPhone,
+                                    label = { Text("رقم هاتف المحوّل") },
+                                    placeholder = { Text("01XXXXXXXXX") },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Default.Phone,
+                                            contentDescription = null,
+                                            tint = PrimaryIndigo
+                                        )
+                                    },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                                    singleLine = true,
+                                    enabled = !uiState.isSubmitting && !uiState.hasPendingRequest,
+                                    shape = RoundedCornerShape(Dimens.Radius12),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("payer_phone_input")
+                                )
+                            }
+
+                            // 6. Optional Transfer Reference
+                            item {
+                                OutlinedTextField(
+                                    value = uiState.transferReference,
+                                    onValueChange = viewModel::updateTransferReference,
+                                    label = { Text("رقم العملية (اختياري)") },
+                                    placeholder = { Text("أدخل رقم العملية إن وجد") },
+                                    supportingText = {
+                                        Text("يمكنك إرسال الطلب بدون رقم العملية إذا لم يتوفر.")
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.ReceiptLong,
+                                            contentDescription = null,
+                                            tint = PrimaryIndigo
+                                        )
+                                    },
+                                    singleLine = true,
+                                    enabled = !uiState.isSubmitting && !uiState.hasPendingRequest,
+                                    shape = RoundedCornerShape(Dimens.Radius12),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("transfer_reference_input")
+                                )
+                            }
+
+                            // 7. Payment Receipt Upload
+                            item {
+                                ReceiptUploadSection(
+                                    uploadState = uiState.receiptUploadState,
+                                    enabled = !uiState.isSubmitting && !uiState.hasPendingRequest,
+                                    onPickFile = {
+                                        receiptPickerLauncher.launch(ReceiptFileProcessor.PICKER_MIME_TYPES)
+                                    },
+                                    onRetryUpload = viewModel::retryReceiptUpload,
+                                    onRemoveFile = viewModel::removeReceipt
+                                )
+                            }
+                        }
+
+                        // Error banner if submit fails
+                        if (!uiState.submitErrorMessage.isNullOrBlank()) {
+                            item {
+                                Surface(
+                                    shape = RoundedCornerShape(Dimens.Radius12),
+                                    color = DangerRedLight,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("submit_error_banner")
+                                ) {
+                                    Text(
+                                        text = uiState.submitErrorMessage!!,
+                                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                                        color = DangerRed,
+                                        modifier = Modifier.padding(Dimens.Spacing12)
+                                    )
+                                }
+                            }
+                        }
+
+                        // 8. Submit Subscription Request Button
+                        item {
+                            Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing6)) {
+                                if (!isFree && !uiState.isReceiptUploaded && !uiState.hasPendingRequest) {
+                                    Text(
+                                        text = "يرجى رفع إيصال الدفع بنجاح أولاً لتفعيل زر إرسال الطلب.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Button(
+                                    onClick = viewModel::submitRequest,
+                                    enabled = uiState.canSubmitRequest,
+                                    shape = RoundedCornerShape(Dimens.Radius16),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isFree) EmeraldGreen else PrimaryIndigo
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(54.dp)
+                                        .testTag("submit_subscription_button")
+                                ) {
+                                    if (uiState.isSubmitting) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(20.dp),
+                                            color = Color.White,
+                                            strokeWidth = 2.dp
+                                        )
+                                        Spacer(modifier = Modifier.width(Dimens.Spacing10))
+                                        Text("جاري إرسال الطلب...", fontWeight = FontWeight.Bold)
+                                    } else {
+                                        Text(
+                                            text = "إرسال طلب الاشتراك",
+                                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Request History
@@ -264,488 +517,13 @@ fun SubscriptionPlansScreen(
                 }
             }
         }
-
-        // Subscription Request Dialog
-        val selectedPlan = uiState.selectedPlan
-        if (selectedPlan != null) {
-            SubscriptionRequestDialog(
-                plan = selectedPlan,
-                billingPeriod = uiState.selectedBillingPeriod,
-                payerPhone = uiState.payerPhone,
-                transferReference = uiState.transferReference,
-                receiptFileName = uiState.receiptFileName,
-                isSubmitting = uiState.isSubmitting,
-                errorMessage = uiState.submitErrorMessage,
-                onBillingPeriodChange = viewModel::selectBillingPeriod,
-                onPayerPhoneChange = viewModel::updatePayerPhone,
-                onTransferReferenceChange = viewModel::updateTransferReference,
-                onPickReceipt = { imagePickerLauncher.launch("image/*") },
-                onSubmit = viewModel::submitRequest,
-                onDismiss = viewModel::dismissPlanSelection
-            )
-        }
     }
 }
 
-@Composable
-private fun CurrentSubscriptionBanner(
-    currentPlan: SubscriptionPlan?,
-    subscriptionStatus: String?,
-    endDate: String?
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(Dimens.Radius20),
-        colors = CardDefaults.cardColors(containerColor = DarkNavyCard)
-    ) {
-        Column(modifier = Modifier.padding(Dimens.Spacing20)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.WorkspacePremium,
-                    contentDescription = null,
-                    tint = Color(0xFFFBBF24),
-                    modifier = Modifier.size(28.dp)
-                )
-                Spacer(modifier = Modifier.width(Dimens.Spacing12))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "باقتك الحالية",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color.White.copy(alpha = 0.7f)
-                    )
-                    Text(
-                        text = currentPlan?.name ?: "مجاني",
-                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-                        color = Color.White
-                    )
-                }
-                val statusLabel = when (subscriptionStatus?.lowercase()) {
-                    "active" -> "نشط"
-                    "expired" -> "منتهي"
-                    "trial" -> "تجريبي"
-                    else -> if (currentPlan?.code == "free") "مجاني" else "غير محدد"
-                }
-                Surface(
-                    shape = RoundedCornerShape(Dimens.Radius8),
-                    color = if (subscriptionStatus == "expired") DangerRed else EmeraldGreen
-                ) {
-                    Text(
-                        text = statusLabel,
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                        color = Color.White,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.height(Dimens.Spacing12))
-            HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
-            Spacer(modifier = Modifier.height(Dimens.Spacing12))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "الحد الأقصى للطلاب: ${currentPlan?.studentLimit ?: 20} طالب",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.White.copy(alpha = 0.85f)
-                )
-                if (!endDate.isNullOrBlank()) {
-                    Text(
-                        text = "ينتهي: ${endDate.take(10)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.White.copy(alpha = 0.85f)
-                    )
-                }
-            }
-        }
+private fun copyToClipboard(context: Context, label: String, text: String) {
+    try {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboard?.setPrimaryClip(ClipData.newPlainText(label, text))
+    } catch (_: Exception) {
     }
-}
-
-@Composable
-private fun PendingRequestCard(
-    request: TeacherSubscriptionRequest,
-    plans: List<SubscriptionPlan>
-) {
-    val planName = plans.find { it.id == request.planId }?.name ?: "باقة"
-    Surface(
-        shape = RoundedCornerShape(Dimens.Radius16),
-        color = AmberWarningLight,
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Row(
-            modifier = Modifier.padding(Dimens.Spacing16),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = Icons.Default.HourglassTop,
-                contentDescription = null,
-                tint = AmberWarning,
-                modifier = Modifier.size(28.dp)
-            )
-            Spacer(modifier = Modifier.width(Dimens.Spacing12))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "طلب اشتراك قيد المراجعة",
-                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                    color = AmberWarning
-                )
-                Text(
-                    text = "الباقة: $planName • المدة: ${if (request.billingPeriod == "annual") "سنوي" else "شهري"} • السعر: ${request.priceAtRequest.toLong()} ج.م",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF92400E)
-                )
-                Text(
-                    text = "سيتم تفعيل الباقة فور مراجعة الإدارة والموافقة على الطلب.",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color(0xFF92400E)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun PlanCard(
-    plan: SubscriptionPlan,
-    isCurrent: Boolean,
-    hasPendingRequest: Boolean,
-    onSelect: () -> Unit
-) {
-    val isPro = plan.code == "pro"
-    val borderColor = when {
-        isCurrent -> EmeraldGreen
-        isPro -> PrimaryIndigo
-        else -> MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(Dimens.Radius20),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = BorderStroke(if (isCurrent || isPro) 2.dp else 1.dp, borderColor),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (isPro) 3.dp else 1.dp)
-    ) {
-        Column(modifier = Modifier.padding(Dimens.Spacing20)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = plan.name,
-                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    if (isPro) {
-                        Spacer(modifier = Modifier.width(Dimens.Spacing8))
-                        Surface(
-                            shape = RoundedCornerShape(Dimens.Radius8),
-                            color = PrimaryIndigo.copy(alpha = 0.1f)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Star,
-                                    contentDescription = null,
-                                    tint = PrimaryIndigo,
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "الأكثر تميزاً",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                    color = PrimaryIndigo
-                                )
-                            }
-                        }
-                    }
-                }
-
-                if (isCurrent) {
-                    Surface(
-                        shape = RoundedCornerShape(Dimens.Radius8),
-                        color = EmeraldGreenLight
-                    ) {
-                        Text(
-                            text = "الباقة الحالية",
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                            color = EmeraldGreen,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(Dimens.Spacing12))
-
-            // Pricing
-            if (plan.monthlyPrice == 0.0) {
-                Text(
-                    text = "مجاني",
-                    style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
-                    color = EmeraldGreen
-                )
-            } else {
-                val annualPrice = (plan.monthlyPrice * 10).toLong()
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text(
-                        text = "${plan.monthlyPrice.toLong()} ج.م",
-                        style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
-                        color = PrimaryIndigo
-                    )
-                    Text(
-                        text = " / شهرياً",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Text(
-                    text = "أو $annualPrice ج.م سنوياً (توفير شهرين)",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = EmeraldGreen
-                )
-            }
-
-            Spacer(modifier = Modifier.height(Dimens.Spacing8))
-            Text(
-                text = "حتى ${plan.studentLimit} طالب",
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                color = MaterialTheme.colorScheme.onSurface
-            )
-
-            if (plan.features.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(Dimens.Spacing12))
-                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
-                Spacer(modifier = Modifier.height(Dimens.Spacing12))
-                plan.features.forEach { feature ->
-                    Row(
-                        modifier = Modifier.padding(vertical = 3.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = null,
-                            tint = EmeraldGreen,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(Dimens.Spacing8))
-                        Text(
-                            text = feature,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(Dimens.Spacing16))
-
-            Button(
-                onClick = onSelect,
-                enabled = !isCurrent && !hasPendingRequest,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(Dimens.Radius12),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isPro) PrimaryIndigo else EmeraldGreen
-                )
-            ) {
-                Text(
-                    text = when {
-                        isCurrent -> "باقتك الحالية"
-                        hasPendingRequest -> "يوجد طلب قيد المراجعة"
-                        plan.code == "free" -> "اختيار الباقة المجانية"
-                        else -> "اشترك الآن"
-                    },
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun RequestHistoryItem(
-    request: TeacherSubscriptionRequest,
-    plans: List<SubscriptionPlan>
-) {
-    val planName = plans.find { it.id == request.planId }?.name ?: "باقة"
-    val (statusText, statusColor, bgColor) = when (request.status.lowercase()) {
-        "approved" -> Triple("تمت الموافقة", EmeraldGreen, EmeraldGreenLight)
-        "rejected" -> Triple("مرفوض", DangerRed, DangerRedLight)
-        else -> Triple("قيد المراجعة", AmberWarning, AmberWarningLight)
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(Dimens.Radius12),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(Dimens.Spacing14),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "$planName (${if (request.billingPeriod == "annual") "سنوي" else "شهري"})",
-                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
-                )
-                Text(
-                    text = "${request.priceAtRequest.toLong()} ج.م • ${request.createdAt.take(10)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                if (!request.adminNote.isNullOrBlank()) {
-                    Text(
-                        text = "ملاحظة الإدارة: ${request.adminNote}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
-            }
-            Surface(
-                shape = RoundedCornerShape(Dimens.Radius8),
-                color = bgColor
-            ) {
-                Text(
-                    text = statusText,
-                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                    color = statusColor,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SubscriptionRequestDialog(
-    plan: SubscriptionPlan,
-    billingPeriod: String,
-    payerPhone: String,
-    transferReference: String,
-    receiptFileName: String?,
-    isSubmitting: Boolean,
-    errorMessage: String?,
-    onBillingPeriodChange: (String) -> Unit,
-    onPayerPhoneChange: (String) -> Unit,
-    onTransferReferenceChange: (String) -> Unit,
-    onPickReceipt: () -> Unit,
-    onSubmit: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    val isFree = plan.code == "free"
-    AlertDialog(
-        onDismissRequest = { if (!isSubmitting) onDismiss() },
-        title = {
-            Text(
-                text = "طلب الاشتراك في باقة ${plan.name}",
-                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
-            )
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12)) {
-                if (isFree) {
-                    Text(
-                        text = "سيتم إرسال طلب تفعيل الباقة المجانية (${plan.studentLimit} طالب). لا يلزم تحويل مالي.",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                } else {
-                    Text(
-                        text = "اختر مدة الاشتراك:",
-                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(Dimens.Spacing8)) {
-                        FilterChip(
-                            selected = billingPeriod == "monthly",
-                            onClick = { onBillingPeriodChange("monthly") },
-                            label = { Text("شهري (${plan.monthlyPrice.toLong()} ج.م)") }
-                        )
-                        FilterChip(
-                            selected = billingPeriod == "annual",
-                            onClick = { onBillingPeriodChange("annual") },
-                            label = { Text("سنوي (${(plan.monthlyPrice * 10).toLong()} ج.م)") }
-                        )
-                    }
-
-                    Text(
-                        text = "طريقة الدفع: فودافون كاش (Vodafone Cash)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    OutlinedTextField(
-                        value = payerPhone,
-                        onValueChange = onPayerPhoneChange,
-                        label = { Text("رقم الهاتف المحوّل منه") },
-                        placeholder = { Text("010XXXXXXXX") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    OutlinedTextField(
-                        value = transferReference,
-                        onValueChange = onTransferReferenceChange,
-                        label = { Text("رقم العملية / المرجع") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    OutlinedButton(
-                        onClick = onPickReceipt,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(Dimens.Radius12)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CloudUpload,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(Dimens.Spacing8))
-                        Text(
-                            text = if (receiptFileName != null) "تم اختيار: $receiptFileName" else "إرفاق صورة إيصال الدفع"
-                        )
-                    }
-                }
-
-                if (!errorMessage.isNullOrBlank()) {
-                    Text(
-                        text = errorMessage,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = onSubmit,
-                enabled = !isSubmitting
-            ) {
-                if (isSubmitting) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        color = Color.White,
-                        strokeWidth = 2.dp
-                    )
-                } else {
-                    Text("إرسال الطلب")
-                }
-            }
-        },
-        dismissButton = {
-            TextButton(
-                onClick = onDismiss,
-                enabled = !isSubmitting
-            ) {
-                Text("إلغاء")
-            }
-        }
-    )
 }

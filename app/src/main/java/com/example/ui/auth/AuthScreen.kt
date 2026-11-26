@@ -480,8 +480,9 @@ fun AuthScreen(
                     showResetDialog = true
                 },
                 onWhatsAppClick = {
+                    val waTarget = com.example.core.config.PaymentSupportConfig.WHATSAPP_TARGET_E164_NO_PLUS
                     val intent = Intent(Intent.ACTION_VIEW).apply {
-                        data = Uri.parse("https://wa.me/201040129414?text=" + Uri.encode("السلام عليكم، أريد تفعيل حساب المدرس في تطبيق مدار."))
+                        data = Uri.parse("https://wa.me/$waTarget?text=" + Uri.encode("السلام عليكم، أريد تفعيل حساب المدرس في تطبيق مدار."))
                     }
                     context.startActivity(intent)
                 }

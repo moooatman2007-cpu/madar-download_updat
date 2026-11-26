@@ -123,8 +123,9 @@ fun StatusScreen(
                         } else {
                             "السلام عليكم، أريد الاستفسار عن حالة حساب المدرس في تطبيق مدار."
                         }
+                        val waTarget = com.example.core.config.PaymentSupportConfig.WHATSAPP_TARGET_E164_NO_PLUS
                         val intent = Intent(Intent.ACTION_VIEW).apply {
-                            data = Uri.parse("https://wa.me/201040129414?text=" + Uri.encode(messageBody))
+                            data = Uri.parse("https://wa.me/$waTarget?text=" + Uri.encode(messageBody))
                         }
                         context.startActivity(intent)
                     },

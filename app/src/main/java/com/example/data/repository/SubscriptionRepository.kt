@@ -40,10 +40,20 @@ interface SubscriptionRepository {
     suspend fun getRequestHistory(teacherId: String): List<TeacherSubscriptionRequest>
 
     /**
-     * Upload a payment receipt image to the `subscription-receipts` bucket.
-     * Returns the storage path on success.
+     * Upload a payment receipt image or PDF to the private `subscription-receipts` bucket.
+     * Returns the storage object path on success (never a public URL).
      */
-    suspend fun uploadReceipt(bytes: ByteArray, fileName: String, teacherId: String): Result<String>
+    suspend fun uploadReceipt(
+        bytes: ByteArray,
+        fileName: String,
+        teacherId: String,
+        mimeType: String = "image/jpeg"
+    ): Result<String>
+
+    /**
+     * Best-effort deletion of a previously uploaded receipt before submission if the user replaces/removes it.
+     */
+    suspend fun deleteReceipt(receiptPath: String): Result<Unit> = Result.success(Unit)
 
     /**
      * Submit a subscription request via the `submit_teacher_subscription_request` RPC.
@@ -53,7 +63,7 @@ interface SubscriptionRepository {
         billingPeriod: String,
         paymentMethod: String,
         payerPhone: String,
-        transferReference: String,
+        transferReference: String?,
         receiptPath: String,
         idempotencyKey: String
     ): Result<SubmitSubscriptionResult>
