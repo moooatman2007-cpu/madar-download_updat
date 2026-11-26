@@ -1,9 +1,6 @@
 package com.example
 
-import android.content.Context
 import androidx.lifecycle.SavedStateHandle
-import androidx.room.Room
-import androidx.test.core.app.ApplicationProvider
 import com.example.core.model.Grade
 import com.example.core.model.Group
 import com.example.core.model.GroupDay
@@ -11,23 +8,17 @@ import com.example.core.model.Student
 import com.example.core.model.Teacher
 import com.example.data.SupabaseClientProvider
 import com.example.data.auth.AccountSessionManager
-import com.example.data.local.AppDatabase
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.GroupDao
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.dao.StudentDao
-import com.example.data.local.mapper.toEntity
 import com.example.data.repository.GroupRemoteDataSource
 import com.example.data.repository.MockGradeRepository
 import com.example.data.repository.MockGroupRepository
 import com.example.data.repository.MockStudentRepository
 import com.example.data.repository.MockTeacherRepository
 import com.example.data.repository.SupabaseGroupRepository
-import java.net.UnknownHostException
 import com.example.ui.add_edit_student.AddEditStudentEvent
 import com.example.ui.add_edit_student.AddEditStudentViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -46,6 +37,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.net.UnknownHostException
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -53,10 +45,6 @@ class AddEditStudentGroupSelectionTest {
 
     private val testDispatcher = StandardTestDispatcher()
     private val teacherT1 = Teacher(id = "teacher_1", fullName = "أحمد المدرس", email = "t1@example.com")
-    private val teacherT2 = Teacher(id = "teacher_2", fullName = "محمود المدرس", email = "t2@example.com")
-
-    private val gradeG1 = Grade(id = "grade_1", name = "الصف الأول الإعدادي", teacherId = "teacher_1", displayOrder = 1)
-    private val gradeG2 = Grade(id = "grade_2", name = "الصف الثاني الإعدادي", teacherId = "teacher_1", displayOrder = 2)
 
     private lateinit var teacherRepository: MockTeacherRepository
     private lateinit var gradeRepository: MockGradeRepository
@@ -97,7 +85,6 @@ class AddEditStudentGroupSelectionTest {
         Dispatchers.resetMain()
     }
 
-    // 1. loadGroupsForSelectedGrade
     @Test
     fun `1 loadGroupsForSelectedGrade loads active groups for the selected grade`() = runTest {
         val group1 = createTestGroup(id = "grp_1", teacherId = "teacher_1", gradeId = "grade_1", name = "مجموعة أ", active = true)
@@ -123,7 +110,6 @@ class AddEditStudentGroupSelectionTest {
         assertFalse(state.groups.any { it.id == "grp_3" })
     }
 
-    // 2. groups filtered by teacher
     @Test
     fun `2 groups filtered by teacher isolates groups from other teachers`() = runTest {
         val groupT1 = createTestGroup(id = "grp_t1", teacherId = "teacher_1", gradeId = "grade_1", name = "مجموعة مدرسي", active = true)
@@ -145,7 +131,6 @@ class AddEditStudentGroupSelectionTest {
         assertEquals("grp_t1", groups.first().id)
     }
 
-    // 3. groups filtered by grade
     @Test
     fun `3 groups filtered by grade isolates groups from other grades`() = runTest {
         val groupG1 = createTestGroup(id = "grp_g1", teacherId = "teacher_1", gradeId = "grade_1", name = "مجموعة أولى", active = true)
@@ -167,7 +152,6 @@ class AddEditStudentGroupSelectionTest {
         assertEquals("grp_g1", groups.first().id)
     }
 
-    // 4. changing grade clears incompatible group
     @Test
     fun `4 changing grade clears incompatible group`() = runTest {
         val groupG1 = createTestGroup(id = "grp_g1", teacherId = "teacher_1", gradeId = "grade_1", name = "مجموعة أولى", active = true)
@@ -184,11 +168,9 @@ class AddEditStudentGroupSelectionTest {
         )
         testDispatcher.scheduler.advanceUntilIdle()
 
-        // Select Group G1
         viewModel.onGroupSelected("grp_g1")
         assertEquals("grp_g1", viewModel.uiState.value.selectedGroupId)
 
-        // Switch Grade to grade_2
         viewModel.onGradeSelected("grade_2")
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -199,7 +181,6 @@ class AddEditStudentGroupSelectionTest {
         assertEquals("grp_g2", state.groups.first().id)
     }
 
-    // 5. valid group assignment succeeds
     @Test
     fun `5 valid group assignment succeeds`() = runTest {
         val group = createTestGroup(id = "grp_valid", teacherId = "teacher_1", gradeId = "grade_1", name = "نجوم المستقبل", active = true)
@@ -227,7 +208,6 @@ class AddEditStudentGroupSelectionTest {
         assertEquals("grp_valid", state.createdStudent?.groupId)
     }
 
-    // 6. invalid teacher group rejected
     @Test
     fun `6 invalid teacher group rejected`() = runTest {
         val groupT2 = createTestGroup(id = "grp_t2", teacherId = "teacher_2", gradeId = "grade_1", name = "مجموعة مدرس آخر", active = true)
@@ -259,7 +239,6 @@ class AddEditStudentGroupSelectionTest {
         job.cancel()
     }
 
-    // 7. invalid grade-group combination rejected
     @Test
     fun `7 invalid grade-group combination rejected`() = runTest {
         val groupG2 = createTestGroup(id = "grp_g2", teacherId = "teacher_1", gradeId = "grade_2", name = "مجموعة الصف الثاني", active = true)
@@ -276,7 +255,6 @@ class AddEditStudentGroupSelectionTest {
 
         viewModel.onFullNameChange("طالب صف أول")
         viewModel.onParentPhoneChange("01012345678")
-        // Force an invalid group belonging to grade_2 while selectedGradeId is grade_1
         viewModel.onGroupSelected("grp_g2")
 
         val events = mutableListOf<AddEditStudentEvent>()
@@ -292,7 +270,6 @@ class AddEditStudentGroupSelectionTest {
         job.cancel()
     }
 
-    // 8. removing group works
     @Test
     fun `8 removing group works`() = runTest {
         val group = createTestGroup(id = "grp_1", teacherId = "teacher_1", gradeId = "grade_1", name = "مجموعة 1", active = true)
@@ -319,7 +296,6 @@ class AddEditStudentGroupSelectionTest {
 
         assertEquals("grp_1", viewModel.uiState.value.selectedGroupId)
 
-        // Select no group
         viewModel.onGroupSelected(null)
         assertNull(viewModel.uiState.value.selectedGroupId)
 
@@ -337,7 +313,6 @@ class AddEditStudentGroupSelectionTest {
         job.cancel()
     }
 
-    // 9. inactive current group remains visible on edit
     @Test
     fun `9 inactive current group remains visible on edit`() = runTest {
         val inactiveCurrentGroup = createTestGroup(id = "grp_inactive_1", teacherId = "teacher_1", gradeId = "grade_1", name = "مجموعة قديمة مغلقة", active = false)
@@ -366,13 +341,11 @@ class AddEditStudentGroupSelectionTest {
 
         val state = viewModel.uiState.value
         assertEquals("grp_inactive_1", state.selectedGroupId)
-        // Groups list should include the student's inactive group AND active groups, but NOT other inactive groups
         assertTrue(state.groups.any { it.id == "grp_inactive_1" })
         assertTrue(state.groups.any { it.id == "grp_active" })
         assertFalse(state.groups.any { it.id == "grp_inactive_2" })
     }
 
-    // 10. no groups -> student can still be saved
     @Test
     fun `10 no groups - student can still be saved`() = runTest {
         groupRepository.setGroups(emptyList())
@@ -402,18 +375,8 @@ class AddEditStudentGroupSelectionTest {
         assertNull(finalState.createdStudent?.groupId)
     }
 
-    // 11. offline group assignment fails in Online-Only mode and does not modify Room
     @Test
-    fun `11 offline student group assignment fails without mutating Room`() = runBlocking {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
-            .allowMainThreadQueries()
-            .build()
-        val studentDao = db.studentDao()
-        val groupDao = db.groupDao()
-        val outboxDao = db.outboxDao()
-
-        DatabaseProvider.setDatabase(db, context)
+    fun `11 offline student group assignment fails without mutating memory`() = runBlocking {
         SupabaseClientProvider.mockTeacherId = "teacher_1"
         AccountSessionManager.setActiveTeacherId("teacher_1")
 
@@ -435,43 +398,33 @@ class AddEditStudentGroupSelectionTest {
                 override suspend fun updateStudentGroup(teacherId: String, studentId: String, groupId: String?) = throw UnknownHostException("offline")
             }
 
+            var callbackCalled = false
             val supabaseGroupRepo = SupabaseGroupRepository(
                 remoteDataSource = offlineRemote,
                 teacherIdProvider = { "teacher_1" },
-                sessionActiveChecker = { true }
+                sessionActiveChecker = { true },
+                onStudentUpdated = { callbackCalled = true }
             )
 
             val assignResult = supabaseGroupRepo.assignStudentToGroup("teacher_1", "s_offline_1", "grp_1")
             assertTrue(assignResult.isFailure)
-            assertTrue(studentDao.getAllStudentsSync("teacher_1").isEmpty())
-            assertTrue(groupDao.getGroupsSync("teacher_1").isEmpty())
-            assertTrue(outboxDao.getPendingOperationsForTeacher("teacher_1").isEmpty())
+            assertFalse(callbackCalled)
+            assertTrue(supabaseGroupRepo.observeGroups("teacher_1").first().isEmpty())
         } finally {
             AccountSessionManager.setActiveTeacherId(null)
             SupabaseClientProvider.mockTeacherId = null
-            db.close()
-            DatabaseProvider.resetForTesting()
         }
     }
 
-    // 12. online group assignment updates server directly without writing to Room or Outbox
     @Test
-    fun `12 online group assignment updates server directly without Outbox or Room`() = runBlocking {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
-            .allowMainThreadQueries()
-            .build()
-        val studentDao = db.studentDao()
-        val outboxDao = db.outboxDao()
-
-        DatabaseProvider.setDatabase(db, context)
+    fun `12 online group assignment updates server directly without local cache`() = runBlocking {
         SupabaseClientProvider.mockTeacherId = "teacher_1"
         AccountSessionManager.setActiveTeacherId("teacher_1")
 
         try {
             val group = createTestGroup(id = "grp_1", teacherId = "teacher_1", gradeId = "grade_1", name = "المتفوقين", active = true)
             var student = Student(
-                studentId = "s_outbox_1",
+                studentId = "s_online_1",
                 studentCode = "ST-10002",
                 fullName = "إسلام صبحي",
                 gradeId = "grade_1",
@@ -509,17 +462,14 @@ class AddEditStudentGroupSelectionTest {
                 onStudentUpdated = { callbackStudent = it }
             )
 
-            val res = supabaseGroupRepo.assignStudentToGroup("teacher_1", "s_outbox_1", "grp_1")
+            val res = supabaseGroupRepo.assignStudentToGroup("teacher_1", "s_online_1", "grp_1")
             assertTrue(res.isSuccess)
             assertEquals("grp_1", updatedOnServer?.groupId)
             assertEquals("grp_1", callbackStudent?.groupId)
-            assertTrue(outboxDao.getPendingOperationsForTeacher("teacher_1").isEmpty())
-            assertTrue(studentDao.getAllStudentsSync("teacher_1").isEmpty())
+            assertFalse(updatedOnServer!!.studentCode.contains("TMP"))
         } finally {
             AccountSessionManager.setActiveTeacherId(null)
             SupabaseClientProvider.mockTeacherId = null
-            db.close()
-            DatabaseProvider.resetForTesting()
         }
     }
 
@@ -529,14 +479,13 @@ class AddEditStudentGroupSelectionTest {
         assertNotNull(existing)
 
         val viewModel = AddEditStudentViewModel(
-            savedStateHandle = null, // Simulating runtime navigation where SavedStateHandle is not passed to constructor
+            savedStateHandle = null,
             studentRepository = studentRepository,
             gradeRepository = gradeRepository,
             teacherRepository = teacherRepository,
             groupRepository = groupRepository
         )
 
-        // Screen calls initialize
         viewModel.initialize("s_01", null)
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -546,12 +495,10 @@ class AddEditStudentGroupSelectionTest {
         assertEquals(existing!!.fullName, stateBeforeSave.fullName)
         assertEquals(existing.studentCode, stateBeforeSave.existingStudentCode)
 
-        // Modify name and save
         viewModel.onFullNameChange("طالب بعد التعديل")
         viewModel.saveStudent()
         testDispatcher.scheduler.advanceUntilIdle()
 
-        // Verify that student in repository was updated in-place without creating a new student
         val updated = studentRepository.getStudentById("s_01")
         assertNotNull(updated)
         assertEquals("s_01", updated!!.studentId)

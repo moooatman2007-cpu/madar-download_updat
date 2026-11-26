@@ -4,18 +4,17 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.model.*
 import com.example.data.repository.*
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.time.LocalDate
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import io.github.jan.supabase.auth.auth
-import java.util.concurrent.TimeUnit
-import com.example.data.SupabaseClientProvider
 
 enum class ReportsTab(val titleAr: String) {
     GROUP_DAILY("تقرير مجموعة"),
@@ -230,6 +229,8 @@ data class TopStudentsReportData(
 
 data class ReportsUiState(
     val isLoading: Boolean = false,
+    val loadError: String? = null,
+    val isOfflineError: Boolean = false,
     val selectedTab: ReportsTab = ReportsTab.GROUP_DAILY,
     val selectedDate: LocalDate = LocalDate.now(),
     val startDate: LocalDate = LocalDate.now().minusDays(30),
@@ -292,7 +293,8 @@ class ReportsViewModel(
     private val homeworkRepository: HomeworkRepository = RepositoryProvider.homeworkRepository,
     private val groupRepository: GroupRepository = RepositoryProvider.groupRepository,
     private val teacherRepository: TeacherRepository = RepositoryProvider.teacherRepository,
-    private val notificationEventRepository: NotificationEventRepository = RepositoryProvider.notificationEventRepository
+    private val notificationEventRepository: NotificationEventRepository = RepositoryProvider.notificationEventRepository,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : ViewModel() {
 
     companion object {
@@ -313,35 +315,82 @@ class ReportsViewModel(
     private val _isSendingNotification = MutableStateFlow(false)
     private val _notificationMessage = MutableStateFlow<String?>(null)
     private val _topStudentsMode = MutableStateFlow(TopStudentsMode.CLASS)
+    private val _isLoading = MutableStateFlow(false)
+    private val _loadError = MutableStateFlow<Pair<String?, Boolean>>(null to false)
+    private val _teacherId = MutableStateFlow("")
 
     private val _uiState = MutableStateFlow(ReportsUiState())
     val uiState: StateFlow<ReportsUiState> = _uiState.asStateFlow()
 
     init {
         loadData()
-        refresh()
+        performRefresh(force = true)
+    }
+
+    fun retry() {
+        performRefresh(force = true)
     }
 
     fun refresh() {
+        performRefresh(force = false)
+    }
+
+    private fun performRefresh(force: Boolean) {
+        if (_isLoading.value && !force) return
         viewModelScope.launch {
-            val teacher = teacherRepository.fetchCurrentTeacher()
-            val teacherId = teacher?.id ?: ""
-            if (teacherId.isNotEmpty()) {
-                groupRepository.refreshGroups(teacherId)
-                gradeRepository.refreshGrades(teacher?.educationalStage)
+            _isLoading.value = true
+            _loadError.value = null to false
+            try {
+                val teacher = teacherRepository.fetchCurrentTeacher()
+                val teacherId = teacher?.id ?: ""
+                _teacherId.value = teacherId
+
+                coroutineScope {
+                    val groupsDef = async(ioDispatcher) {
+                        if (teacherId.isNotEmpty()) groupRepository.refreshGroups(teacherId) else Result.success(Unit)
+                    }
+                    val gradesDef = async(ioDispatcher) {
+                        gradeRepository.refreshGradesResult(teacher?.educationalStage)
+                    }
+                    val studentsDef = async(ioDispatcher) { studentRepository.refreshStudents() }
+                    val attendanceDef = async(ioDispatcher) { attendanceRepository.refreshAllAttendanceForTeacher() }
+                    val recitationsDef = async(ioDispatcher) { recitationRepository.refreshAllRecitationsForTeacher() }
+                    val examsDef = async(ioDispatcher) { examRepository.refreshAllExamsForTeacher() }
+                    val homeworkDef = async(ioDispatcher) { homeworkRepository.refreshHomeworkForTeacher() }
+
+                    val groupsRes = groupsDef.await()
+                    val gradesRes = gradesDef.await()
+                    val studentsRes = studentsDef.await()
+                    val attendanceRes = attendanceDef.await()
+                    val recitationsRes = recitationsDef.await()
+                    val examsRes = examsDef.await()
+                    val homeworkRes = homeworkDef.await()
+
+                    val firstError = groupsRes.exceptionOrNull()
+                        ?: gradesRes.exceptionOrNull()
+                        ?: studentsRes.exceptionOrNull()
+                        ?: attendanceRes.exceptionOrNull()
+                        ?: recitationsRes.exceptionOrNull()
+                        ?: examsRes.exceptionOrNull()
+                        ?: homeworkRes.exceptionOrNull()
+
+                    if (firstError != null) {
+                        _loadError.value = firstError.toArabicErrorMessage() to firstError.isOfflineOrNetworkError()
+                    }
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                _loadError.value = e.toArabicErrorMessage() to e.isOfflineOrNetworkError()
+            } finally {
+                _isLoading.value = false
             }
         }
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     private fun loadData() {
         viewModelScope.launch {
-            val teacher = teacherRepository.fetchCurrentTeacher()
-            val teacherId = teacher?.id ?: ""
-            if (teacherId.isNotEmpty()) {
-                groupRepository.refreshGroups(teacherId)
-                gradeRepository.refreshGrades(teacher?.educationalStage)
-            }
-
             val paramsFlow = combine(
                 combine(_selectedTab, _selectedDate, _startDate) { tab, date, start -> Triple(tab, date, start) },
                 combine(_endDate, _groupReportMode, _topStudentsMode) { end, mode, topMode -> Triple(end, mode, topMode) },
@@ -360,11 +409,19 @@ class ReportsViewModel(
                 )
             }
 
+            val groupsFlow = _teacherId.flatMapLatest { id ->
+                if (id.isNotBlank()) {
+                    groupRepository.observeGroups(id)
+                } else {
+                    flowOf(emptyList())
+                }
+            }
+
             val repoDataFlow = combine(
                 combine(
                     studentRepository.getStudents(),
                     gradeRepository.getGrades(),
-                    groupRepository.observeGroups(teacherId),
+                    groupsFlow,
                     attendanceRepository.getAllAttendanceForTeacher()
                 ) { students, grades, groups, attendance ->
                     listOf(students, grades, groups, attendance)
@@ -389,7 +446,7 @@ class ReportsViewModel(
                 )
             }
 
-            combine(paramsFlow, repoDataFlow) { params, repo ->
+            combine(paramsFlow, repoDataFlow, _teacherId) { params, repo, teacherId ->
                 val tab = params.tab
                 val selectedDate = params.date
                 val start = params.start
@@ -783,7 +840,9 @@ class ReportsViewModel(
                 } else null
 
                 ReportsUiState(
-                    isLoading = false,
+                    isLoading = _isLoading.value,
+                    loadError = _loadError.value.first,
+                    isOfflineError = _loadError.value.second,
                     selectedTab = tab,
                     selectedDate = selectedDate,
                     startDate = start,
@@ -804,12 +863,19 @@ class ReportsViewModel(
                     topStudentsReport = topStudentsReport,
                     topStudentsMode = params.topStudentsMode
                 )
+            }.combine(_isLoading) { state, loading ->
+                state.copy(isLoading = loading)
+            }.combine(_loadError) { state, errPair ->
+                state.copy(loadError = errPair.first, isOfflineError = errPair.second)
             }.combine(_currentMonthlyReport) { state, monthlyReport ->
                 state.copy(currentMonthlyReport = monthlyReport)
             }.combine(_isSendingNotification) { state, isSending ->
                 state.copy(isSendingNotification = isSending)
             }.combine(_notificationMessage) { state, msg ->
                 state.copy(notificationMessage = msg)
+            }.catch { e ->
+                _loadError.value = e.toArabicErrorMessage() to e.isOfflineOrNetworkError()
+                _isLoading.value = false
             }.collect { newState ->
                 _uiState.value = newState
             }

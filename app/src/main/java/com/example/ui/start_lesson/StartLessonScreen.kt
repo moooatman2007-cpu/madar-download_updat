@@ -78,6 +78,8 @@ import com.example.core.model.Student
 import com.example.ui.attendance.BarcodeCameraScannerView
 import com.example.ui.attendance.ScanResultType
 import com.example.ui.components.EmptyStateView
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.DangerRedLight
 import com.example.ui.theme.DarkNavyCard
@@ -301,18 +303,52 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
             color = MaterialTheme.colorScheme.onSurface
         )
 
-        if (uiState.groups.isEmpty()) {
-            EmptyStateView(
-                title = "لا توجد مجموعات مفعّلة",
-                description = "يرجى إضافة مجموعة دراسية وتعيين طلابها من قسم المجموعات أولاً",
-                buttonText = null
-            )
-        } else {
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12),
-                modifier = Modifier.weight(1f)
-            ) {
-                items(uiState.groups, key = { it.id }) { group: Group ->
+        val loadError = uiState.loadError
+        when {
+            uiState.isLoading && uiState.groups.isEmpty() -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(color = PrimaryIndigo)
+                }
+            }
+            loadError != null && uiState.groups.isEmpty() -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    OnlineStatusStateView(
+                        isOffline = uiState.isOfflineError,
+                        message = loadError,
+                        onRetry = viewModel::retry
+                    )
+                }
+            }
+            uiState.groups.isEmpty() -> {
+                EmptyStateView(
+                    title = "لا توجد مجموعات مفعّلة",
+                    description = "يرجى إضافة مجموعة دراسية وتعيين طلابها من قسم المجموعات أولاً",
+                    buttonText = null
+                )
+            }
+            else -> {
+                if (loadError != null) {
+                    OnlineInlineErrorBanner(
+                        isOffline = uiState.isOfflineError,
+                        message = loadError,
+                        onRetry = viewModel::retry
+                    )
+                }
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    items(uiState.groups, key = { it.id }) { group: Group ->
                     val isSelected = uiState.selectedGroupId == group.id
                     val gradeName = gradesById[group.gradeId]?.name ?: ""
                     val studentCount = uiState.groupStudentCounts[group.id] ?: 0
@@ -387,22 +423,23 @@ fun StepSelectGroupContent(uiState: StartLessonUiState, viewModel: StartLessonVi
                         }
                     }
                 }
-            }
+                }
 
-            Button(
-                onClick = { viewModel.goToStep(StartLessonStep.ATTENDANCE) },
-                enabled = uiState.selectedGroupId != null,
-                colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp)
-                    .testTag("start_lesson_proceed_attendance_button")
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-                    Text("ابدأ الحضور", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null)
+                Button(
+                    onClick = { viewModel.goToStep(StartLessonStep.ATTENDANCE) },
+                    enabled = uiState.selectedGroupId != null,
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp)
+                        .testTag("start_lesson_proceed_attendance_button")
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+                        Text("ابدأ الحضور", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null)
+                    }
                 }
             }
         }
@@ -612,19 +649,39 @@ fun StepAttendanceContent(uiState: StartLessonUiState, viewModel: StartLessonVie
                                 }
                             }
 
+                            val isTogglingPayment = student.studentId in uiState.togglingPaymentStudentIds
                             Surface(
                                 shape = RoundedCornerShape(8.dp),
-                                color = if (isPaid) EmeraldGreenLight else DangerRedLight,
-                                contentColor = if (isPaid) EmeraldGreen else DangerRed,
+                                color = if (isTogglingPayment) MaterialTheme.colorScheme.surfaceVariant else if (isPaid) EmeraldGreenLight else DangerRedLight,
+                                contentColor = if (isTogglingPayment) MaterialTheme.colorScheme.onSurfaceVariant else if (isPaid) EmeraldGreen else DangerRed,
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(8.dp))
-                                    .clickable { viewModel.togglePaymentStatus(student.studentId) }
+                                    .clickable(enabled = !isTogglingPayment) { viewModel.togglePaymentStatus(student.studentId) }
+                                    .testTag("start_lesson_payment_chip_${student.studentId}")
                             ) {
-                                Text(
-                                    text = if (isPaid) "🟢 دفع" else "🔴 لم يدفع",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                )
+                                if (isTogglingPayment) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(12.dp),
+                                            strokeWidth = 2.dp,
+                                            color = PrimaryIndigo
+                                        )
+                                        Text(
+                                            text = "جارٍ التحديث...",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                    }
+                                } else {
+                                    Text(
+                                        text = if (isPaid) "🟢 دفع" else "🔴 لم يدفع",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
                             }
                         }
                     }
@@ -1177,12 +1234,77 @@ fun StepReviewContent(uiState: StartLessonUiState, viewModel: StartLessonViewMod
             }
         }
 
+        uiState.partialSaveReport?.let { report ->
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = DangerRedLight.copy(alpha = 0.7f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("start_lesson_partial_save_report")
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(Dimens.Spacing16),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = if (!report.attendanceSaved) "فشل حفظ الحضور" else "تم حفظ جزء من بيانات الحصة",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = DangerRed
+                    )
+                    Text(
+                        text = if (report.attendanceSaved) {
+                            "✅ تم حفظ سجل الحضور بنجاح على السيرفر"
+                        } else {
+                            "❌ ${report.attendanceError ?: "تعذر حفظ سجل الحضور"}"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (report.attendanceSaved) EmeraldGreen else DangerRed
+                    )
+                    if (report.savedRecitationCount > 0 || report.failedRecitations.isNotEmpty()) {
+                        Text(
+                            text = "التسميع: تم حفظ ${report.savedRecitationCount} • تعذر حفظ ${report.failedRecitations.size}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    if (report.savedHomeworkCount > 0 || report.failedHomework.isNotEmpty()) {
+                        Text(
+                            text = "الواجب: تم حفظ ${report.savedHomeworkCount} • تعذر حفظ ${report.failedHomework.size}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    if (report.savedExamCount > 0 || report.failedExams.isNotEmpty()) {
+                        Text(
+                            text = "الامتحان: تم حفظ ${report.savedExamCount} • تعذر حفظ ${report.failedExams.size}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    val allFailed = report.failedRecitations.map { "تسميع ${it.studentName}: ${it.message}" } +
+                        report.failedHomework.map { "واجب ${it.studentName}: ${it.message}" } +
+                        report.failedExams.map { "امتحان ${it.studentName}: ${it.message}" }
+                    allFailed.take(4).forEach { line ->
+                        Text(
+                            text = "• $line",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = DangerRed
+                        )
+                    }
+                }
+            }
+        }
+
         Spacer(modifier = Modifier.weight(1f))
 
         Button(
             onClick = viewModel::checkReviewBeforeFinish,
             enabled = !uiState.isSaving,
-            colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (uiState.partialSaveReport?.hasFailures == true) PrimaryIndigo else EmeraldGreen
+            ),
             shape = RoundedCornerShape(16.dp),
             modifier = Modifier
                 .fillMaxWidth()
@@ -1195,7 +1317,10 @@ fun StepReviewContent(uiState: StartLessonUiState, viewModel: StartLessonViewMod
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
                     Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("إنهاء الحصة", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold))
+                    Text(
+                        text = if (uiState.partialSaveReport?.hasFailures == true) "إعادة محاولة حفظ المتبقي" else "إنهاء الحصة",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+                    )
                 }
             }
         }

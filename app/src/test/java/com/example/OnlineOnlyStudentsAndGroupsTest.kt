@@ -1,12 +1,6 @@
 package com.example
 
-import android.content.Context
-import androidx.lifecycle.SavedStateHandle
-import androidx.room.Room
-import androidx.test.core.app.ApplicationProvider
-import com.example.core.model.BatchSyncStatus
 import com.example.core.model.EducationalStages
-import com.example.core.model.Grade
 import com.example.core.model.Group
 import com.example.core.model.GroupDay
 import com.example.core.model.OnlineLoadState
@@ -16,11 +10,6 @@ import com.example.core.model.Teacher
 import com.example.core.model.UpdateStudentOnlineDto
 import com.example.data.SupabaseClientProvider
 import com.example.data.auth.AccountSessionManager
-import com.example.data.local.AppDatabase
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.entity.GroupDayEntity
-import com.example.data.local.entity.GroupEntity
-import com.example.data.local.entity.StudentEntity
 import com.example.data.repository.GradeRepository
 import com.example.data.repository.GroupDeletionBlockedException
 import com.example.data.repository.GroupRemoteDataSource
@@ -37,7 +26,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -53,15 +41,12 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import java.io.IOException
 import java.net.UnknownHostException
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 class OnlineOnlyStudentsAndGroupsTest {
 
-    private lateinit var context: Context
-    private lateinit var db: AppDatabase
     private val testDispatcher = UnconfinedTestDispatcher()
 
     private class FakeBackend {
@@ -249,11 +234,6 @@ class OnlineOnlyStudentsAndGroupsTest {
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
-        context = ApplicationProvider.getApplicationContext()
-        db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
-            .allowMainThreadQueries()
-            .build()
-        DatabaseProvider.setDatabase(db, context)
 
         activeTeacherId = "teacher_A"
         SupabaseClientProvider.mockTeacherId = activeTeacherId
@@ -288,8 +268,6 @@ class OnlineOnlyStudentsAndGroupsTest {
     fun tearDown() {
         AccountSessionManager.setActiveTeacherId(null)
         SupabaseClientProvider.mockTeacherId = null
-        db.close()
-        DatabaseProvider.resetForTesting()
         Dispatchers.resetMain()
     }
 
@@ -321,30 +299,9 @@ class OnlineOnlyStudentsAndGroupsTest {
         assertEquals("grp_1", state.students[0].groupId)
     }
 
-    // 2. عدم عرض بيانات Room القديمة
+    // 2. حالة عدم الاتصال تعرض شاشة Offline بدون أي بيانات محلية قديمة
     @Test
-    fun scenario02_staleRoomDataNeverDisplayed() = runTest {
-        db.studentDao().upsertStudent(
-            StudentEntity(
-                studentId = "stale_room_s1",
-                studentCode = "ST-OLD",
-                fullName = "طالب كاش قديم",
-                gradeId = "grade_prep_1",
-                parentPhone = "01099999999",
-                teacherId = "teacher_A"
-            )
-        )
-        db.groupDao().insertGroup(
-            GroupEntity(
-                id = "stale_room_g1",
-                teacherId = "teacher_A",
-                gradeId = "grade_prep_1",
-                name = "مجموعة كاش قديمة",
-                startTime = "10:00",
-                endTime = "11:00"
-            )
-        )
-
+    fun scenario02_offlineShowsOfflineStateWithZeroLocalFallback() = runTest {
         backend.failFetchStudents = UnknownHostException("Unable to resolve host")
         backend.failFetchGroups = UnknownHostException("Unable to resolve host")
 
@@ -751,9 +708,9 @@ class OnlineOnlyStudentsAndGroupsTest {
         assertEquals(0, backend.groupDays.count { it.groupId == "grp_unlinked" })
     }
 
-    // 10. عدم حفظ البيانات محليًا بشكل دائم في Room أو Outbox
+    // 10. عدم حفظ البيانات محليًا بشكل دائم — انتهاء الجلسة أو إنشاء مستودع جديد دون إنترنت يبدأ فارغًا
     @Test
-    fun scenario10_noPermanentLocalPersistenceInRoomOrOutbox() = runTest {
+    fun scenario10_noPermanentLocalPersistenceAcrossSessions() = runTest {
         val addRes = studentRepo.addStudent("مازن فؤاد", "grade_prep_1", "01066667777", true, null)
         assertTrue(addRes.isSuccess)
         val student = addRes.getOrThrow().data
@@ -774,10 +731,30 @@ class OnlineOnlyStudentsAndGroupsTest {
         assertTrue(studentRepo.refreshStudents().isSuccess)
         assertTrue(groupRepo.refreshGroups("teacher_A").isSuccess)
 
-        assertTrue(db.studentDao().getAllStudentsSync("teacher_A").isEmpty())
-        assertTrue(db.groupDao().getGroupsSync("teacher_A").isEmpty())
-        assertTrue(db.groupDayDao().getGroupDaysByTeacher("teacher_A").isEmpty())
-        assertTrue(db.outboxDao().getPendingOperations().isEmpty())
-        assertTrue(db.outboxDao().getPendingOperationsForTeacher("teacher_A").isEmpty())
+        // Clear session in-memory caches and simulate fresh app startup offline
+        studentRepo.clearCache()
+        groupRepo.clearCache()
+        assertTrue(studentRepo.getStudents().first().isEmpty())
+        assertTrue(groupRepo.observeGroups("teacher_A").first().isEmpty())
+
+        backend.failFetchStudents = UnknownHostException("offline")
+        backend.failFetchGroups = UnknownHostException("offline")
+        val restartedStudentRepo = SupabaseStudentRepository(
+            remoteDataSource = backend.studentRemote,
+            teacherIdProvider = { activeTeacherId },
+            sessionActiveChecker = { id -> activeTeacherId != null && activeTeacherId == id },
+            ioDispatcher = testDispatcher
+        )
+        val restartedGroupRepo = SupabaseGroupRepository(
+            remoteDataSource = backend.groupRemote,
+            teacherIdProvider = { activeTeacherId },
+            sessionActiveChecker = { id -> activeTeacherId != null && activeTeacherId == id },
+            ioDispatcher = testDispatcher
+        )
+
+        assertTrue(restartedStudentRepo.refreshStudents().isFailure)
+        assertTrue(restartedGroupRepo.refreshGroups("teacher_A").isFailure)
+        assertTrue(restartedStudentRepo.getStudents().first().isEmpty())
+        assertTrue(restartedGroupRepo.observeGroups("teacher_A").first().isEmpty())
     }
 }

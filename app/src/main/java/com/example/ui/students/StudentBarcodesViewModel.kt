@@ -9,13 +9,16 @@ import com.example.core.model.Student
 import com.example.data.repository.GradeRepository
 import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
-import com.example.data.repository.SupabaseGradeRepository
-import com.example.data.repository.SupabaseStudentRepository
 import com.example.util.BarcodePdfExporter
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -28,7 +31,8 @@ data class StudentBarcodesUiState(
     val filteredStudents: List<Student> = emptyList(),
     val isLoading: Boolean = false,
     val isExporting: Boolean = false,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val isOfflineError: Boolean = false
 )
 
 class StudentBarcodesViewModel(
@@ -45,11 +49,56 @@ class StudentBarcodesViewModel(
         loadData()
     }
 
-    private fun loadData() {
+    fun retry() {
+        refreshFromServer()
+    }
+
+    private fun refreshFromServer() {
         viewModelScope.launch {
-            (gradeRepository as? SupabaseGradeRepository)?.fetchGrades()
-            (studentRepository as? SupabaseStudentRepository)?.fetchStudents()
+            _uiState.update { it.copy(isLoading = true, errorMessage = null, isOfflineError = false) }
+            try {
+                coroutineScope {
+                    val gradesDef = async { gradeRepository.refreshGradesResult() }
+                    val studentsDef = async { studentRepository.refreshStudents() }
+
+                    val gradesRes = gradesDef.await()
+                    val studentsRes = studentsDef.await()
+
+                    val firstErr = gradesRes.exceptionOrNull() ?: studentsRes.exceptionOrNull()
+                    if (firstErr != null) {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                errorMessage = firstErr.toArabicErrorMessage(),
+                                isOfflineError = firstErr.isOfflineOrNetworkError()
+                            )
+                        }
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                errorMessage = null,
+                                isOfflineError = false
+                            )
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = e.toArabicErrorMessage(),
+                        isOfflineError = e.isOfflineOrNetworkError()
+                    )
+                }
+            }
         }
+    }
+
+    private fun loadData() {
+        refreshFromServer()
 
         viewModelScope.launch {
             combine(
@@ -59,12 +108,20 @@ class StudentBarcodesViewModel(
                 val active = studentsList.filter { it.deletedAt == null }
                 allActiveStudents = active
                 Pair(gradesList, active)
+            }.catch { error ->
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = error.toArabicErrorMessage(),
+                        isOfflineError = error.isOfflineOrNetworkError()
+                    )
+                }
             }.collect { (gradesList, activeStudents) ->
                 _uiState.update { state ->
                     state.copy(
                         grades = gradesList,
                         students = activeStudents,
-                        isLoading = false
+                        isLoading = if (gradesList.isNotEmpty() || activeStudents.isNotEmpty()) false else state.isLoading
                     )
                 }
                 applyFilters()
@@ -88,8 +145,8 @@ class StudentBarcodesViewModel(
             val filtered = allActiveStudents.filter { student ->
                 val matchesGrade = state.selectedGradeId == null || student.gradeId == state.selectedGradeId
                 val matchesQuery = query.isEmpty() ||
-                        student.fullName.lowercase().contains(query) ||
-                        student.studentCode.lowercase().contains(query)
+                    student.fullName.lowercase().contains(query) ||
+                    student.studentCode.lowercase().contains(query)
                 matchesGrade && matchesQuery
             }
             state.copy(filteredStudents = filtered)
@@ -137,6 +194,6 @@ class StudentBarcodesViewModel(
     }
 
     fun clearErrorMessage() {
-        _uiState.update { it.copy(errorMessage = null) }
+        _uiState.update { it.copy(errorMessage = null, isOfflineError = false) }
     }
 }

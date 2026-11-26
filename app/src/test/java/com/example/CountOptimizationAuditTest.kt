@@ -6,6 +6,8 @@ import com.example.core.model.Teacher
 import com.example.data.repository.MockAttendanceRepository
 import com.example.data.repository.MockExamRepository
 import com.example.data.repository.MockGradeRepository
+import com.example.data.repository.MockGroupRepository
+import com.example.data.repository.MockHomeworkRepository
 import com.example.data.repository.MockRecitationRepository
 import com.example.data.repository.MockStudentRepository
 import com.example.data.repository.MockTeacherRepository
@@ -91,7 +93,6 @@ class CountOptimizationAuditTest {
         assertNotNull(todayRecords)
 
         val (present, absent) = attendanceRepository.getTodayAttendanceCount()
-        // Mock returns predefined date or today count
         assertNotNull(present)
         assertNotNull(absent)
     }
@@ -212,14 +213,9 @@ class CountOptimizationAuditTest {
             attendanceRepository = attendanceRepository,
             recitationRepository = recitationRepository,
             examRepository = examRepository,
-            homeworkRepository = com.example.data.repository.MockHomeworkRepository(),
-            groupRepository = com.example.data.repository.MockGroupRepository(),
-            teacherRepository = teacherRepository,
-            syncManager = object : com.example.data.sync.SyncManager {
-                override val syncStatus: kotlinx.coroutines.flow.StateFlow<com.example.data.sync.SyncStatus> = 
-                    kotlinx.coroutines.flow.MutableStateFlow(com.example.data.sync.SyncStatus())
-                override fun retrySync() {}
-            }
+            homeworkRepository = MockHomeworkRepository(),
+            groupRepository = MockGroupRepository(),
+            teacherRepository = teacherRepository
         )
 
         testDispatcher.scheduler.advanceUntilIdle()

@@ -1,148 +1,207 @@
 package com.example
 
-import android.content.Context
-import androidx.room.Room
-import androidx.test.core.app.ApplicationProvider
+import com.example.core.model.EducationalStages
 import com.example.core.model.Grade
-import com.example.core.model.Student
 import com.example.core.model.OnlineLoadState
+import com.example.core.model.Student
 import com.example.core.model.SupabaseStudentInsertDto
+import com.example.core.model.Teacher
 import com.example.core.model.UpdateStudentOnlineDto
+import com.example.data.SupabaseClientProvider
 import com.example.data.auth.AccountSessionManager
-import com.example.data.local.AppDatabase
-import com.example.data.local.entity.GradeEntity
-import com.example.data.local.entity.StudentEntity
-import com.example.data.local.mapper.toDomain
-import com.example.data.local.mapper.toEntity
+import com.example.data.repository.GradeRemoteDataSource
 import com.example.data.repository.StudentRemoteDataSource
 import com.example.data.repository.SupabaseGradeRepository
 import com.example.data.repository.SupabaseStudentRepository
 import com.example.ui.students.StudentListViewModel
-import java.net.UnknownHostException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.net.UnknownHostException
 
+@OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 class GradeOfflineCacheTest {
 
-    private lateinit var context: Context
-    private lateinit var db: AppDatabase
-    private val persistentDbName = "grade_offline_cache_test.db"
+    private val testDispatcher = UnconfinedTestDispatcher()
+    private var currentTeacherId: String? = "teacher_1"
+
+    private class FakeGradeRemoteDataSource : GradeRemoteDataSource {
+        val gradesByTeacher = mutableMapOf<String, MutableList<Grade>>()
+        val teachers = mutableMapOf<String, Teacher>()
+        val linkedStudentsByGrade = mutableSetOf<String>()
+        val linkedGroupsByGrade = mutableSetOf<String>()
+        var failFetch: Throwable? = null
+        var failWrite: Throwable? = null
+
+        override suspend fun fetchTeacherProfile(teacherId: String): Teacher? {
+            failFetch?.let { throw it }
+            return teachers[teacherId]
+        }
+
+        override suspend fun fetchGrades(teacherId: String): List<Grade> {
+            failFetch?.let { throw it }
+            return gradesByTeacher[teacherId].orEmpty().sortedBy { it.displayOrder }
+        }
+
+        override suspend fun fetchGradeById(teacherId: String, gradeId: String): Grade? {
+            failFetch?.let { throw it }
+            return gradesByTeacher[teacherId].orEmpty().firstOrNull { it.id == gradeId }
+        }
+
+        override suspend fun insertGrade(teacherId: String, id: String, name: String, displayOrder: Int): Grade {
+            failWrite?.let { throw it }
+            val created = Grade(id = id, name = name, displayOrder = displayOrder, teacherId = teacherId)
+            val list = gradesByTeacher.getOrPut(teacherId) { mutableListOf() }
+            list.removeAll { it.id == id }
+            list.add(created)
+            return created
+        }
+
+        override suspend fun updateGrade(teacherId: String, id: String, name: String, displayOrder: Int): Grade {
+            failWrite?.let { throw it }
+            val updated = Grade(id = id, name = name, displayOrder = displayOrder, teacherId = teacherId)
+            val list = gradesByTeacher.getOrPut(teacherId) { mutableListOf() }
+            list.removeAll { it.id == id }
+            list.add(updated)
+            return updated
+        }
+
+        override suspend fun updateGradeName(teacherId: String, id: String, name: String) {
+            failWrite?.let { throw it }
+            val list = gradesByTeacher[teacherId] ?: return
+            val idx = list.indexOfFirst { it.id == id }
+            if (idx >= 0) {
+                list[idx] = list[idx].copy(name = name)
+            }
+        }
+
+        override suspend fun hasStudentsInGrade(teacherId: String, gradeId: String): Boolean =
+            linkedStudentsByGrade.contains("$teacherId:$gradeId")
+
+        override suspend fun hasGroupsInGrade(teacherId: String, gradeId: String): Boolean =
+            linkedGroupsByGrade.contains("$teacherId:$gradeId")
+
+        override suspend fun deleteGrade(teacherId: String, id: String) {
+            failWrite?.let { throw it }
+            gradesByTeacher[teacherId]?.removeAll { it.id == id }
+        }
+    }
+
+    private lateinit var gradeRemote: FakeGradeRemoteDataSource
 
     @Before
     fun setUp() {
-        context = ApplicationProvider.getApplicationContext()
-        context.deleteDatabase(persistentDbName)
-        db = Room.databaseBuilder(context, AppDatabase::class.java, persistentDbName)
-            .allowMainThreadQueries()
-            .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
-            .build()
-        com.example.data.SupabaseClientProvider.mockTeacherId = "teacher_1"
+        Dispatchers.setMain(testDispatcher)
+        currentTeacherId = "teacher_1"
+        SupabaseClientProvider.mockTeacherId = "teacher_1"
+        AccountSessionManager.setActiveTeacherId("teacher_1")
+        gradeRemote = FakeGradeRemoteDataSource()
+        gradeRemote.teachers["teacher_1"] = Teacher(
+            id = "teacher_1",
+            email = "t1@midar.app",
+            fullName = "أستاذ 1",
+            educationalStage = EducationalStages.PREPARATORY
+        )
     }
 
     @After
     fun tearDown() {
-        db.close()
-        context.deleteDatabase(persistentDbName)
+        AccountSessionManager.setActiveTeacherId(null)
+        SupabaseClientProvider.mockTeacherId = null
+        Dispatchers.resetMain()
+    }
+
+    private fun buildGradeRepo(teacherProvider: () -> String? = { currentTeacherId }): SupabaseGradeRepository {
+        return SupabaseGradeRepository(
+            remoteDataSource = gradeRemote,
+            teacherIdProvider = teacherProvider,
+            teacherStageMetadataProvider = { null },
+            sessionActiveChecker = { id -> teacherProvider() == id },
+            ioDispatcher = testDispatcher
+        )
     }
 
     @Test
-    fun test1_onlineGradesAreStoredInRoom() = runBlocking {
-        val gradeDao = db.gradeDao()
-        val sampleGrades = listOf(
+    fun test1_onlineGradesAreFetchedDirectlyIntoSessionMemory() = runTest {
+        gradeRemote.gradesByTeacher["teacher_1"] = mutableListOf(
             Grade(id = "grade-1", name = "الصف الأول الإعدادي", displayOrder = 1, teacherId = "teacher_1"),
-            Grade(id = "grade-2", name = "الصف الثاني الإعدادي", displayOrder = 2, teacherId = "teacher_1")
+            Grade(id = "grade-2", name = "الصف الثاني الإعدادي", displayOrder = 2, teacherId = "teacher_1"),
+            Grade(id = "grade-3", name = "الصف الثالث الإعدادي", displayOrder = 3, teacherId = "teacher_1")
         )
+        val repo = buildGradeRepo()
 
-        gradeDao.upsertGrades(sampleGrades.map { it.toEntity() })
+        val result = repo.refreshGradesResult()
+        assertTrue(result.isSuccess)
 
-        val cached = gradeDao.getAllGradesSync("teacher_1")
-        assertEquals(2, cached.size)
-        assertEquals("grade-1", cached[0].gradeId)
-        assertEquals("الصف الأول الإعدادي", cached[0].gradeName)
-        assertEquals("grade-2", cached[1].gradeId)
+        val emitted = repo.getGrades().first()
+        assertEquals(3, emitted.size)
+        assertEquals("grade-1", emitted[0].id)
+        assertEquals("الصف الأول الإعدادي", emitted[0].name)
+        assertEquals("grade-2", emitted[1].id)
     }
 
     @Test
-    fun test2_offlineGradesAreReadFromRoom() = runBlocking {
-        val gradeDao = db.gradeDao()
-        val sampleGrade = Grade(
-            id = "grade-3",
-            name = "الصف الثالث الإعدادي",
-            displayOrder = 3,
-            studentCount = 10,
-            teacherId = "teacher_1"
-        )
-        gradeDao.upsertGrade(sampleGrade.toEntity())
+    fun test2_offlineOrUnauthenticatedSessionStartsEmptyWithoutDiskCache() = runTest {
+        gradeRemote.failFetch = UnknownHostException("Unable to resolve host")
+        val repo = buildGradeRepo()
 
-        val repo = SupabaseGradeRepository(gradeDao = gradeDao)
+        val result = repo.refreshGradesResult()
+        assertTrue(result.isFailure)
+        assertTrue(repo.getGrades().first().isEmpty())
 
-        // Offline read through getGrades Flow
-        val emittedGrades = repo.getGrades().first()
-        assertEquals(1, emittedGrades.size)
-        assertEquals("grade-3", emittedGrades[0].id)
-        assertEquals("الصف الثالث الإعدادي", emittedGrades[0].name)
+        currentTeacherId = null
+        assertTrue(repo.getGrades().first().isEmpty())
     }
 
     @Test
-    fun test3_networkFailureDoesNotClearCache() = runBlocking {
-        val gradeDao = db.gradeDao()
-        val sampleGrades = listOf(
+    fun test3_networkFailurePreservesInMemorySessionUntilSignOut() = runTest {
+        gradeRemote.gradesByTeacher["teacher_1"] = mutableListOf(
             Grade(id = "g1", name = "الصف الأول الثانوي", displayOrder = 1, teacherId = "teacher_1"),
-            Grade(id = "g2", name = "الصف الثاني الثانوي", displayOrder = 2, teacherId = "teacher_1")
+            Grade(id = "g2", name = "الصف الثاني الثانوي", displayOrder = 2, teacherId = "teacher_1"),
+            Grade(id = "g3", name = "الصف الثالث الثانوي", displayOrder = 3, teacherId = "teacher_1")
         )
-        gradeDao.upsertGrades(sampleGrades.map { it.toEntity() })
+        gradeRemote.teachers["teacher_1"] = Teacher(
+            id = "teacher_1",
+            educationalStage = EducationalStages.SECONDARY
+        )
+        val repo = buildGradeRepo()
 
-        val repo = SupabaseGradeRepository(gradeDao = gradeDao)
+        assertTrue(repo.refreshGradesResult(EducationalStages.SECONDARY).isSuccess)
+        assertEquals(3, repo.getGrades().first().size)
 
-        // Simulate refresh failure (unauthenticated / no network)
-        val refreshed = repo.refreshGrades()
-        // Cache must NOT be cleared, it should return cached grades
-        assertEquals(2, refreshed.size)
-        assertEquals("g1", refreshed[0].id)
-        assertEquals("g2", refreshed[1].id)
+        gradeRemote.failFetch = UnknownHostException("offline")
+        val failedRefresh = repo.refreshGradesResult(EducationalStages.SECONDARY)
+        assertTrue(failedRefresh.isFailure)
+        assertEquals(3, repo.getGrades().first().size)
 
-        // Verify Room DB still has the data
-        val inDb = gradeDao.getAllGradesSync("teacher_1")
-        assertEquals(2, inDb.size)
+        // On session end / clearCache(), in-memory state is wiped immediately
+        repo.clearCache()
+        assertTrue(repo.getGrades().first().isEmpty())
     }
 
     @Test
-    fun test4_gradesStayCachedOfflineWhileStudentsFollowOnlineOnly() = runBlocking {
-        com.example.data.SupabaseClientProvider.mockTeacherId = "teacher_100"
+    fun test4_offlineGradesAndStudentsBothShowOnlineOnlyFailureState() = runTest {
+        currentTeacherId = "teacher_100"
+        SupabaseClientProvider.mockTeacherId = "teacher_100"
         AccountSessionManager.setActiveTeacherId("teacher_100")
-        val gradeDao = db.gradeDao()
-        val studentDao = db.studentDao()
 
-        val gradeEntity = GradeEntity(
-            gradeId = "grade-prep-1",
-            gradeName = "الصف الأول الإعدادي",
-            displayOrder = 1,
-            teacherId = "teacher_100"
-        )
-        gradeDao.upsertGrade(gradeEntity)
-
-        // Stale student in Room should NEVER be displayed by Online-Only StudentRepository
-        val studentEntity = StudentEntity(
-            studentId = "student-1",
-            studentCode = "ST001",
-            fullName = "عمر أحمد",
-            gradeId = "grade-prep-1",
-            parentPhone = "01011111111",
-            hasWhatsApp = true,
-            teacherId = "teacher_100"
-        )
-        studentDao.upsertStudent(studentEntity)
-
+        gradeRemote.failFetch = UnknownHostException("offline")
         val offlineStudentRemote = object : StudentRemoteDataSource {
             override suspend fun fetchStudents(teacherId: String): List<Student> = throw UnknownHostException("offline")
             override suspend fun fetchStudentById(teacherId: String, studentId: String): Student? = throw UnknownHostException("offline")
@@ -152,108 +211,95 @@ class GradeOfflineCacheTest {
             override suspend fun softDeleteStudent(teacherId: String, studentId: String, deletedAtIso: String) = throw UnknownHostException("offline")
         }
 
-        val gradeRepo = SupabaseGradeRepository(gradeDao = gradeDao)
+        val gradeRepo = buildGradeRepo()
         val studentRepo = SupabaseStudentRepository(
             remoteDataSource = offlineStudentRemote,
-            teacherIdProvider = { "teacher_100" },
-            sessionActiveChecker = { true }
+            teacherIdProvider = { currentTeacherId },
+            sessionActiveChecker = { id -> currentTeacherId == id },
+            ioDispatcher = testDispatcher
         )
 
         val viewModel = StudentListViewModel(
             studentRepository = studentRepo,
-            gradeRepository = gradeRepo
+            gradeRepository = gradeRepo,
+            defaultDispatcher = testDispatcher
         )
+        advanceUntilIdle()
 
-        // Phase 2 Grades are still available from Room
-        val grades = gradeRepo.getGrades().first()
-        assertEquals(1, grades.size)
-        assertEquals("grade-prep-1", grades[0].id)
-
-        // Phase 1 Students are Online-Only and must NOT read stale Room cache
-        val students = studentRepo.getStudents().first()
-        assertTrue(students.isEmpty())
-        assertTrue(studentRepo.refreshStudents().isFailure)
-        AccountSessionManager.setActiveTeacherId(null)
+        assertTrue(gradeRepo.getGrades().first().isEmpty())
+        assertTrue(studentRepo.getStudents().first().isEmpty())
+        assertTrue(viewModel.uiState.value.loadState is OnlineLoadState.Offline)
+        assertTrue(viewModel.uiState.value.isOfflineError)
     }
 
     @Test
-    fun test5_teacherTenantIsolation() = runBlocking {
-        val gradeDao = db.gradeDao()
-
-        val teacherAGrades = listOf(
-            Grade(id = "g_a1", name = "الصف الأول", displayOrder = 1, teacherId = "teacher_A")
+    fun test5_teacherTenantIsolation() = runTest {
+        gradeRemote.teachers["teacher_A"] = Teacher(id = "teacher_A", educationalStage = EducationalStages.PREPARATORY)
+        gradeRemote.teachers["teacher_B"] = Teacher(id = "teacher_B", educationalStage = EducationalStages.PRIMARY)
+        gradeRemote.gradesByTeacher["teacher_A"] = mutableListOf(
+            Grade(id = "g_a1", name = "الصف الأول الإعدادي", displayOrder = 1, teacherId = "teacher_A"),
+            Grade(id = "g_a2", name = "الصف الثاني الإعدادي", displayOrder = 2, teacherId = "teacher_A"),
+            Grade(id = "g_a3", name = "الصف الثالث الإعدادي", displayOrder = 3, teacherId = "teacher_A")
         )
-        val teacherBGrades = listOf(
-            Grade(id = "g_b1", name = "الصف الثاني", displayOrder = 1, teacherId = "teacher_B")
+        gradeRemote.gradesByTeacher["teacher_B"] = mutableListOf(
+            Grade(id = "g_b1", name = "الصف الأول الابتدائي", displayOrder = 1, teacherId = "teacher_B")
         )
 
-        gradeDao.upsertGrades((teacherAGrades + teacherBGrades).map { it.toEntity() })
+        val repo = buildGradeRepo()
 
-        val aGrades = gradeDao.getAllGradesSync("teacher_A")
-        val bGrades = gradeDao.getAllGradesSync("teacher_B")
+        currentTeacherId = "teacher_A"
+        assertTrue(repo.refreshGradesResult(EducationalStages.PREPARATORY).isSuccess)
+        assertTrue(repo.getGrades().first().all { it.teacherId == "teacher_A" })
+        assertTrue(repo.getGrades().first().any { it.id == "g_a1" })
 
-        assertEquals(1, aGrades.size)
-        assertEquals("g_a1", aGrades[0].gradeId)
+        // Switching active teacher immediately isolates the flow and wipes old session data
+        currentTeacherId = "teacher_B"
+        assertTrue(repo.getGrades().first().isEmpty())
 
-        assertEquals(1, bGrades.size)
-        assertEquals("g_b1", bGrades[0].gradeId)
+        assertTrue(repo.refreshGradesResult(EducationalStages.PRIMARY).isSuccess)
+        val bGrades = repo.getGrades().first()
+        assertFalse(bGrades.any { it.id == "g_a1" })
+        assertTrue(bGrades.any { it.id == "g_b1" })
     }
 
     @Test
-    fun test6_roomMigration2To3PreservesExistingData() = runBlocking {
-        val studentDao = db.studentDao()
-        val gradeDao = db.gradeDao()
-
-        val student = StudentEntity(
-            studentId = "s-pres",
-            studentCode = "100",
-            fullName = "خالد محمود",
-            gradeId = "g-pres",
-            parentPhone = "01099999999",
-            hasWhatsApp = false,
-            teacherId = "t-1"
+    fun test6_onlineGradeNormalizationAndCrudPreserveConsistency() = runTest {
+        gradeRemote.teachers["t-1"] = Teacher(id = "t-1", educationalStage = EducationalStages.SECONDARY)
+        gradeRemote.gradesByTeacher["t-1"] = mutableListOf(
+            Grade(id = "g-pres", name = "الصف الثالث الثانوي", displayOrder = 3, teacherId = "t-1")
         )
-        studentDao.upsertStudent(student)
+        currentTeacherId = "t-1"
+        val repo = buildGradeRepo()
 
-        val grade = GradeEntity(
-            gradeId = "g-pres",
-            gradeName = "الصف الثالث الثانوي",
-            displayOrder = 3,
-            teacherId = "t-1"
-        )
-        gradeDao.upsertGrade(grade)
+        val grades = repo.refreshGradesResult(EducationalStages.SECONDARY).getOrThrow()
+        assertTrue(grades.any { it.id == "g-pres" })
 
-        val fetchedStudent = studentDao.getStudentByIdSync("t-1", "s-pres")
-        val fetchedGrade = gradeDao.getGradeById("t-1", "g-pres")
-
-        assertNotNull(fetchedStudent)
-        assertEquals("خالد محمود", fetchedStudent?.fullName)
-
+        val fetchedGrade = repo.getGradeById("g-pres")
         assertNotNull(fetchedGrade)
-        assertEquals("الصف الثالث الثانوي", fetchedGrade?.gradeName)
+        assertEquals("الصف الثالث الثانوي", fetchedGrade?.name)
+
+        // Update name in place
+        assertTrue(repo.updateGradeResult(fetchedGrade!!.copy(name = "الصف الثالث الثانوي - متقدم")).isSuccess)
+        assertEquals("الصف الثالث الثانوي - متقدم", repo.getGradeById("g-pres")?.name)
     }
 
     @Test
-    fun test7_processRestartPreservesGradeCache() = runBlocking {
-        // Step 1: Write to database instance 1
-        val gradeDao1 = db.gradeDao()
-        gradeDao1.upsertGrade(
-            Grade(id = "grade-restart", name = "الصف التجريبي", displayOrder = 1, teacherId = "t_restart").toEntity()
+    fun test7_processRestartStartsWithEmptySessionMemoryInOnlineOnlyMode() = runTest {
+        gradeRemote.gradesByTeacher["t_restart"] = mutableListOf(
+            Grade(id = "grade-restart", name = "الصف التجريبي", displayOrder = 1, teacherId = "t_restart")
         )
-        db.close()
+        currentTeacherId = "t_restart"
+        val repo1 = buildGradeRepo()
+        assertTrue(repo1.addGradeResult(Grade(id = "g-added", name = "صف مضاف", displayOrder = 4, teacherId = "t_restart")).isSuccess)
+        assertTrue(repo1.getGrades().first().isNotEmpty())
 
-        // Step 2: Open new database connection simulating app restart
-        com.example.data.SupabaseClientProvider.mockTeacherId = "t_restart"
-        val db2 = Room.databaseBuilder(context, AppDatabase::class.java, persistentDbName)
-            .allowMainThreadQueries()
-            .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
-            .build()
+        // Simulate app restart with a fresh repository instance before any remote fetch completes
+        val repo2 = buildGradeRepo()
+        assertTrue(repo2.getGrades().first().isEmpty())
 
-        val gradeDao2 = db2.gradeDao()
-        val cached = gradeDao2.getGradeById("t_restart", "grade-restart")
-        assertNotNull(cached)
-        assertEquals("الصف التجريبي", cached?.gradeName)
-
-        db2.close()
+        // Once offline on restart, no stale grade cache appears
+        gradeRemote.failFetch = UnknownHostException("offline")
+        assertTrue(repo2.refreshGradesResult().isFailure)
+        assertTrue(repo2.getGrades().first().isEmpty())
     }
 }

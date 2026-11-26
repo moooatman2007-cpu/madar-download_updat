@@ -1,31 +1,61 @@
 package com.example.data.repository
 
+import android.util.Log
 import com.example.core.model.Teacher
 import com.example.core.model.UpdateTeacherRequest
 import com.example.core.model.UpsertTeacherRequest
 import com.example.data.SupabaseClientProvider
+import com.example.data.auth.AccountSessionManager
+import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.storage.storage
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
-class SupabaseTeacherRepository : TeacherRepository {
-    private val client = SupabaseClientProvider.client
+class SupabaseTeacherRepository(
+    private val client: SupabaseClient = SupabaseClientProvider.client,
+    private val teacherIdProvider: () -> String? = {
+        SupabaseClientProvider.mockTeacherId
+            ?: try { client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+    },
+    private val sessionActiveChecker: (String) -> Boolean = { teacherId ->
+        AccountSessionManager.isSessionActive(teacherId)
+    },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+) : TeacherRepository {
+
     private val _currentTeacher = MutableStateFlow<Teacher?>(null)
+
+    private fun resolveActiveTeacherId(): String? {
+        val teacherId = teacherIdProvider()?.takeIf { it.isNotBlank() } ?: return null
+        return if (sessionActiveChecker(teacherId)) teacherId else null
+    }
+
+    private fun isStillAuthorized(teacherId: String): Boolean =
+        sessionActiveChecker(teacherId) && teacherIdProvider() == teacherId
 
     fun clearCache() {
         _currentTeacher.value = null
     }
 
-    override fun getCurrentTeacher(): Flow<Teacher?> = _currentTeacher.asStateFlow()
+    override fun getCurrentTeacher(): Flow<Teacher?> = _currentTeacher.map { teacher ->
+        val activeId = resolveActiveTeacherId()
+        if (activeId == null || teacher == null || teacher.id != activeId) null else teacher
+    }
 
-    override suspend fun fetchCurrentTeacher(): Teacher? = withContext(Dispatchers.IO) {
+    override suspend fun fetchCurrentTeacher(): Teacher? = withContext(ioDispatcher) {
         val mockId = SupabaseClientProvider.mockTeacherId
         if (mockId != null) {
+            if (!sessionActiveChecker(mockId)) {
+                clearCache()
+                return@withContext null
+            }
             val cached = _currentTeacher.value
             if (cached != null && cached.id == mockId) return@withContext cached
             val mockTeacher = Teacher(id = mockId, email = "mock@teacher.com", fullName = "المدرس الحالي")
@@ -33,8 +63,12 @@ class SupabaseTeacherRepository : TeacherRepository {
             return@withContext mockTeacher
         }
 
-        val user = client.auth.currentUserOrNull() ?: return@withContext null
-        val teacherId = user.id
+        val user = client.auth.currentUserOrNull()
+        val teacherId = user?.id?.takeIf { it.isNotBlank() } ?: resolveActiveTeacherId()
+        if (teacherId == null || !isStillAuthorized(teacherId)) {
+            clearCache()
+            return@withContext null
+        }
 
         // Execute PostgREST query directly.
         // If this throws an exception (network error, timeout, 500), let it propagate
@@ -47,11 +81,16 @@ class SupabaseTeacherRepository : TeacherRepository {
             }
             .decodeSingleOrNull<Teacher>()
 
-        val metaStage = user.userMetadata?.get("educational_stage")?.toString()?.replace("\"", "")
+        if (!isStillAuthorized(teacherId)) {
+            clearCache()
+            return@withContext null
+        }
+
+        val metaStage = user?.userMetadata?.get("educational_stage")?.toString()?.replace("\"", "")
         val finalTeacher = (result ?: Teacher(
             id = teacherId,
-            email = user.email ?: "",
-            fullName = user.userMetadata?.get("full_name")?.toString()?.replace("\"", "") ?: "",
+            email = user?.email ?: "",
+            fullName = user?.userMetadata?.get("full_name")?.toString()?.replace("\"", "") ?: "",
             educationalStage = metaStage
         )).let { t ->
             if (t.educationalStage == null && !metaStage.isNullOrBlank()) {
@@ -69,12 +108,17 @@ class SupabaseTeacherRepository : TeacherRepository {
         centerName: String?,
         educationalStage: String?,
         avatarUrl: String?
-    ): Result<Teacher> = withContext(Dispatchers.IO) {
+    ): Result<Teacher> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("جلسة تسجيل الدخول غير صحيحة أو انتهت."))
+
         try {
             val user = client.auth.currentUserOrNull()
-                ?: return@withContext Result.failure(Exception("جلسة تسجيل الدخول غير صحيحة أو انتهت."))
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("جلسة تسجيل الدخول غير صحيحة أو انتهت."))
+            }
 
-            val teacherId = user.id
             val updateDto = UpdateTeacherRequest(
                 fullName = fullName,
                 phoneNumber = phoneNumber?.ifBlank { null },
@@ -91,11 +135,13 @@ class SupabaseTeacherRepository : TeacherRepository {
                             eq("id", teacherId)
                         }
                     }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.w("SupabaseTeacherRepo", "Update failed, falling back to upsert: ${e.message}")
                 val upsertDto = UpsertTeacherRequest(
                     id = teacherId,
-                    email = user.email ?: "",
+                    email = user?.email ?: _currentTeacher.value?.email ?: "",
                     fullName = fullName,
                     phoneNumber = phoneNumber?.ifBlank { null },
                     subject = subject?.ifBlank { null },
@@ -106,9 +152,14 @@ class SupabaseTeacherRepository : TeacherRepository {
                 client.postgrest["teachers"].upsert(upsertDto)
             }
 
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حفظ البيانات."))
+            }
+
             val updated = Teacher(
                 id = teacherId,
-                email = user.email ?: "",
+                email = user?.email ?: _currentTeacher.value?.email ?: "",
                 fullName = fullName,
                 phoneNumber = phoneNumber?.ifBlank { null },
                 subject = subject?.ifBlank { null },
@@ -119,39 +170,46 @@ class SupabaseTeacherRepository : TeacherRepository {
 
             _currentTeacher.value = updated
             Result.success(updated)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseTeacherRepo", "updateTeacherProfile failed: ${e.message}", e)
             val rawMsg = e.localizedMessage ?: e.message ?: e.toString()
             Result.failure(Exception("فشل حفظ البيانات: $rawMsg"))
         }
     }
 
-    override suspend fun uploadAvatar(bytes: ByteArray, fileName: String, mimeType: String): Result<String> = withContext(Dispatchers.IO) {
-        try {
-            val user = client.auth.currentUserOrNull()
-                ?: return@withContext Result.failure(Exception("جلسة تسجيل الدخول غير صحيحة أو انتهت."))
+    override suspend fun uploadAvatar(bytes: ByteArray, fileName: String, mimeType: String): Result<String> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("جلسة تسجيل الدخول غير صحيحة أو انتهت."))
 
-            val teacherId = user.id
+        try {
             val bucket = client.storage.from("teacher-avatars")
             val filePath = "$teacherId/$fileName"
 
             bucket.upload(filePath, bytes) {
                 upsert = true
             }
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء رفع الصورة."))
+            }
             val publicUrl = bucket.publicUrl(filePath)
             Result.success(publicUrl)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseTeacherRepo", "uploadAvatar failed: ${e.message}", e)
             val rawMsg = e.localizedMessage ?: e.message ?: e.toString()
             Result.failure(Exception("فشل رفع الصورة: $rawMsg"))
         }
     }
 
-    override suspend fun deleteAvatar(): Result<Unit> = withContext(Dispatchers.IO) {
-        try {
-            val user = client.auth.currentUserOrNull()
-                ?: return@withContext Result.failure(Exception("غير مسجل الدخول."))
+    override suspend fun deleteAvatar(): Result<Unit> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("غير مسجل الدخول."))
 
+        try {
             val current = _currentTeacher.value
             val avatarUrl = current?.avatarUrl
             if (!avatarUrl.isNullOrBlank()) {
@@ -159,11 +217,18 @@ class SupabaseTeacherRepository : TeacherRepository {
                 val fileName = avatarUrl.substringAfterLast("/")
                 if (fileName.isNotBlank()) {
                     try {
-                        bucket.delete("${user.id}/$fileName")
+                        bucket.delete("$teacherId/$fileName")
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        e.printStackTrace()
+                        Log.w("SupabaseTeacherRepo", "Failed to remove avatar file from storage: ${e.message}")
                     }
                 }
+            }
+
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حذف الصورة."))
             }
 
             updateTeacherProfile(
@@ -173,10 +238,11 @@ class SupabaseTeacherRepository : TeacherRepository {
                 centerName = current?.centerName,
                 educationalStage = current?.educationalStage,
                 avatarUrl = null
-            )
-            Result.success(Unit)
+            ).map { Unit }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseTeacherRepo", "deleteAvatar failed: ${e.message}", e)
             val rawMsg = e.localizedMessage ?: e.message ?: e.toString()
             Result.failure(Exception("فشل حذف الصورة: $rawMsg"))
         }

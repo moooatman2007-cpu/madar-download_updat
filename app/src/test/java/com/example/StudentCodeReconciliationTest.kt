@@ -1,26 +1,14 @@
 package com.example
 
-import android.content.Context
-import androidx.room.Room
-import androidx.test.core.app.ApplicationProvider
-import androidx.work.ListenableWorker
-import androidx.work.testing.TestListenableWorkerBuilder
 import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Student
 import com.example.core.model.SupabaseStudentInsertDto
 import com.example.core.model.UpdateStudentOnlineDto
 import com.example.data.SupabaseClientProvider
 import com.example.data.auth.AccountSessionManager
-import com.example.data.local.AppDatabase
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.AttendanceDao
-import com.example.data.local.dao.ExamDao
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.dao.StudentDao
-import com.example.data.local.entity.OutboxEntity
 import com.example.data.repository.StudentRemoteDataSource
 import com.example.data.repository.SupabaseStudentRepository
-import com.example.data.sync.OutboxSyncWorker
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -35,45 +23,26 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.IOException
 import java.net.UnknownHostException
-import java.util.UUID
 
+@OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 class StudentCodeReconciliationTest {
 
-    private lateinit var context: Context
-    private lateinit var db: AppDatabase
-    private lateinit var studentDao: StudentDao
-    private lateinit var outboxDao: OutboxDao
-    private lateinit var attendanceDao: AttendanceDao
-    private lateinit var examDao: ExamDao
-
     private val teacherA = "teacher_alpha_test"
     private val teacherB = "teacher_beta_test"
+    private var activeTeacherId: String? = teacherA
 
     @Before
     fun setUp() {
-        context = ApplicationProvider.getApplicationContext()
-        db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
-            .allowMainThreadQueries()
-            .build()
-        DatabaseProvider.setDatabase(db, context)
-
-        studentDao = db.studentDao()
-        outboxDao = db.outboxDao()
-        attendanceDao = db.attendanceDao()
-        examDao = db.examDao()
-
+        activeTeacherId = teacherA
         SupabaseClientProvider.mockTeacherId = teacherA
         AccountSessionManager.setActiveTeacherId(teacherA)
     }
 
     @After
     fun tearDown() {
-        OutboxSyncWorker.operationProcessor = null
         AccountSessionManager.setActiveTeacherId(null)
         SupabaseClientProvider.mockTeacherId = null
-        db.close()
-        DatabaseProvider.resetForTesting()
     }
 
     @Test
@@ -82,8 +51,10 @@ class StudentCodeReconciliationTest {
         val fakeRemote = object : StudentRemoteDataSource {
             private val stored = mutableListOf<Student>()
             override suspend fun fetchStudents(teacherId: String) = stored.filter { it.teacherId == teacherId }
-            override suspend fun fetchStudentById(teacherId: String, studentId: String) = stored.firstOrNull { it.studentId == studentId && it.teacherId == teacherId }
-            override suspend fun fetchStudentByCode(teacherId: String, studentCode: String) = stored.firstOrNull { it.studentCode == studentCode && it.teacherId == teacherId }
+            override suspend fun fetchStudentById(teacherId: String, studentId: String) =
+                stored.firstOrNull { it.studentId == studentId && it.teacherId == teacherId }
+            override suspend fun fetchStudentByCode(teacherId: String, studentCode: String) =
+                stored.firstOrNull { it.studentCode == studentCode && it.teacherId == teacherId }
             override suspend fun insertStudent(dto: SupabaseStudentInsertDto): Student {
                 val created = Student(
                     studentId = dto.id,
@@ -104,8 +75,8 @@ class StudentCodeReconciliationTest {
 
         val repo = SupabaseStudentRepository(
             remoteDataSource = fakeRemote,
-            teacherIdProvider = { teacherA },
-            sessionActiveChecker = { true }
+            teacherIdProvider = { activeTeacherId },
+            sessionActiveChecker = { id -> activeTeacherId == id }
         )
 
         val result = repo.addStudent(
@@ -122,12 +93,14 @@ class StudentCodeReconciliationTest {
         assertEquals("ST-00001", syncResult.data.studentCode)
         assertFalse(syncResult.data.studentCode.contains("TMP"))
 
-        // Verify lookup by server code succeeds in Online-Only repo and Room/Outbox stay empty
+        // Verify lookup by server code succeeds directly via Supabase remote source
         val byCode = repo.getStudentByCode("ST-00001")
         assertNotNull(byCode)
         assertEquals(syncResult.data.studentId, byCode?.studentId)
-        assertTrue(studentDao.getAllStudentsSync(teacherA).isEmpty())
-        assertTrue(outboxDao.getPendingOperationsForTeacher(teacherA).isEmpty())
+
+        // Clearing in-memory session cache leaves no persistent store behind
+        repo.clearCache()
+        assertTrue(repo.getStudents().first().isEmpty())
     }
 
     @Test
@@ -158,8 +131,8 @@ class StudentCodeReconciliationTest {
 
         val repo = SupabaseStudentRepository(
             remoteDataSource = fakeRemote,
-            teacherIdProvider = { teacherA },
-            sessionActiveChecker = { true }
+            teacherIdProvider = { activeTeacherId },
+            sessionActiveChecker = { id -> activeTeacherId == id }
         )
 
         val s1 = repo.addStudent("طالب أول", "grade_1", "01000000001", true, null).getOrNull()!!.data
@@ -174,7 +147,7 @@ class StudentCodeReconciliationTest {
     }
 
     @Test
-    fun testOfflineStudentCreation_failsWithoutTemporaryCodeOrOutbox() = runBlocking {
+    fun testOfflineStudentCreation_failsWithoutTemporaryCodeOrLocalQueue() = runBlocking {
         val offlineRemote = object : StudentRemoteDataSource {
             override suspend fun fetchStudents(teacherId: String) = throw UnknownHostException("offline")
             override suspend fun fetchStudentById(teacherId: String, studentId: String) = throw UnknownHostException("offline")
@@ -186,15 +159,13 @@ class StudentCodeReconciliationTest {
 
         val repo = SupabaseStudentRepository(
             remoteDataSource = offlineRemote,
-            teacherIdProvider = { teacherA },
-            sessionActiveChecker = { true }
+            teacherIdProvider = { activeTeacherId },
+            sessionActiveChecker = { id -> activeTeacherId == id }
         )
 
         val addResult = repo.addStudent("طارق محمود", "grade_2", "01122334455", true, null)
         assertTrue(addResult.isFailure)
         assertTrue(repo.getStudents().first().isEmpty())
-        assertTrue(studentDao.getAllStudentsSync(teacherA).isEmpty())
-        assertTrue(outboxDao.getPendingOperationsForTeacher(teacherA).isEmpty())
     }
 
     @Test
@@ -227,8 +198,8 @@ class StudentCodeReconciliationTest {
 
         val repo = SupabaseStudentRepository(
             remoteDataSource = fakeRemote,
-            teacherIdProvider = { teacherA },
-            sessionActiveChecker = { true }
+            teacherIdProvider = { activeTeacherId },
+            sessionActiveChecker = { id -> activeTeacherId == id }
         )
 
         val updateCandidate = serverStudent.copy(
@@ -243,43 +214,62 @@ class StudentCodeReconciliationTest {
     }
 
     @Test
-    fun testPhase2OutboxWorkerRetry_andTenantIsolationStillWorkForRemainingOutboxEntities() = runBlocking {
-        val opB = OutboxEntity(
-            id = UUID.randomUUID().toString(),
-            operationType = "UPSERT",
-            entityType = "ATTENDANCE",
-            entityId = "att_teacher_b",
-            payload = "{}",
-            createdAt = System.currentTimeMillis(),
-            status = "PENDING",
+    fun testOnlineRetryAfterTransientFailure_andTenantIsolation() = runBlocking {
+        var failInsert = true
+        val remoteStorage = linkedMapOf<String, Student>()
+        var seq = 1
+
+        val fakeRemote = object : StudentRemoteDataSource {
+            override suspend fun fetchStudents(teacherId: String) = remoteStorage.values.filter { it.teacherId == teacherId }
+            override suspend fun fetchStudentById(teacherId: String, studentId: String) =
+                remoteStorage[studentId]?.takeIf { it.teacherId == teacherId }
+            override suspend fun fetchStudentByCode(teacherId: String, studentCode: String) =
+                remoteStorage.values.firstOrNull { it.teacherId == teacherId && it.studentCode == studentCode }
+            override suspend fun insertStudent(dto: SupabaseStudentInsertDto): Student {
+                if (failInsert) throw IOException("503")
+                val s = Student(
+                    studentId = dto.id,
+                    studentCode = "ST-%05d".format(seq++),
+                    fullName = dto.fullName,
+                    gradeId = dto.gradeId,
+                    parentPhone = dto.parentPhone,
+                    teacherId = dto.teacherId
+                )
+                remoteStorage[s.studentId] = s
+                return s
+            }
+            override suspend fun updateStudent(teacherId: String, studentId: String, request: UpdateStudentOnlineDto) = error("unused")
+            override suspend fun softDeleteStudent(teacherId: String, studentId: String, deletedAtIso: String) {}
+        }
+
+        // Seed Teacher B student on server
+        remoteStorage["s_b"] = Student(
+            studentId = "s_b",
+            studentCode = "ST-B001",
+            fullName = "طالب ب",
+            gradeId = "g_1",
+            parentPhone = "01022223333",
             teacherId = teacherB
         )
-        outboxDao.insertOperation(opB)
 
-        val opA = OutboxEntity(
-            id = UUID.randomUUID().toString(),
-            operationType = "UPSERT",
-            entityType = "ATTENDANCE",
-            entityId = "att_teacher_a",
-            payload = "{}",
-            createdAt = System.currentTimeMillis(),
-            status = "PENDING",
-            teacherId = teacherA
+        val repo = SupabaseStudentRepository(
+            remoteDataSource = fakeRemote,
+            teacherIdProvider = { activeTeacherId },
+            sessionActiveChecker = { id -> activeTeacherId == id }
         )
-        outboxDao.insertOperation(opA)
 
-        // Attempt 1 fails -> PENDING + retryCount=1, Teacher B untouched
-        OutboxSyncWorker.operationProcessor = { throw IOException("503") }
-        val worker1 = TestListenableWorkerBuilder<OutboxSyncWorker>(context).build()
-        assertEquals(ListenableWorker.Result.retry(), worker1.doWork())
-        assertEquals(1, outboxDao.getOperationById(opA.id)?.retryCount)
-        assertEquals("PENDING", outboxDao.getOperationById(opB.id)?.status)
+        // Attempt 1 fails -> zero local queue or phantom students; Teacher B untouched
+        val attempt1 = repo.addStudent("طالب أ", "g_1", "01011112222", true, null)
+        assertTrue(attempt1.isFailure)
+        assertTrue(repo.getStudents().first().isEmpty())
+        assertEquals(1, remoteStorage.size)
 
-        // Attempt 2 succeeds -> SYNCED for A, Teacher B untouched
-        OutboxSyncWorker.operationProcessor = { }
-        val worker2 = TestListenableWorkerBuilder<OutboxSyncWorker>(context).build()
-        assertEquals(ListenableWorker.Result.success(), worker2.doWork())
-        assertEquals("SYNCED", outboxDao.getOperationById(opA.id)?.status)
-        assertEquals("PENDING", outboxDao.getOperationById(opB.id)?.status)
+        // Attempt 2 succeeds cleanly -> authoritative server code, Teacher B still isolated
+        failInsert = false
+        val attempt2 = repo.addStudent("طالب أ", "g_1", "01011112222", true, null)
+        assertTrue(attempt2.isSuccess)
+        assertEquals("ST-00001", attempt2.getOrNull()?.data?.studentCode)
+        assertEquals(listOf("طالب أ"), repo.getStudents().first().map { it.fullName })
+        assertTrue(repo.updateStudent(remoteStorage["s_b"]!!.copy(fullName = "اختراق")).exceptionOrNull() is SecurityException)
     }
 }

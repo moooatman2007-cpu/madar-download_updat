@@ -2,21 +2,24 @@ package com.example
 
 import com.example.core.model.Attendance
 import com.example.core.model.AttendanceStatus
+import com.example.core.model.BatchSyncStatus
 import com.example.core.model.UpsertAttendanceRequest
-import com.example.data.local.dao.AttendanceDao
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.entity.AttendanceEntity
-import com.example.data.local.entity.OutboxEntity
+import com.example.data.repository.AttendanceRemoteDataSource
 import com.example.data.repository.MockAttendanceRepository
+import com.example.data.repository.SupabaseAttendanceRepository
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.IOException
 
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE)
@@ -29,24 +32,22 @@ class AttendanceNoGroupAndOutboxTest {
         val studentId = "std_nogroup_1"
         val date = "2026-09-27"
 
-        // 1. Insert attendance for the first time (no group)
         val res1 = repo.recordOrUpdateAttendance(studentId, date, AttendanceStatus.PRESENT, "Note 1", null)
         assertTrue(res1.isSuccess)
         val att1 = res1.getOrThrow().data
         assertEquals(AttendanceStatus.PRESENT, att1.status)
-        assertEquals(null, att1.groupId)
+        assertNull(att1.groupId)
 
-        // 2. Same student + date -> UPDATE (PRESENT -> ABSENT), should remain 1 record
         val res2 = repo.recordOrUpdateAttendance(studentId, date, AttendanceStatus.ABSENT, "Note 2", null)
         assertTrue(res2.isSuccess)
         val att2 = res2.getOrThrow().data
         assertEquals(AttendanceStatus.ABSENT, att2.status)
 
-        // Verify total records for student/date in mock repo
-        val allForStudent = repo.getAttendanceForStudent(studentId)
-        // Mock repository behavior maintains uniqueness per student/date/groupId
-        val list = repo.getAttendanceByDate(studentId, date)
-        assertNotNull(list)
+        val allForStudent = repo.getAttendanceForStudent(studentId).first()
+        assertEquals(1, allForStudent.size)
+        val record = repo.getAttendanceByDate(studentId, date)
+        assertNotNull(record)
+        assertEquals(AttendanceStatus.ABSENT, record?.status)
     }
 
     @Test
@@ -57,17 +58,14 @@ class AttendanceNoGroupAndOutboxTest {
         val groupA = "grp_A"
         val groupB = "grp_B"
 
-        // 1. Group A insert
         val r1 = repo.recordOrUpdateAttendance(studentId, date, AttendanceStatus.PRESENT, "Group A", groupA)
         assertTrue(r1.isSuccess)
         assertEquals(groupA, r1.getOrThrow().data.groupId)
 
-        // 2. Group A update
         val r2 = repo.recordOrUpdateAttendance(studentId, date, AttendanceStatus.LATE, "Group A Updated", groupA)
         assertTrue(r2.isSuccess)
         assertEquals(AttendanceStatus.LATE, r2.getOrThrow().data.status)
 
-        // 3. Different group (Group B) -> allowed as separate record
         val r3 = repo.recordOrUpdateAttendance(studentId, date, AttendanceStatus.PRESENT, "Group B", groupB)
         assertTrue(r3.isSuccess)
         assertEquals(groupB, r3.getOrThrow().data.groupId)
@@ -75,27 +73,75 @@ class AttendanceNoGroupAndOutboxTest {
 
     @Test
     fun testOutboxSyncNoGroupAndRetrySafety() = runTest {
-        // Verify outbox entities creation and retry safety logic semantics
-        val req1 = UpsertAttendanceRequest(
-            teacherId = "teacher_1",
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        var shouldFailOnce = true
+        val capturedRequests = mutableListOf<UpsertAttendanceRequest>()
+
+        val fakeRemote = object : AttendanceRemoteDataSource {
+            private val stored = linkedMapOf<String, Attendance>()
+            override suspend fun fetchAttendanceForStudent(teacherId: String, studentId: String) =
+                stored.values.filter { it.teacherId == teacherId && it.studentId == studentId }
+            override suspend fun fetchAttendanceForStudentByMonth(teacherId: String, studentId: String, startDate: String, endDate: String) = emptyList<Attendance>()
+            override suspend fun fetchAllAttendanceForTeacher(teacherId: String) = stored.values.filter { it.teacherId == teacherId }
+            override suspend fun fetchTodayCountByStatus(teacherId: String, date: String, status: AttendanceStatus) = 0
+            override suspend fun fetchStudentGroupId(teacherId: String, studentId: String): String? = null
+            override suspend fun upsertAttendance(request: UpsertAttendanceRequest): Attendance {
+                if (shouldFailOnce) {
+                    shouldFailOnce = false
+                    throw IOException("Transient 503 error")
+                }
+                capturedRequests.add(request)
+                val key = "${request.studentId}_${request.date}"
+                val saved = Attendance(
+                    attendanceId = key,
+                    studentId = request.studentId,
+                    teacherId = request.teacherId,
+                    groupId = request.groupId,
+                    date = request.date,
+                    status = AttendanceStatus.fromString(request.status),
+                    note = request.note
+                )
+                stored[key] = saved
+                return saved
+            }
+            override suspend fun upsertBatchAttendance(requests: List<UpsertAttendanceRequest>) = emptyList<Attendance>()
+            override suspend fun deleteAttendanceByStudentAndDate(teacherId: String, studentId: String, date: String) {}
+            override suspend fun deleteAttendanceById(teacherId: String, attendanceId: String) {}
+            override suspend fun fetchAttendanceByDate(teacherId: String, studentId: String, date: String) =
+                stored["${studentId}_$date"]
+            override suspend fun fetchAttendanceForDate(teacherId: String, date: String) = emptyList<Attendance>()
+        }
+
+        val repo = SupabaseAttendanceRepository(
+            remoteDataSource = fakeRemote,
+            teacherIdProvider = { "teacher_1" },
+            sessionActiveChecker = { true },
+            ioDispatcher = dispatcher
+        )
+
+        val firstAttempt = repo.recordOrUpdateAttendance(
             studentId = "std_og_1",
-            groupId = null,
             date = "2026-09-27",
-            status = "PRESENT",
-            note = "Outbox No Group"
+            status = AttendanceStatus.PRESENT,
+            note = "No Group Direct Online",
+            groupId = null
         )
-        val entity = OutboxEntity(
-            id = "outbox_1",
-            operationType = "UPSERT",
-            entityType = "ATTENDANCE",
-            entityId = "std_og_1_2026-09-27",
-            payload = kotlinx.serialization.json.Json.encodeToString(UpsertAttendanceRequest.serializer(), req1),
-            createdAt = System.currentTimeMillis(),
-            status = "PENDING",
-            teacherId = "teacher_1"
+        assertTrue(firstAttempt.isFailure)
+        assertTrue(repo.getAllAttendanceForTeacher().first().isEmpty())
+
+        val retryAttempt = repo.recordOrUpdateAttendance(
+            studentId = "std_og_1",
+            date = "2026-09-27",
+            status = AttendanceStatus.PRESENT,
+            note = "No Group Direct Online",
+            groupId = null
         )
-        assertNotNull(entity)
-        assertEquals("ATTENDANCE", entity.entityType)
-        assertEquals("UPSERT", entity.operationType)
+        assertTrue(retryAttempt.isSuccess)
+        val syncResult = retryAttempt.getOrThrow()
+        assertEquals(BatchSyncStatus.SAVED_TO_CLOUD, syncResult.syncStatus)
+        assertNull(syncResult.data.groupId)
+        assertEquals(1, capturedRequests.size)
+        assertNull(capturedRequests[0].groupId)
+        assertEquals(1, repo.getAllAttendanceForTeacher().first().size)
     }
 }

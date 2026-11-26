@@ -62,6 +62,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.core.model.Student
 import com.example.ui.components.EmptyStateView
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.theme.Dimens
 import com.example.ui.theme.PrimaryIndigo
 import com.example.util.BarcodeGenerator
@@ -237,10 +239,26 @@ fun StudentBarcodesScreen(
                     .padding(horizontal = Dimens.Spacing16, vertical = Dimens.Spacing4)
             )
 
-            if (uiState.isLoading) {
+            if (uiState.errorMessage != null && uiState.students.isNotEmpty()) {
+                OnlineInlineErrorBanner(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.errorMessage!!,
+                    onRetry = viewModel::retry,
+                    modifier = Modifier.padding(horizontal = Dimens.Spacing16, vertical = Dimens.Spacing4)
+                )
+            }
+
+            if (uiState.isLoading && uiState.students.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator(color = PrimaryIndigo)
                 }
+            } else if (uiState.errorMessage != null && uiState.students.isEmpty()) {
+                OnlineStatusStateView(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.errorMessage!!,
+                    onRetry = viewModel::retry,
+                    modifier = Modifier.fillMaxSize()
+                )
             } else if (uiState.filteredStudents.isEmpty()) {
                 EmptyStateView(
                     title = "لا يوجد طلاب لعرض الباركود",

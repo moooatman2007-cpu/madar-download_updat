@@ -1,5 +1,6 @@
 package com.example.data.repository
 
+import android.util.Log
 import com.example.core.model.AbsenceNotificationEventInsertDto
 import com.example.core.model.ApproveRecitationResultDto
 import com.example.core.model.ExamNotificationEventInsertDto
@@ -9,11 +10,16 @@ import com.example.core.model.NotificationEvent
 import com.example.core.model.PendingRecitationNotificationDto
 import com.example.core.model.RecitationNotificationEventInsertDto
 import com.example.data.SupabaseClientProvider
+import com.example.data.auth.AccountSessionManager
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -21,22 +27,35 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 
 /**
  * Production implementation of NotificationEventRepository communicating directly
  * with Supabase PostgREST for inserting PENDING events.
  */
 class SupabaseNotificationEventRepository(
-    private val client: SupabaseClient = SupabaseClientProvider.client
+    private val client: SupabaseClient = SupabaseClientProvider.client,
+    private val teacherIdProvider: () -> String? = {
+        SupabaseClientProvider.mockTeacherId
+            ?: try { client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+    },
+    private val sessionActiveChecker: (String) -> Boolean = { teacherId ->
+        AccountSessionManager.isSessionActive(teacherId)
+    },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : NotificationEventRepository {
+
+    private fun resolveActiveTeacherId(): String? {
+        val teacherId = teacherIdProvider()?.takeIf { it.isNotBlank() } ?: return null
+        return if (sessionActiveChecker(teacherId)) teacherId else null
+    }
+
+    private fun isStillAuthorized(teacherId: String): Boolean =
+        sessionActiveChecker(teacherId) && teacherIdProvider() == teacherId
 
     override suspend fun createNotificationEvent(
         event: NotificationEvent
-    ): NotificationEventCreationResult = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    ): NotificationEventCreationResult = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
             ?: return@withContext NotificationEventCreationResult.Failed(
                 error = IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."),
                 message = "انتهت الجلسة، يرجى تسجيل الدخول أولاً."
@@ -103,14 +122,23 @@ class SupabaseNotificationEventRepository(
                 }
             }
 
+            if (!isStillAuthorized(teacherId)) {
+                return@withContext NotificationEventCreationResult.Failed(
+                    error = IllegalStateException("انتهت الجلسة أثناء إنشاء حدث الإشعار."),
+                    message = "انتهت الجلسة أثناء إنشاء حدث الإشعار."
+                )
+            }
+
             NotificationEventCreationResult.Created(event)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             val msg = e.message ?: ""
             val isDuplicate = msg.contains("23505", ignoreCase = true) ||
-                    msg.contains("duplicate key", ignoreCase = true) ||
-                    msg.contains("unique constraint", ignoreCase = true) ||
-                    msg.contains("already exists", ignoreCase = true) ||
-                    msg.contains("409", ignoreCase = true)
+                msg.contains("duplicate key", ignoreCase = true) ||
+                msg.contains("unique constraint", ignoreCase = true) ||
+                msg.contains("already exists", ignoreCase = true) ||
+                msg.contains("409", ignoreCase = true)
 
             if (isDuplicate) {
                 NotificationEventCreationResult.AlreadyExists(
@@ -126,23 +154,38 @@ class SupabaseNotificationEventRepository(
         }
     }
 
-    override suspend fun getPendingRecitations(): Result<List<PendingRecitationNotificationDto>> = withContext(Dispatchers.IO) {
+    override suspend fun getPendingRecitations(): Result<List<PendingRecitationNotificationDto>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
+
         try {
             val response = client.postgrest.rpc("get_pending_recitation_notifications")
                 .decodeList<PendingRecitationNotificationDto>()
+            if (!isStillAuthorized(teacherId)) {
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب التسميعات المنتظرة."))
+            }
             Result.success(response)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseNotifRepo", "getPendingRecitations failed: ${e.message}", e)
             Result.failure(Exception("فشل جلب قائمة التسميعات المنتظرة: ${e.message}", e))
         }
     }
 
-    override suspend fun approveRecitation(recitationId: String): Result<ApproveRecitationResult> = withContext(Dispatchers.IO) {
+    override suspend fun approveRecitation(recitationId: String): Result<ApproveRecitationResult> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
+
         try {
             val params = buildJsonObject { put("p_recitation_id", recitationId) }
             val response = client.postgrest.rpc("approve_recitation_notification", parameters = params)
                 .decodeSingle<ApproveRecitationResultDto>()
-            
+
+            if (!isStillAuthorized(teacherId)) {
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء اعتماد التسميع."))
+            }
+
             val retRecitationId = response.recitationId
             val retEventId = response.eventId
 
@@ -155,25 +198,37 @@ class SupabaseNotificationEventRepository(
             }
 
             if (response.alreadyApproved) {
-                Result.success(ApproveRecitationResult.AlreadyApproved(
-                    retEventId,
-                    retRecitationId
-                ))
+                Result.success(
+                    ApproveRecitationResult.AlreadyApproved(
+                        retEventId,
+                        retRecitationId
+                    )
+                )
             } else if (response.success) {
-                Result.success(ApproveRecitationResult.Success(
-                    retEventId,
-                    retRecitationId
-                ))
+                Result.success(
+                    ApproveRecitationResult.Success(
+                        retEventId,
+                        retRecitationId
+                    )
+                )
             } else {
                 Result.failure(Exception(response.status ?: "فشل اعتماد التسميع"))
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseNotifRepo", "approveRecitation failed: ${e.message}", e)
             Result.failure(Exception("فشل اعتماد التسميع: ${e.message}", e))
         }
     }
 
-    override suspend fun triggerNotificationWorker(eventType: String?): NotificationWorkerResult = withContext(Dispatchers.IO) {
+    override suspend fun triggerNotificationWorker(eventType: String?): NotificationWorkerResult = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext NotificationWorkerResult.Error(
+                IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."),
+                "انتهت جلسة تسجيل الدخول أو لا يوجد رمز تفويض صالح؛ يرجى إعادة تسجيل الدخول لتشغيل الإشعارات."
+            )
+
         val workerUrl = SupabaseClientProvider.getEdgeFunctionUrl("studentmanager-notification-worker")
         if (workerUrl.isBlank() || workerUrl.contains("placeholder")) {
             return@withContext NotificationWorkerResult.Skipped("بيئة اختبار أو رابط غير مهيأ")
@@ -197,9 +252,6 @@ class SupabaseNotificationEventRepository(
             }
         }
 
-        val currentUserId = client.auth.currentUserOrNull()?.id ?: "null"
-        if (com.example.BuildConfig.DEBUG) android.util.Log.d("NotificationWorker", "Current user resolved")
-
         try {
             val payloadObj = JSONObject().apply {
                 if (!eventType.isNullOrBlank()) {
@@ -214,6 +266,12 @@ class SupabaseNotificationEventRepository(
 
             workerHttpClient.newCall(requestBuilder.build()).execute().use { response ->
                 val bodyStr = response.body?.string() ?: ""
+                if (!isStillAuthorized(teacherId)) {
+                    return@withContext NotificationWorkerResult.Error(
+                        IllegalStateException("انتهت الجلسة أثناء تشغيل معالج الإشعارات."),
+                        "انتهت جلسة تسجيل الدخول أثناء تنفيذ العملية."
+                    )
+                }
                 if (response.isSuccessful) {
                     try {
                         val json = JSONObject(bodyStr)
@@ -286,6 +344,8 @@ class SupabaseNotificationEventRepository(
                     )
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: java.net.SocketTimeoutException) {
             NotificationWorkerResult.Error(e, "انتهت مهلة الاتصال بمعالج الإشعارات (تجاوزت المهلة 130 ثانية)")
         } catch (e: java.net.UnknownHostException) {

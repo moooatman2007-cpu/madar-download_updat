@@ -30,6 +30,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.core.model.*
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.components.StudentAvatar
 import com.example.ui.theme.*
 import java.time.Instant
@@ -318,18 +320,77 @@ fun ReportsScreen(
             }
 
             // Report Content
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(Dimens.Spacing16),
-                verticalArrangement = Arrangement.spacedBy(Dimens.Spacing16)
-            ) {
-                when (uiState.selectedTab) {
-                    ReportsTab.GROUP_DAILY -> {
-                        if (uiState.groupReportMode == GroupReportMode.PERIOD) {
-                            groupPeriodReportContent(uiState, onNavigateToStudentDetail)
-                        } else {
-                            groupDailyReportContent(
+            val hasReportEntities = uiState.students.isNotEmpty() || uiState.groups.isNotEmpty() || uiState.grades.isNotEmpty()
+            when {
+                uiState.isLoading && !hasReportEntities -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(color = PrimaryIndigo)
+                    }
+                }
+                uiState.loadError != null && !hasReportEntities -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        OnlineStatusStateView(
+                            isOffline = uiState.isOfflineError,
+                            message = uiState.loadError!!,
+                            onRetry = viewModel::retry
+                        )
+                    }
+                }
+                else -> {
+                    uiState.loadError?.let { errorMsg ->
+                        OnlineInlineErrorBanner(
+                            isOffline = uiState.isOfflineError,
+                            message = errorMsg,
+                            onRetry = viewModel::retry,
+                            modifier = Modifier.padding(horizontal = Dimens.Spacing16, vertical = Dimens.Spacing8)
+                        )
+                    }
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentPadding = PaddingValues(Dimens.Spacing16),
+                        verticalArrangement = Arrangement.spacedBy(Dimens.Spacing16)
+                    ) {
+                        when (uiState.selectedTab) {
+                            ReportsTab.GROUP_DAILY -> {
+                                if (uiState.groupReportMode == GroupReportMode.PERIOD) {
+                                    groupPeriodReportContent(uiState, onNavigateToStudentDetail)
+                                } else {
+                                    groupDailyReportContent(
+                                        uiState = uiState,
+                                        onNavigateToStudentDetail = onNavigateToStudentDetail,
+                                        onSendAbsenceClick = { targets -> absenceConfirmTargets = targets },
+                                        onSendRecitationClick = { item ->
+                                            if (item.student.parentPhone.isBlank()) {
+                                                noPhoneStudentName = item.student.fullName
+                                            } else {
+                                                singleRecitationConfirmTarget = item
+                                            }
+                                        },
+                                        onSendExamClick = { item ->
+                                            if (item.student.parentPhone.isBlank()) {
+                                                noPhoneStudentName = item.student.fullName
+                                            } else {
+                                                singleExamConfirmTarget = item
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                            ReportsTab.GRADE_DAILY -> gradeDailyReportContent(
                                 uiState = uiState,
+                                viewModel = viewModel,
                                 onNavigateToStudentDetail = onNavigateToStudentDetail,
                                 onSendAbsenceClick = { targets -> absenceConfirmTargets = targets },
                                 onSendRecitationClick = { item ->
@@ -347,36 +408,16 @@ fun ReportsScreen(
                                     }
                                 }
                             )
+                            ReportsTab.TEACHER_DAILY -> teacherDailyReportContent(uiState, viewModel)
+                            ReportsTab.TOP_STUDENTS -> topStudentsReportContent(uiState, viewModel)
+                            ReportsTab.STUDENT -> studentReportContent(
+                                uiState = uiState,
+                                onNavigateToStudentDetail = onNavigateToStudentDetail,
+                                viewModel = viewModel,
+                                isMonthlyReportMode = isMonthlyReportMode
+                            )
                         }
                     }
-                    ReportsTab.GRADE_DAILY -> gradeDailyReportContent(
-                        uiState = uiState,
-                        viewModel = viewModel,
-                        onNavigateToStudentDetail = onNavigateToStudentDetail,
-                        onSendAbsenceClick = { targets -> absenceConfirmTargets = targets },
-                        onSendRecitationClick = { item ->
-                            if (item.student.parentPhone.isBlank()) {
-                                noPhoneStudentName = item.student.fullName
-                            } else {
-                                singleRecitationConfirmTarget = item
-                            }
-                        },
-                        onSendExamClick = { item ->
-                            if (item.student.parentPhone.isBlank()) {
-                                noPhoneStudentName = item.student.fullName
-                            } else {
-                                singleExamConfirmTarget = item
-                            }
-                        }
-                    )
-                    ReportsTab.TEACHER_DAILY -> teacherDailyReportContent(uiState, viewModel)
-                    ReportsTab.TOP_STUDENTS -> topStudentsReportContent(uiState, viewModel)
-                    ReportsTab.STUDENT -> studentReportContent(
-                        uiState = uiState,
-                        onNavigateToStudentDetail = onNavigateToStudentDetail,
-                        viewModel = viewModel,
-                        isMonthlyReportMode = isMonthlyReportMode
-                    )
                 }
             }
         }

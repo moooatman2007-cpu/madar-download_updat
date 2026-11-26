@@ -24,12 +24,13 @@ import com.example.data.repository.PaymentRepository
 import com.example.data.repository.RecitationRepository
 import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
-import com.example.data.repository.SupabaseGradeRepository
-import com.example.data.repository.SupabaseStudentRepository
 import com.example.data.repository.TeacherRepository
 import com.example.ui.attendance.ScanFeedback
 import com.example.ui.attendance.ScanResultType
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import io.github.jan.supabase.auth.auth
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -152,7 +153,33 @@ data class NotificationEventCreationSummary(
         get() = createdCount + alreadyExistsCount + failedCount + skippedCount
 }
 
+data class FailedLessonItem(
+    val studentId: String,
+    val studentName: String,
+    val message: String
+)
+
+data class LessonSaveReport(
+    val attendanceSaved: Boolean = false,
+    val attendanceError: String? = null,
+    val savedRecitationCount: Int = 0,
+    val failedRecitations: List<FailedLessonItem> = emptyList(),
+    val savedHomeworkCount: Int = 0,
+    val failedHomework: List<FailedLessonItem> = emptyList(),
+    val savedExamCount: Int = 0,
+    val failedExams: List<FailedLessonItem> = emptyList()
+) {
+    val hasFailures: Boolean
+        get() = !attendanceSaved ||
+            failedRecitations.isNotEmpty() ||
+            failedHomework.isNotEmpty() ||
+            failedExams.isNotEmpty()
+}
+
 data class StartLessonUiState(
+    val isLoading: Boolean = false,
+    val loadError: String? = null,
+    val isOfflineError: Boolean = false,
     val currentStep: StartLessonStep = StartLessonStep.SELECT_GROUP,
     val grades: List<Grade> = emptyList(),
     val groups: List<Group> = emptyList(),
@@ -173,6 +200,7 @@ data class StartLessonUiState(
     val currentYear: Int = LocalDate.now().year,
     val currentMonth: Int = LocalDate.now().monthValue,
     val paymentsMap: Map<String, com.example.core.model.LessonPayment> = emptyMap(),
+    val togglingPaymentStudentIds: Set<String> = emptySet(),
     
     // Step inputs per studentId
     val recitationsMap: Map<String, StudentRecitationInput> = emptyMap(),
@@ -189,11 +217,17 @@ data class StartLessonUiState(
     val scanFeedback: ScanFeedback? = null,
     val recentScannedStudents: List<Student> = emptyList(),
 
-    // Saving / dialogs
+    // Saving / dialogs / idempotent checkpoints
     val isSaving: Boolean = false,
     val errorMessage: String? = null,
     val showUnrecordedWarning: Boolean = false,
     val isFinished: Boolean = false,
+    val attendanceSaved: Boolean = false,
+    val savedAbsenceItems: List<LessonSavedItem> = emptyList(),
+    val savedRecitationItemsByStudent: Map<String, LessonSavedItem> = emptyMap(),
+    val savedHomeworkItemsByStudent: Map<String, LessonSavedItem> = emptyMap(),
+    val savedExamItemsByStudent: Map<String, LessonSavedItem> = emptyMap(),
+    val partialSaveReport: LessonSaveReport? = null,
     val savedContext: LessonSavedContext? = null,
     val reviewState: NotificationReviewState? = null,
     val isSubmittingNotifications: Boolean = false,
@@ -221,8 +255,9 @@ class StartLessonViewModel(
     private var studentCodeMap: Map<String, Student> = emptyMap()
 
     init {
-        loadData()
+        observeDataFlows()
         loadMonthlyPayments()
+        refreshOnlineData()
     }
 
     private suspend fun resolveTeacherId(): String? {
@@ -231,29 +266,88 @@ class StartLessonViewModel(
             ?: try { teacherRepository.fetchCurrentTeacher()?.id } catch (_: Exception) { null }
     }
 
-    private fun loadData() {
+    fun retry() {
+        refreshOnlineData()
+    }
+
+    fun refreshOnlineData() {
         viewModelScope.launch {
-            val teacherId = resolveTeacherId()
-            launch {
-                try { (gradeRepository as? SupabaseGradeRepository)?.fetchGrades() } catch (_: Exception) {}
-            }
-            launch {
-                try { (studentRepository as? SupabaseStudentRepository)?.fetchStudents() } catch (_: Exception) {}
-            }
-            if (!teacherId.isNullOrBlank()) {
-                launch {
-                    try { groupRepository.refreshGroups(teacherId) } catch (_: Exception) {}
+            val state = _uiState.value
+            _uiState.update { it.copy(isLoading = true, loadError = null, isOfflineError = false) }
+            try {
+                val teacherId = resolveTeacherId()
+                coroutineScope {
+                    val gradesDef = async(ioDispatcher) { gradeRepository.refreshGradesResult() }
+                    val studentsDef = async(ioDispatcher) { studentRepository.refreshStudents() }
+                    val groupsDef = async(ioDispatcher) {
+                        if (!teacherId.isNullOrBlank()) {
+                            groupRepository.refreshGroups(teacherId)
+                        } else {
+                            Result.success(Unit)
+                        }
+                    }
+                    val paymentsDef = async(ioDispatcher) {
+                        paymentRepository.fetchMonthlyPaymentsResult(state.currentYear, state.currentMonth)
+                    }
+
+                    val gradesRes = gradesDef.await()
+                    val studentsRes = studentsDef.await()
+                    val groupsRes = groupsDef.await()
+                    val paymentsRes = paymentsDef.await()
+
+                    val firstError = gradesRes.exceptionOrNull()
+                        ?: studentsRes.exceptionOrNull()
+                        ?: groupsRes.exceptionOrNull()
+                        ?: paymentsRes.exceptionOrNull()
+
+                    if (firstError != null) {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                loadError = firstError.toArabicErrorMessage(),
+                                isOfflineError = firstError.isOfflineOrNetworkError()
+                            )
+                        }
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                loadError = null,
+                                isOfflineError = false
+                            )
+                        }
+                    }
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        loadError = e.toArabicErrorMessage(),
+                        isOfflineError = e.isOfflineOrNetworkError()
+                    )
                 }
             }
         }
+    }
 
+    private fun observeDataFlows() {
         viewModelScope.launch {
             val teacherId = resolveTeacherId()
             val groupsFlow = if (!teacherId.isNullOrBlank()) {
                 groupRepository.observeGroups(teacherId)
                     .map { list -> list.filter { it.active } }
                     .onStart { emit(emptyList()) }
-                    .catch { emit(emptyList()) }
+                    .catch { e ->
+                        _uiState.update {
+                            it.copy(
+                                loadError = e.toArabicErrorMessage(),
+                                isOfflineError = e.isOfflineOrNetworkError()
+                            )
+                        }
+                        emit(emptyList())
+                    }
             } else {
                 flowOf(emptyList())
             }
@@ -265,37 +359,46 @@ class StartLessonViewModel(
             ) { grades, students, groups ->
                 val active = students.filter { it.deletedAt == null }
                 Triple(grades, active, groups)
-            }.collect { (grades, active, groups) ->
-                allStudentsList = active
-                studentCodeMap = active
-                    .filter { it.studentCode.isNotBlank() }
-                    .associateBy { it.studentCode.trim().lowercase() }
-                val countsByGroup = active
-                    .filter { !it.groupId.isNullOrBlank() }
-                    .groupingBy { it.groupId!! }
-                    .eachCount()
-
-                _uiState.update { state ->
-                    val selectedGroup = state.selectedGroupId?.let { id -> groups.firstOrNull { it.id == id } }
-                    val resolvedGradeId = selectedGroup?.gradeId ?: state.selectedGradeId
-                    val gradeName = resolvedGradeId?.let { id -> grades.firstOrNull { it.id == id }?.name } ?: state.selectedGradeName
-                    val groupName = selectedGroup?.name ?: state.selectedGroupName
-                    val updatedStudents = when {
-                        state.selectedGroupId != null -> active.filter { it.groupId == state.selectedGroupId }
-                        state.selectedGradeId != null -> active.filter { it.gradeId == state.selectedGradeId }
-                        else -> state.studentsInGroup
-                    }
-                    state.copy(
-                        grades = grades,
-                        groups = groups,
-                        groupStudentCounts = countsByGroup,
-                        selectedGradeId = resolvedGradeId,
-                        selectedGradeName = gradeName,
-                        selectedGroupName = groupName,
-                        studentsInGroup = updatedStudents
-                    )
-                }
             }
+                .catch { e ->
+                    _uiState.update {
+                        it.copy(
+                            loadError = e.toArabicErrorMessage(),
+                            isOfflineError = e.isOfflineOrNetworkError()
+                        )
+                    }
+                }
+                .collect { (grades, active, groups) ->
+                    allStudentsList = active
+                    studentCodeMap = active
+                        .filter { it.studentCode.isNotBlank() }
+                        .associateBy { it.studentCode.trim().lowercase() }
+                    val countsByGroup = active
+                        .filter { !it.groupId.isNullOrBlank() }
+                        .groupingBy { it.groupId!! }
+                        .eachCount()
+
+                    _uiState.update { state ->
+                        val selectedGroup = state.selectedGroupId?.let { id -> groups.firstOrNull { it.id == id } }
+                        val resolvedGradeId = selectedGroup?.gradeId ?: state.selectedGradeId
+                        val gradeName = resolvedGradeId?.let { id -> grades.firstOrNull { it.id == id }?.name } ?: state.selectedGradeName
+                        val groupName = selectedGroup?.name ?: state.selectedGroupName
+                        val updatedStudents = when {
+                            state.selectedGroupId != null -> active.filter { it.groupId == state.selectedGroupId }
+                            state.selectedGradeId != null -> active.filter { it.gradeId == state.selectedGradeId }
+                            else -> state.studentsInGroup
+                        }
+                        state.copy(
+                            grades = grades,
+                            groups = groups,
+                            groupStudentCounts = countsByGroup,
+                            selectedGradeId = resolvedGradeId,
+                            selectedGradeName = gradeName,
+                            selectedGroupName = groupName,
+                            studentsInGroup = updatedStudents
+                        )
+                    }
+                }
         }
     }
 
@@ -303,7 +406,14 @@ class StartLessonViewModel(
         viewModelScope.launch {
             val state = _uiState.value
             paymentRepository.getMonthlyPayments(state.currentYear, state.currentMonth)
-                .catch { }
+                .catch { e ->
+                    _uiState.update {
+                        it.copy(
+                            loadError = it.loadError ?: e.toArabicErrorMessage(),
+                            isOfflineError = it.isOfflineError || e.isOfflineOrNetworkError()
+                        )
+                    }
+                }
                 .collect { payments ->
                     _uiState.update { it.copy(paymentsMap = payments.associateBy { p -> p.studentId }) }
                 }
@@ -350,6 +460,15 @@ class StartLessonViewModel(
                 excusedStudentIds = if (isSameGroup) it.excusedStudentIds else emptySet(),
                 attendanceStatusMap = if (isSameGroup) it.attendanceStatusMap else emptyMap(),
                 recentScannedStudents = if (isSameGroup) it.recentScannedStudents else emptyList(),
+                attendanceSaved = if (isSameGroup) it.attendanceSaved else false,
+                savedAbsenceItems = if (isSameGroup) it.savedAbsenceItems else emptyList(),
+                savedRecitationItemsByStudent = if (isSameGroup) it.savedRecitationItemsByStudent else emptyMap(),
+                savedHomeworkItemsByStudent = if (isSameGroup) it.savedHomeworkItemsByStudent else emptyMap(),
+                savedExamItemsByStudent = if (isSameGroup) it.savedExamItemsByStudent else emptyMap(),
+                partialSaveReport = if (isSameGroup) it.partialSaveReport else null,
+                isFinished = if (isSameGroup) it.isFinished else false,
+                savedContext = if (isSameGroup) it.savedContext else null,
+                reviewState = if (isSameGroup) it.reviewState else null,
                 scanFeedback = null
             )
         }
@@ -388,7 +507,23 @@ class StartLessonViewModel(
                 studentsInGroup = students,
                 recitationsMap = recMap,
                 homeworkMap = hwMap,
-                examsMap = exMap
+                examsMap = exMap,
+                presentStudentIds = if (isSameGrade) it.presentStudentIds else emptySet(),
+                absentStudentIds = if (isSameGrade) it.absentStudentIds else emptySet(),
+                lateStudentIds = if (isSameGrade) it.lateStudentIds else emptySet(),
+                excusedStudentIds = if (isSameGrade) it.excusedStudentIds else emptySet(),
+                attendanceStatusMap = if (isSameGrade) it.attendanceStatusMap else emptyMap(),
+                recentScannedStudents = if (isSameGrade) it.recentScannedStudents else emptyList(),
+                attendanceSaved = if (isSameGrade) it.attendanceSaved else false,
+                savedAbsenceItems = if (isSameGrade) it.savedAbsenceItems else emptyList(),
+                savedRecitationItemsByStudent = if (isSameGrade) it.savedRecitationItemsByStudent else emptyMap(),
+                savedHomeworkItemsByStudent = if (isSameGrade) it.savedHomeworkItemsByStudent else emptyMap(),
+                savedExamItemsByStudent = if (isSameGrade) it.savedExamItemsByStudent else emptyMap(),
+                partialSaveReport = if (isSameGrade) it.partialSaveReport else null,
+                isFinished = if (isSameGrade) it.isFinished else false,
+                savedContext = if (isSameGrade) it.savedContext else null,
+                reviewState = if (isSameGrade) it.reviewState else null,
+                scanFeedback = null
             )
         }
         if (!isSameGrade) {
@@ -402,7 +537,18 @@ class StartLessonViewModel(
             try {
                 val state = _uiState.value
                 val date = state.currentDate
-                val records = attendanceRepository.getAttendanceForDateAndGroup(date, groupId)
+                val res = attendanceRepository.fetchAttendanceForDateAndGroupResult(date, groupId)
+                if (res.isFailure) {
+                    val err = res.exceptionOrNull()
+                    _uiState.update {
+                        it.copy(
+                            isLoadingAttendance = false,
+                            errorMessage = err?.toArabicErrorMessage() ?: "تعذر جلب الحضور المسجل من السيرفر"
+                        )
+                    }
+                    return@launch
+                }
+                val records = res.getOrNull().orEmpty()
                 val groupStudentIds = allStudentsList.filter { it.groupId == groupId }.map { it.studentId }.toSet()
                 val relevantRecords = records.filter { groupStudentIds.contains(it.studentId) }
 
@@ -426,8 +572,15 @@ class StartLessonViewModel(
                         isLoadingAttendance = false
                     )
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
-                _uiState.update { it.copy(isLoadingAttendance = false) }
+                _uiState.update {
+                    it.copy(
+                        isLoadingAttendance = false,
+                        errorMessage = e.toArabicErrorMessage()
+                    )
+                }
             }
         }
     }
@@ -438,7 +591,18 @@ class StartLessonViewModel(
             try {
                 val state = _uiState.value
                 val date = state.currentDate
-                val records = attendanceRepository.getAttendanceForDateAndGroup(date, null)
+                val res = attendanceRepository.fetchAttendanceForDateAndGroupResult(date, null)
+                if (res.isFailure) {
+                    val err = res.exceptionOrNull()
+                    _uiState.update {
+                        it.copy(
+                            isLoadingAttendance = false,
+                            errorMessage = err?.toArabicErrorMessage() ?: "تعذر جلب الحضور المسجل من السيرفر"
+                        )
+                    }
+                    return@launch
+                }
+                val records = res.getOrNull().orEmpty()
                 val gradeStudentIds = allStudentsList.filter { it.gradeId == gradeId }.map { it.studentId }.toSet()
                 val relevantRecords = records.filter { gradeStudentIds.contains(it.studentId) }
 
@@ -462,8 +626,15 @@ class StartLessonViewModel(
                         isLoadingAttendance = false
                     )
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
-                _uiState.update { it.copy(isLoadingAttendance = false) }
+                _uiState.update {
+                    it.copy(
+                        isLoadingAttendance = false,
+                        errorMessage = e.toArabicErrorMessage()
+                    )
+                }
             }
         }
     }
@@ -496,6 +667,9 @@ class StartLessonViewModel(
                 presentStudentIds = set,
                 absentStudentIds = absentSet,
                 attendanceStatusMap = statusMap,
+                attendanceSaved = false,
+                savedAbsenceItems = emptyList(),
+                partialSaveReport = null,
                 statusChangeMessage = msg
             )
         }
@@ -517,6 +691,9 @@ class StartLessonViewModel(
                 absentStudentIds = updatedAbsent,
                 attendanceStatusMap = updatedStatusMap,
                 recentScannedStudents = updatedRecent,
+                attendanceSaved = false,
+                savedAbsenceItems = emptyList(),
+                partialSaveReport = null,
                 scanFeedback = if (student != null) ScanFeedback(student, ScanResultType.SUCCESS_PRESENT, student.studentCode) else null,
                 statusChangeMessage = "تم تعديل حالة $studentName من غائب إلى حاضر بنجاح ✓"
             )
@@ -529,10 +706,52 @@ class StartLessonViewModel(
 
     fun togglePaymentStatus(studentId: String) {
         val state = _uiState.value
+        if (studentId in state.togglingPaymentStudentIds) return
         val payment = state.paymentsMap[studentId]
         val newIsPaid = !(payment?.isPaid ?: false)
+        _uiState.update {
+            it.copy(
+                togglingPaymentStudentIds = it.togglingPaymentStudentIds + studentId,
+                errorMessage = null
+            )
+        }
         viewModelScope.launch {
-            paymentRepository.setPaymentStatus(studentId, state.currentYear, state.currentMonth, newIsPaid, payment?.amount ?: 0.0)
+            try {
+                val result = paymentRepository.setPaymentStatus(
+                    studentId = studentId,
+                    year = state.currentYear,
+                    month = state.currentMonth,
+                    isPaid = newIsPaid,
+                    amount = payment?.amount ?: 0.0
+                )
+                result.onSuccess { updatedPayment ->
+                    _uiState.update { current ->
+                        current.copy(
+                            paymentsMap = current.paymentsMap + (studentId to updatedPayment),
+                            togglingPaymentStudentIds = current.togglingPaymentStudentIds - studentId
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update { current ->
+                        current.copy(
+                            togglingPaymentStudentIds = current.togglingPaymentStudentIds - studentId,
+                            errorMessage = err.toArabicErrorMessage()
+                        )
+                    }
+                }
+            } catch (ce: CancellationException) {
+                _uiState.update { current ->
+                    current.copy(togglingPaymentStudentIds = current.togglingPaymentStudentIds - studentId)
+                }
+                throw ce
+            } catch (e: Exception) {
+                _uiState.update { current ->
+                    current.copy(
+                        togglingPaymentStudentIds = current.togglingPaymentStudentIds - studentId,
+                        errorMessage = e.toArabicErrorMessage()
+                    )
+                }
+            }
         }
     }
 
@@ -584,6 +803,9 @@ class StartLessonViewModel(
                 absentStudentIds = updatedAbsent,
                 recentScannedStudents = updatedRecent,
                 attendanceStatusMap = updatedStatusMap,
+                attendanceSaved = false,
+                savedAbsenceItems = emptyList(),
+                partialSaveReport = null,
                 scanFeedback = ScanFeedback(student, ScanResultType.SUCCESS_PRESENT, trimmed)
             )
         }
@@ -609,7 +831,11 @@ class StartLessonViewModel(
                 updated.copy(isRecorded = hasInput)
             }
             map[studentId] = resolved
-            state.copy(recitationsMap = map)
+            state.copy(
+                recitationsMap = map,
+                savedRecitationItemsByStudent = state.savedRecitationItemsByStudent - studentId,
+                partialSaveReport = null
+            )
         }
     }
 
@@ -617,12 +843,16 @@ class StartLessonViewModel(
         _uiState.update { state ->
             val map = state.recitationsMap.toMutableMap()
             map[studentId] = StudentRecitationInput()
-            state.copy(recitationsMap = map)
+            state.copy(
+                recitationsMap = map,
+                savedRecitationItemsByStudent = state.savedRecitationItemsByStudent - studentId,
+                partialSaveReport = null
+            )
         }
     }
 
     fun setSkipRecitation(skip: Boolean) {
-        _uiState.update { it.copy(skipRecitation = skip) }
+        _uiState.update { it.copy(skipRecitation = skip, partialSaveReport = null) }
     }
 
     // Homework updates
@@ -638,7 +868,11 @@ class StartLessonViewModel(
                 updated.copy(isRecorded = current.isRecorded || hasInput)
             }
             map[studentId] = resolved
-            state.copy(homeworkMap = map)
+            state.copy(
+                homeworkMap = map,
+                savedHomeworkItemsByStudent = state.savedHomeworkItemsByStudent - studentId,
+                partialSaveReport = null
+            )
         }
     }
 
@@ -646,12 +880,16 @@ class StartLessonViewModel(
         _uiState.update { state ->
             val map = state.homeworkMap.toMutableMap()
             map[studentId] = StudentHomeworkInput()
-            state.copy(homeworkMap = map)
+            state.copy(
+                homeworkMap = map,
+                savedHomeworkItemsByStudent = state.savedHomeworkItemsByStudent - studentId,
+                partialSaveReport = null
+            )
         }
     }
 
     fun setSkipHomework(skip: Boolean) {
-        _uiState.update { it.copy(skipHomework = skip) }
+        _uiState.update { it.copy(skipHomework = skip, partialSaveReport = null) }
     }
 
     // Exam updates
@@ -669,7 +907,11 @@ class StartLessonViewModel(
                 updated.copy(isRecorded = hasInput)
             }
             map[studentId] = resolved
-            state.copy(examsMap = map)
+            state.copy(
+                examsMap = map,
+                savedExamItemsByStudent = state.savedExamItemsByStudent - studentId,
+                partialSaveReport = null
+            )
         }
     }
 
@@ -677,12 +919,16 @@ class StartLessonViewModel(
         _uiState.update { state ->
             val map = state.examsMap.toMutableMap()
             map[studentId] = StudentExamInput()
-            state.copy(examsMap = map)
+            state.copy(
+                examsMap = map,
+                savedExamItemsByStudent = state.savedExamItemsByStudent - studentId,
+                partialSaveReport = null
+            )
         }
     }
 
     fun setSkipExam(skip: Boolean) {
-        _uiState.update { it.copy(skipExam = skip) }
+        _uiState.update { it.copy(skipExam = skip, partialSaveReport = null) }
     }
 
     fun checkReviewBeforeFinish() {
@@ -744,12 +990,19 @@ class StartLessonViewModel(
             }
         }
 
-        _uiState.update { it.copy(isSaving = true, showUnrecordedWarning = false, errorMessage = null) }
+        _uiState.update {
+            it.copy(
+                isSaving = true,
+                showUnrecordedWarning = false,
+                errorMessage = null
+            )
+        }
 
         viewModelScope.launch {
             try {
                 val date = state.currentDate
                 val students = state.studentsInGroup
+                val studentNamesById = students.associate { it.studentId to it.fullName }
                 val groupId: String? = state.selectedGroupId
 
                 // Identify students who are absent
@@ -758,33 +1011,44 @@ class StartLessonViewModel(
                     .map { it.studentId }
                     .toSet()
 
-                // 1. Record Attendance
-                val attRecords = students.map { s ->
-                    val status = if (state.presentStudentIds.contains(s.studentId)) AttendanceStatus.PRESENT else AttendanceStatus.ABSENT
-                    BatchAttendanceItemDto(studentId = s.studentId, status = status.name, note = null)
-                }
-                val attResult = attendanceRepository.recordBatchAttendance(date, attRecords, groupId)
-                val isAttendanceCloudConfirmed = attResult.isSuccess && attResult.getOrNull()?.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD
+                // 1. Record Attendance (idempotent: skip if already confirmed on cloud in previous attempt)
+                val absenceItems: List<LessonSavedItem>
+                if (!state.attendanceSaved) {
+                    val attRecords = students.map { s ->
+                        val status = if (state.presentStudentIds.contains(s.studentId)) AttendanceStatus.PRESENT else AttendanceStatus.ABSENT
+                        BatchAttendanceItemDto(studentId = s.studentId, status = status.name, note = null)
+                    }
+                    val attResult = attendanceRepository.recordBatchAttendance(date, attRecords, groupId)
+                    val batchSync = attResult.getOrNull()
+                    if (attResult.isFailure || batchSync == null || batchSync.syncStatus != BatchSyncStatus.SAVED_TO_CLOUD) {
+                        val attErrMsg = attResult.exceptionOrNull()?.toArabicErrorMessage()
+                            ?: "تعذر حفظ سجل الحضور على السيرفر. يرجى التحقق من الاتصال والمحاولة مرة أخرى."
+                        val report = LessonSaveReport(
+                            attendanceSaved = false,
+                            attendanceError = attErrMsg
+                        )
+                        _uiState.update {
+                            it.copy(
+                                isSaving = false,
+                                isFinished = false,
+                                attendanceSaved = false,
+                                partialSaveReport = report,
+                                errorMessage = attErrMsg
+                            )
+                        }
+                        return@launch
+                    }
 
-                val newStatusMap = attRecords.associate { it.studentId to AttendanceStatus.fromString(it.status) }
-                _uiState.update {
-                    it.copy(
-                        absentStudentIds = absentStudentIds,
-                        attendanceStatusMap = it.attendanceStatusMap + newStatusMap
-                    )
-                }
-
-                // 1.1 Match and collect Attendance Absence Source IDs
-                val absenceItems = mutableListOf<LessonSavedItem>()
-                if (absentStudentIds.isNotEmpty()) {
-                    try {
-                        val savedAttendanceList = attendanceRepository.getAttendanceForDateAndGroup(date, groupId)
+                    val collectedAbsence = mutableListOf<LessonSavedItem>()
+                    if (absentStudentIds.isNotEmpty()) {
+                        val savedAttRes = attendanceRepository.fetchAttendanceForDateAndGroupResult(date, groupId)
+                        val savedAttendanceList = savedAttRes.getOrNull().orEmpty()
                         val savedMap = savedAttendanceList.associateBy { it.studentId }
                         for (studentId in absentStudentIds) {
                             val att = savedMap[studentId]
                             if (att != null && att.status == AttendanceStatus.ABSENT && att.attendanceId.isNotBlank()) {
-                                val isOnline = isAttendanceCloudConfirmed && isServerUUID(att.attendanceId)
-                                absenceItems.add(
+                                val isOnline = isServerUUID(att.attendanceId)
+                                collectedAbsence.add(
                                     LessonSavedItem(
                                         studentId = studentId,
                                         sourceId = att.attendanceId,
@@ -794,17 +1058,28 @@ class StartLessonViewModel(
                                 )
                             }
                         }
-                    } catch (_: Exception) {
-                        // Resilient: lesson save does not fail if ID staging query encounters an issue
                     }
+                    absenceItems = collectedAbsence
+                    val newStatusMap = attRecords.associate { it.studentId to AttendanceStatus.fromString(it.status) }
+                    _uiState.update {
+                        it.copy(
+                            attendanceSaved = true,
+                            savedAbsenceItems = absenceItems,
+                            absentStudentIds = absentStudentIds,
+                            attendanceStatusMap = it.attendanceStatusMap + newStatusMap
+                        )
+                    }
+                } else {
+                    absenceItems = state.savedAbsenceItems
                 }
 
-                // 2. Record Recitations if not skipped and explicitly recorded by teacher
-                val recitationItems = mutableListOf<LessonSavedItem>()
+                // 2. Record Recitations (checkpoint per student to prevent duplicates on retry)
+                val savedRecsByStudent = _uiState.value.savedRecitationItemsByStudent.toMutableMap()
+                val failedRecitations = mutableListOf<FailedLessonItem>()
                 if (!state.skipRecitation) {
-                    coroutineScope {
-                        val deferredRecitations = state.recitationsMap.mapNotNull { (studentId, rec) ->
-                            if (rec.isRecorded) {
+                    val recResults = coroutineScope {
+                        state.recitationsMap.mapNotNull { (studentId, rec) ->
+                            if (rec.isRecorded && !savedRecsByStudent.containsKey(studentId)) {
                                 val maxScore = rec.maxScoreStr.trim().toDoubleOrNull()?.takeIf { it > 0.0 } ?: 10.0
                                 val score = rec.scoreStr.trim().toDoubleOrNull()
                                 if (score != null && score >= 0.0 && score <= maxScore) {
@@ -818,30 +1093,42 @@ class StartLessonViewModel(
                                             maxScore = maxScore,
                                             note = rec.note.trim().ifBlank { null }
                                         )
-                                        recRes.getOrNull()?.let { syncRes ->
-                                            val savedRec = syncRes.data
-                                            val isOnline = syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD && isServerUUID(savedRec.recitationId)
-                                            LessonSavedItem(
-                                                studentId = studentId,
-                                                sourceId = savedRec.recitationId,
-                                                eventType = NotificationEventType.RECITATION,
-                                                isConfirmedOnline = isOnline
-                                            )
-                                        }
+                                        studentId to recRes
                                     }
                                 } else null
                             } else null
-                        }
-                        recitationItems.addAll(deferredRecitations.awaitAll().filterNotNull())
+                        }.awaitAll()
                     }
+                    for ((studentId, res) in recResults) {
+                        val syncRes = res.getOrNull()
+                        if (res.isSuccess && syncRes != null && syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD) {
+                            val savedRec = syncRes.data
+                            savedRecsByStudent[studentId] = LessonSavedItem(
+                                studentId = studentId,
+                                sourceId = savedRec.recitationId,
+                                eventType = NotificationEventType.RECITATION,
+                                isConfirmedOnline = isServerUUID(savedRec.recitationId)
+                            )
+                        } else {
+                            failedRecitations.add(
+                                FailedLessonItem(
+                                    studentId = studentId,
+                                    studentName = studentNamesById[studentId] ?: "الطالب",
+                                    message = res.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر حفظ التسميع"
+                                )
+                            )
+                        }
+                    }
+                    _uiState.update { it.copy(savedRecitationItemsByStudent = savedRecsByStudent.toMap()) }
                 }
 
-                // 3. Record Homework if not skipped and explicitly recorded by teacher
-                val homeworkItems = mutableListOf<LessonSavedItem>()
+                // 3. Record Homework (checkpoint per student)
+                val savedHwByStudent = _uiState.value.savedHomeworkItemsByStudent.toMutableMap()
+                val failedHomework = mutableListOf<FailedLessonItem>()
                 if (!state.skipHomework) {
-                    coroutineScope {
-                        val deferredHomework = state.homeworkMap.mapNotNull { (studentId, hw) ->
-                            if (hw.isRecorded) {
+                    val hwResults = coroutineScope {
+                        state.homeworkMap.mapNotNull { (studentId, hw) ->
+                            if (hw.isRecorded && !savedHwByStudent.containsKey(studentId)) {
                                 async(ioDispatcher) {
                                     val hwRes = homeworkRepository.addHomework(
                                         studentId = studentId,
@@ -850,29 +1137,41 @@ class StartLessonViewModel(
                                         status = hw.status,
                                         note = hw.note.trim().ifBlank { null }
                                     )
-                                    hwRes.getOrNull()?.let { syncRes ->
-                                        val savedHw = syncRes.data
-                                        val isOnline = syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD && isServerUUID(savedHw.homeworkId)
-                                        LessonSavedItem(
-                                            studentId = studentId,
-                                            sourceId = savedHw.homeworkId,
-                                            eventType = NotificationEventType.HOMEWORK,
-                                            isConfirmedOnline = isOnline
-                                        )
-                                    }
+                                    studentId to hwRes
                                 }
                             } else null
-                        }
-                        homeworkItems.addAll(deferredHomework.awaitAll().filterNotNull())
+                        }.awaitAll()
                     }
+                    for ((studentId, res) in hwResults) {
+                        val syncRes = res.getOrNull()
+                        if (res.isSuccess && syncRes != null && syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD) {
+                            val savedHw = syncRes.data
+                            savedHwByStudent[studentId] = LessonSavedItem(
+                                studentId = studentId,
+                                sourceId = savedHw.homeworkId,
+                                eventType = NotificationEventType.HOMEWORK,
+                                isConfirmedOnline = isServerUUID(savedHw.homeworkId)
+                            )
+                        } else {
+                            failedHomework.add(
+                                FailedLessonItem(
+                                    studentId = studentId,
+                                    studentName = studentNamesById[studentId] ?: "الطالب",
+                                    message = res.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر حفظ الواجب"
+                                )
+                            )
+                        }
+                    }
+                    _uiState.update { it.copy(savedHomeworkItemsByStudent = savedHwByStudent.toMap()) }
                 }
 
-                // 4. Record Exam if not skipped and explicitly recorded by teacher
-                val examItems = mutableListOf<LessonSavedItem>()
+                // 4. Record Exams (checkpoint per student)
+                val savedExamsByStudent = _uiState.value.savedExamItemsByStudent.toMutableMap()
+                val failedExams = mutableListOf<FailedLessonItem>()
                 if (!state.skipExam) {
-                    coroutineScope {
-                        val deferredExams = state.examsMap.mapNotNull { (studentId, ex) ->
-                            if (ex.isRecorded && ex.scoreStr.isNotBlank()) {
+                    val examResults = coroutineScope {
+                        state.examsMap.mapNotNull { (studentId, ex) ->
+                            if (ex.isRecorded && ex.scoreStr.isNotBlank() && !savedExamsByStudent.containsKey(studentId)) {
                                 val maxScore = ex.maxScoreStr.trim().toDoubleOrNull()?.takeIf { it > 0.0 } ?: 10.0
                                 val score = ex.scoreStr.trim().toDoubleOrNull()
                                 if (score != null && score >= 0.0 && score <= maxScore) {
@@ -886,29 +1185,63 @@ class StartLessonViewModel(
                                             maxScore = maxScore,
                                             note = ex.note.trim().ifBlank { null }
                                         )
-                                        exRes.getOrNull()?.let { syncRes ->
-                                            val savedEx = syncRes.data
-                                            val isOnline = syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD && isServerUUID(savedEx.examId)
-                                            LessonSavedItem(
-                                                studentId = studentId,
-                                                sourceId = savedEx.examId,
-                                                eventType = NotificationEventType.EXAM,
-                                                isConfirmedOnline = isOnline
-                                            )
-                                        }
+                                        studentId to exRes
                                     }
                                 } else null
                             } else null
-                        }
-                        examItems.addAll(deferredExams.awaitAll().filterNotNull())
+                        }.awaitAll()
                     }
+                    for ((studentId, res) in examResults) {
+                        val syncRes = res.getOrNull()
+                        if (res.isSuccess && syncRes != null && syncRes.syncStatus == BatchSyncStatus.SAVED_TO_CLOUD) {
+                            val savedEx = syncRes.data
+                            savedExamsByStudent[studentId] = LessonSavedItem(
+                                studentId = studentId,
+                                sourceId = savedEx.examId,
+                                eventType = NotificationEventType.EXAM,
+                                isConfirmedOnline = isServerUUID(savedEx.examId)
+                            )
+                        } else {
+                            failedExams.add(
+                                FailedLessonItem(
+                                    studentId = studentId,
+                                    studentName = studentNamesById[studentId] ?: "الطالب",
+                                    message = res.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر حفظ الامتحان"
+                                )
+                            )
+                        }
+                    }
+                    _uiState.update { it.copy(savedExamItemsByStudent = savedExamsByStudent.toMap()) }
+                }
+
+                val report = LessonSaveReport(
+                    attendanceSaved = true,
+                    savedRecitationCount = savedRecsByStudent.size,
+                    failedRecitations = failedRecitations,
+                    savedHomeworkCount = savedHwByStudent.size,
+                    failedHomework = failedHomework,
+                    savedExamCount = savedExamsByStudent.size,
+                    failedExams = failedExams
+                )
+
+                if (report.hasFailures) {
+                    val totalFailed = failedRecitations.size + failedHomework.size + failedExams.size
+                    _uiState.update {
+                        it.copy(
+                            isSaving = false,
+                            isFinished = false,
+                            partialSaveReport = report,
+                            errorMessage = "تم حفظ الحضور، لكن تعذر حفظ $totalFailed عنصر. أعد المحاولة لحفظ العناصر المتبقية دون تكرار."
+                        )
+                    }
+                    return@launch
                 }
 
                 val savedContext = LessonSavedContext(
                     absenceItems = absenceItems,
-                    recitationItems = recitationItems,
-                    homeworkItems = homeworkItems,
-                    examItems = examItems
+                    recitationItems = savedRecsByStudent.values.toList(),
+                    homeworkItems = savedHwByStudent.values.toList(),
+                    examItems = savedExamsByStudent.values.toList()
                 )
 
                 val reviewState = buildNotificationReviewState(
@@ -921,13 +1254,23 @@ class StartLessonViewModel(
                     it.copy(
                         isSaving = false,
                         isFinished = true,
+                        partialSaveReport = null,
                         currentStep = StartLessonStep.NOTIFICATION_REVIEW,
                         savedContext = savedContext,
                         reviewState = reviewState
                     )
                 }
+            } catch (ce: CancellationException) {
+                _uiState.update { it.copy(isSaving = false) }
+                throw ce
             } catch (e: Exception) {
-                _uiState.update { it.copy(isSaving = false, errorMessage = e.message ?: "حدث خطأ أثناء حفظ الحصة") }
+                _uiState.update {
+                    it.copy(
+                        isSaving = false,
+                        isFinished = false,
+                        errorMessage = e.toArabicErrorMessage()
+                    )
+                }
             }
         }
     }

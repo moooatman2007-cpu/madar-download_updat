@@ -73,6 +73,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.core.model.Student
 import com.example.ui.components.EmptyStateView
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.DangerRedLight
 import com.example.ui.theme.DarkNavyCard
@@ -218,6 +220,32 @@ fun FastAttendanceScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            if (uiState.isLoading && uiState.allStudentsInScope.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = PrimaryIndigo)
+                }
+                return@Scaffold
+            }
+
+            if (uiState.loadError != null && uiState.allStudentsInScope.isEmpty()) {
+                OnlineStatusStateView(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.loadError!!,
+                    onRetry = viewModel::retry,
+                    modifier = Modifier.fillMaxSize()
+                )
+                return@Scaffold
+            }
+
+            if (uiState.loadError != null) {
+                OnlineInlineErrorBanner(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.loadError!!,
+                    onRetry = viewModel::retry,
+                    modifier = Modifier.padding(horizontal = Dimens.Spacing16, vertical = Dimens.Spacing4)
+                )
+            }
+
             // Group Context Header
             if (uiState.selectedGroupId != null) {
                 Card(
@@ -667,6 +695,7 @@ fun FastAttendanceScreen(
                                         }
 
                                         // Payment status chip in barcode mode
+                                        val isTogglingPayment = uiState.togglingPaymentStudentIds.contains(student.studentId)
                                         Surface(
                                             shape = RoundedCornerShape(6.dp),
                                             color = if (isStudentPaid) EmeraldGreenLight else DangerRedLight,
@@ -677,14 +706,26 @@ fun FastAttendanceScreen(
                                             ),
                                             modifier = Modifier
                                                 .clip(RoundedCornerShape(6.dp))
-                                                .clickable { viewModel.togglePaymentStatus(student.studentId) }
+                                                .clickable(enabled = !isTogglingPayment) {
+                                                    viewModel.togglePaymentStatus(student.studentId)
+                                                }
                                                 .testTag("recent_scanned_payment_chip_${student.studentId}")
                                         ) {
-                                            Text(
-                                                text = if (isStudentPaid) "🟢 دفع" else "🔴 لم يدفع",
-                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
+                                            if (isTogglingPayment) {
+                                                Box(modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)) {
+                                                    CircularProgressIndicator(
+                                                        color = if (isStudentPaid) EmeraldGreen else DangerRed,
+                                                        strokeWidth = 2.dp,
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                }
+                                            } else {
+                                                Text(
+                                                    text = if (isStudentPaid) "🟢 دفع" else "🔴 لم يدفع",
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -778,6 +819,7 @@ fun FastAttendanceScreen(
                         val isExplicitlyAbsent = uiState.absentStudentIds.contains(student.studentId) || 
                             uiState.attendanceStatusMap[student.studentId] == AttendanceStatus.ABSENT
                         val isPaid = uiState.paymentsMap[student.studentId]?.isPaid ?: false
+                        val isTogglingPayment = uiState.togglingPaymentStudentIds.contains(student.studentId)
                         val gradeName = gradeMap[student.gradeId] ?: ""
                         val isGuest = uiState.selectedGroupId != null && student.groupId != uiState.selectedGroupId
 
@@ -788,6 +830,7 @@ fun FastAttendanceScreen(
                             isExplicitlyAbsent = isExplicitlyAbsent,
                             attendanceStatus = uiState.attendanceStatusMap[student.studentId],
                             isPaid = isPaid,
+                            isTogglingPayment = isTogglingPayment,
                             isGuest = isGuest,
                             onToggle = { viewModel.toggleStudentPresent(student.studentId) },
                             onTogglePayment = { viewModel.togglePaymentStatus(student.studentId) }
@@ -901,6 +944,7 @@ private fun FastAttendanceStudentRow(
     isExplicitlyAbsent: Boolean = false,
     attendanceStatus: AttendanceStatus? = null,
     isPaid: Boolean,
+    isTogglingPayment: Boolean = false,
     isGuest: Boolean = false,
     onToggle: () -> Unit,
     onTogglePayment: () -> Unit
@@ -1052,14 +1096,24 @@ private fun FastAttendanceStudentRow(
                     ),
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable { onTogglePayment() }
+                        .clickable(enabled = !isTogglingPayment) { onTogglePayment() }
                         .testTag("fast_attendance_payment_chip_${student.studentId}")
                 ) {
-                    Text(
-                        text = if (isPaid) "🟢 دفع" else "🔴 لم يدفع",
-                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
+                    if (isTogglingPayment) {
+                        Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                            CircularProgressIndicator(
+                                color = if (isPaid) EmeraldGreen else DangerRed,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = if (isPaid) "🟢 دفع" else "🔴 لم يدفع",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
                 }
             }
 

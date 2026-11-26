@@ -18,7 +18,12 @@ import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
 import com.example.data.repository.SupabaseGradeRepository
 import com.example.data.repository.SupabaseStudentRepository
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -74,6 +79,9 @@ data class FastAttendanceUiState(
     val paymentsMap: Map<String, LessonPayment> = emptyMap(),
     val paidCount: Int = 0,
     val unpaidCount: Int = 0,
+    val isLoading: Boolean = true,
+    val loadError: String? = null,
+    val isOfflineError: Boolean = false,
     val isSaving: Boolean = false,
     val saveSummary: FastAttendanceSummary? = null,
     val errorMessage: String? = null,
@@ -82,6 +90,7 @@ data class FastAttendanceUiState(
     val recentScannedStudents: List<Student> = emptyList(),
     val isAddStudentDialogOpen: Boolean = false,
     val isLoadingAttendance: Boolean = false,
+    val togglingPaymentStudentIds: Set<String> = emptySet(),
     val statusChangeMessage: String? = null
 )
 
@@ -116,7 +125,18 @@ class FastAttendanceViewModel(
             val groupId = state.selectedGroupId
             _uiState.update { it.copy(isLoadingAttendance = true) }
             try {
-                val records = attendanceRepository.getAttendanceForDateAndGroup(date, groupId)
+                val result = attendanceRepository.fetchAttendanceForDateAndGroupResult(date, groupId)
+                if (result.isFailure) {
+                    val ex = result.exceptionOrNull()
+                    _uiState.update {
+                        it.copy(
+                            isLoadingAttendance = false,
+                            errorMessage = ex?.toArabicErrorMessage() ?: "تعذر تحميل سجل الحضور الحالي."
+                        )
+                    }
+                    return@launch
+                }
+                val records = result.getOrDefault(emptyList())
                 val loadedPresent = records.filter { it.status == AttendanceStatus.PRESENT || it.status == AttendanceStatus.LATE }
                     .map { it.studentId }
                     .toSet()
@@ -157,11 +177,18 @@ class FastAttendanceViewModel(
                     )
                 }
                 applyFilters()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 if (BuildConfig.DEBUG) {
                     android.util.Log.e("FastAttendanceVM", "Failed to load existing attendance", e)
                 }
-                _uiState.update { it.copy(isLoadingAttendance = false) }
+                _uiState.update {
+                    it.copy(
+                        isLoadingAttendance = false,
+                        errorMessage = e.toArabicErrorMessage()
+                    )
+                }
             }
         }
     }
@@ -178,37 +205,63 @@ class FastAttendanceViewModel(
 
     fun setInitialGroupId(groupId: String?, initialGroupName: String? = null) {
         if (groupId.isNullOrBlank()) return
-        _uiState.update { 
+        _uiState.update {
             it.copy(
                 selectedGroupId = groupId,
                 groupName = initialGroupName ?: it.groupName
-            ) 
+            )
         }
         viewModelScope.launch {
-            val teacher = teacherRepository.fetchCurrentTeacher()
-            val teacherId = teacher?.id 
-                ?: com.example.data.SupabaseClientProvider.mockTeacherId 
-                ?: try { com.example.data.SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
-            
-            if (teacherId != null) {
-                val group = try { groupRepository.getGroupById(teacherId, groupId) } catch (_: Exception) { null }
-                if (group != null) {
-                    _uiState.update { it.copy(groupName = group.name) }
-                } else {
-                    _uiState.update {
-                        it.copy(
-                            errorMessage = "لا يمكن الوصول لهذه المجموعة: غير مصرح أو غير موجودة.",
-                            allStudentsInScope = emptyList(),
-                            filteredStudents = emptyList()
-                        )
+            try {
+                val teacher = try { teacherRepository.fetchCurrentTeacher() } catch (_: Exception) { null }
+                val teacherId = teacher?.id
+                    ?: com.example.data.SupabaseClientProvider.mockTeacherId
+                    ?: try { com.example.data.SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+
+                if (teacherId != null) {
+                    val groupResult = groupRepository.fetchGroupById(teacherId, groupId)
+                    if (groupResult.isFailure) {
+                        val ex = groupResult.exceptionOrNull()
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                loadError = ex?.toArabicErrorMessage() ?: "تعذر تحميل بيانات المجموعة من السيرفر.",
+                                isOfflineError = ex?.isOfflineOrNetworkError() == true
+                            )
+                        }
+                        return@launch
                     }
-                    return@launch
+                    val group = groupResult.getOrNull()
+                    if (group != null) {
+                        _uiState.update { it.copy(groupName = group.name, loadError = null, isOfflineError = false) }
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                loadError = "لا يمكن الوصول لهذه المجموعة: غير مصرح أو غير موجودة.",
+                                isOfflineError = false,
+                                allStudentsInScope = emptyList(),
+                                filteredStudents = emptyList()
+                            )
+                        }
+                        return@launch
+                    }
+                }
+                val currentGradeId = _uiState.value.selectedGradeId
+                updateLookupMaps(allStudentsList, currentGradeId, groupId)
+                applyFilters()
+                loadExistingAttendance()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        loadError = e.toArabicErrorMessage(),
+                        isOfflineError = e.isOfflineOrNetworkError()
+                    )
                 }
             }
-            val currentGradeId = _uiState.value.selectedGradeId
-            updateLookupMaps(allStudentsList, currentGradeId, groupId)
-            applyFilters()
-            loadExistingAttendance()
         }
     }
 
@@ -226,11 +279,73 @@ class FastAttendanceViewModel(
         inScopeStudentIdsSet = scope.mapTo(HashSet()) { it.studentId }
     }
 
-    private fun loadData() {
-        viewModelScope.launch {
-            (gradeRepository as? SupabaseGradeRepository)?.fetchGrades()
-            (studentRepository as? SupabaseStudentRepository)?.fetchStudents()
+    fun retry() {
+        _uiState.update { it.copy(loadError = null, isOfflineError = false, errorMessage = null) }
+        refreshOnlineData()
+        loadExistingAttendance()
+        val state = _uiState.value
+        val groupId = state.selectedGroupId
+        if (!groupId.isNullOrBlank()) {
+            setInitialGroupId(groupId, state.groupName)
         }
+    }
+
+    private fun refreshOnlineData() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true, loadError = null, isOfflineError = false) }
+            try {
+                coroutineScope {
+                    val gradesDef = async { gradeRepository.refreshGradesResult() }
+                    val studentsDef = async { studentRepository.refreshStudents() }
+                    val paymentsDef = async {
+                        paymentRepository.fetchMonthlyPaymentsResult(
+                            _uiState.value.currentYear,
+                            _uiState.value.currentMonth
+                        )
+                    }
+
+                    val gradesRes = gradesDef.await()
+                    val studentsRes = studentsDef.await()
+                    val paymentsRes = paymentsDef.await()
+
+                    val firstFailure = gradesRes.exceptionOrNull()
+                        ?: studentsRes.exceptionOrNull()
+                        ?: paymentsRes.exceptionOrNull()
+
+                    if (firstFailure != null) {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                loadError = firstFailure.toArabicErrorMessage(),
+                                isOfflineError = firstFailure.isOfflineOrNetworkError()
+                            )
+                        }
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                loadError = null,
+                                isOfflineError = false
+                            )
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        loadError = e.toArabicErrorMessage(),
+                        isOfflineError = e.isOfflineOrNetworkError()
+                    )
+                }
+            }
+        }
+    }
+
+    private fun loadData() {
+        refreshOnlineData()
 
         viewModelScope.launch {
             combine(
@@ -240,6 +355,14 @@ class FastAttendanceViewModel(
                 val activeStudents = studentsList.filter { it.deletedAt == null }
                 allStudentsList = activeStudents
                 Pair(gradesList, activeStudents)
+            }.catch { error ->
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        loadError = error.toArabicErrorMessage(),
+                        isOfflineError = error.isOfflineOrNetworkError()
+                    )
+                }
             }.collect { (gradesList, activeStudents) ->
                 val currentGradeId = _uiState.value.selectedGradeId
                 val currentGroupId = _uiState.value.selectedGroupId
@@ -263,7 +386,8 @@ class FastAttendanceViewModel(
                         baseGroupStudents = base,
                         allStudentsInScope = scope,
                         paidCount = paid,
-                        unpaidCount = unpaid
+                        unpaidCount = unpaid,
+                        isLoading = if (gradesList.isNotEmpty() || activeStudents.isNotEmpty()) false else state.isLoading
                     )
                 }
                 applyFilters()
@@ -280,7 +404,7 @@ class FastAttendanceViewModel(
                 .catch { error ->
                     if (BuildConfig.DEBUG) android.util.Log.e("FastAttendanceVM", "Failed to load monthly payments for $year-$month", error)
                     _uiState.update {
-                        it.copy(errorMessage = "تعذر تحميل بيانات اشتراكات هذا الشهر: ${error.message}")
+                        it.copy(errorMessage = error.toArabicErrorMessage())
                     }
                 }
                 .collect { paymentsList ->
@@ -301,67 +425,67 @@ class FastAttendanceViewModel(
 
     fun togglePaymentStatus(studentId: String) {
         val currentState = _uiState.value
+        if (currentState.togglingPaymentStudentIds.contains(studentId)) return
+
         val year = currentState.currentYear
         val month = currentState.currentMonth
         val oldPayment = currentState.paymentsMap[studentId]
         val oldIsPaid = oldPayment?.isPaid ?: false
         val newIsPaid = !oldIsPaid
 
-        // 1. Optimistic UI update
-        val updatedPayment = (oldPayment ?: LessonPayment(
-            studentId = studentId,
-            year = year,
-            month = month,
-            amount = 0.0
-        )).copy(
-            isPaid = newIsPaid,
-            paidAt = if (newIsPaid) java.time.OffsetDateTime.now().toString() else null
-        )
-
-        val newPaymentsMap = currentState.paymentsMap.toMutableMap().apply {
-            put(studentId, updatedPayment)
-        }
-
-        val scope = currentState.allStudentsInScope
-        val paid = scope.count { newPaymentsMap[it.studentId]?.isPaid == true }
-        val unpaid = (scope.size - paid).coerceAtLeast(0)
-
         _uiState.update {
             it.copy(
-                paymentsMap = newPaymentsMap,
-                paidCount = paid,
-                unpaidCount = unpaid
+                togglingPaymentStudentIds = it.togglingPaymentStudentIds + studentId,
+                errorMessage = null
             )
         }
 
-        // 2. Perform backend update
         viewModelScope.launch {
-            val result = paymentRepository.setPaymentStatus(
-                studentId = studentId,
-                year = year,
-                month = month,
-                isPaid = newIsPaid,
-                amount = oldPayment?.amount ?: 0.0
-            )
+            try {
+                val result = paymentRepository.setPaymentStatus(
+                    studentId = studentId,
+                    year = year,
+                    month = month,
+                    isPaid = newIsPaid,
+                    amount = oldPayment?.amount ?: 0.0
+                )
 
-            if (result.isFailure) {
-                // Rollback optimistic state
-                val rollbackMap = _uiState.value.paymentsMap.toMutableMap()
-                if (oldPayment != null) {
-                    rollbackMap[studentId] = oldPayment
+                if (result.isSuccess) {
+                    val savedPayment = result.getOrThrow()
+                    _uiState.update { state ->
+                        val newPaymentsMap = state.paymentsMap.toMutableMap().apply {
+                            put(studentId, savedPayment)
+                        }
+                        val scope = state.allStudentsInScope
+                        val paid = scope.count { newPaymentsMap[it.studentId]?.isPaid == true }
+                        val unpaid = (scope.size - paid).coerceAtLeast(0)
+                        state.copy(
+                            paymentsMap = newPaymentsMap,
+                            paidCount = paid,
+                            unpaidCount = unpaid,
+                            togglingPaymentStudentIds = state.togglingPaymentStudentIds - studentId,
+                            statusChangeMessage = if (savedPayment.isPaid) "تم تأكيد دفع الشهر ✓" else "تم إلغاء تأكيد الدفع"
+                        )
+                    }
                 } else {
-                    rollbackMap.remove(studentId)
+                    val ex = result.exceptionOrNull()
+                    _uiState.update {
+                        it.copy(
+                            togglingPaymentStudentIds = it.togglingPaymentStudentIds - studentId,
+                            errorMessage = ex?.toArabicErrorMessage() ?: "تعذر تحديث حالة الدفع، يرجى المحاولة لاحقاً."
+                        )
+                    }
                 }
-                val rollbackScope = _uiState.value.allStudentsInScope
-                val rbPaid = rollbackScope.count { rollbackMap[it.studentId]?.isPaid == true }
-                val rbUnpaid = (rollbackScope.size - rbPaid).coerceAtLeast(0)
-
+            } catch (e: CancellationException) {
+                _uiState.update {
+                    it.copy(togglingPaymentStudentIds = it.togglingPaymentStudentIds - studentId)
+                }
+                throw e
+            } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
-                        paymentsMap = rollbackMap,
-                        paidCount = rbPaid,
-                        unpaidCount = rbUnpaid,
-                        errorMessage = "تعذر تحديث حالة الدفع، يرجى المحاولة لاحقاً."
+                        togglingPaymentStudentIds = it.togglingPaymentStudentIds - studentId,
+                        errorMessage = e.toArabicErrorMessage()
                     )
                 }
             }

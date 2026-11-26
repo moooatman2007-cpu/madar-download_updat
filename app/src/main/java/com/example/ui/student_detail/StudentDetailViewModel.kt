@@ -328,7 +328,7 @@ class StudentDetailViewModel(
                     }
                 }
 
-                // Load global data for overview and populate monthly slices locally from Room cache
+                // Load global data for overview and populate monthly slices from in-memory session state
                 globalDataJob?.cancel()
                 var isInitialLoad = true
                 globalDataJob = launch {
@@ -506,26 +506,38 @@ class StudentDetailViewModel(
             coroutineScope {
                 // Load Monthly Performance & Report
                 launch {
-                    val performance = monthlyReportRepository.getStudentMonthlyPerformance(studentId, year, month)
-                    _uiState.update {
-                        it.copy(
-                            studentMonthlyPerformance = performance,
-                            teacherMonthlyNote = performance?.teacherNote ?: ""
-                        )
+                    try {
+                        val performance = monthlyReportRepository.getStudentMonthlyPerformance(studentId, year, month)
+                        _uiState.update {
+                            it.copy(
+                                studentMonthlyPerformance = performance,
+                                teacherMonthlyNote = performance?.teacherNote ?: ""
+                            )
+                        }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
                     }
                 }
 
                 // Load Monthly Payment & refresh history
                 launch {
-                    val payment = paymentRepository.getPaymentForStudent(studentId, year, month)
-                    val history = paymentRepository.getPaymentsForStudentHistory(studentId)
-                    _uiState.update { state ->
-                        val mergedHistory = if (history.isNotEmpty()) history else state.studentPaymentHistory
-                        state.copy(
-                            monthlyPayment = payment,
-                            isPaymentPaid = payment?.isPaid ?: false,
-                            studentPaymentHistory = mergedHistory
-                        )
+                    try {
+                        val paymentResult = paymentRepository.fetchPaymentForStudentResult(studentId, year, month)
+                        val historyResult = paymentRepository.fetchPaymentsForStudentHistoryResult(studentId)
+                        val payment = paymentResult.getOrNull()
+                        val history = historyResult.getOrNull()
+                        _uiState.update { state ->
+                            val mergedHistory = if (!history.isNullOrEmpty()) history else state.studentPaymentHistory
+                            state.copy(
+                                monthlyPayment = if (paymentResult.isSuccess) payment else state.monthlyPayment,
+                                isPaymentPaid = if (paymentResult.isSuccess) (payment?.isPaid ?: false) else state.isPaymentPaid,
+                                studentPaymentHistory = mergedHistory
+                            )
+                        }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
                     }
                 }
             }
@@ -544,47 +556,41 @@ class StudentDetailViewModel(
         val oldPayment = _uiState.value.monthlyPayment
         val oldIsPaid = _uiState.value.isPaymentPaid
         val targetAmount = oldPayment?.amount?.takeIf { it > 0.0 } ?: _uiState.value.defaultMonthlyFee
-
         val newIsPaid = !oldIsPaid
 
-        // Optimistic UI update
-        _uiState.update {
-            it.copy(
-                isPaymentPaid = newIsPaid,
-                isTogglingPayment = true
-            )
-        }
+        _uiState.update { it.copy(isTogglingPayment = true) }
 
         viewModelScope.launch {
-            val result = paymentRepository.togglePaymentStatus(studentId, year, month, amount = targetAmount)
-            if (result.isSuccess) {
-                val updatedPayment = result.getOrNull()
-                val updatedHistory = paymentRepository.getPaymentsForStudentHistory(studentId)
-                _uiState.update { state ->
-                    val mergedHistory = mergePaymentIntoHistory(
-                        base = if (updatedHistory.isNotEmpty()) updatedHistory else state.studentPaymentHistory,
-                        updated = updatedPayment
-                    )
-                    state.copy(
-                        monthlyPayment = updatedPayment,
-                        isPaymentPaid = updatedPayment?.isPaid ?: newIsPaid,
-                        isTogglingPayment = false,
-                        studentPaymentHistory = mergedHistory
-                    )
+            try {
+                val result = paymentRepository.togglePaymentStatus(studentId, year, month, amount = targetAmount)
+                if (result.isSuccess) {
+                    val updatedPayment = result.getOrNull()
+                    val updatedHistory = paymentRepository.fetchPaymentsForStudentHistoryResult(studentId).getOrDefault(emptyList())
+                    _uiState.update { state ->
+                        val mergedHistory = mergePaymentIntoHistory(
+                            base = if (updatedHistory.isNotEmpty()) updatedHistory else state.studentPaymentHistory,
+                            updated = updatedPayment
+                        )
+                        state.copy(
+                            monthlyPayment = updatedPayment,
+                            isPaymentPaid = updatedPayment?.isPaid ?: newIsPaid,
+                            isTogglingPayment = false,
+                            studentPaymentHistory = mergedHistory
+                        )
+                    }
+                    val statusStr = if (updatedPayment?.isPaid == true) "مدفوع" else "غير مدفوع"
+                    _events.emit(StudentDetailEvent.ShowMessage("تم تحديث حالة الدفع إلى $statusStr"))
+                } else {
+                    _uiState.update { it.copy(isTogglingPayment = false) }
+                    val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل تحديث حالة الدفع"
+                    _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
                 }
-                val statusStr = if (updatedPayment?.isPaid == true) "مدفوع" else "غير مدفوع"
-                _events.emit(StudentDetailEvent.ShowMessage("تم تحديث حالة الدفع إلى $statusStr"))
-            } else {
-                // Rollback on failure
-                _uiState.update {
-                    it.copy(
-                        monthlyPayment = oldPayment,
-                        isPaymentPaid = oldIsPaid,
-                        isTogglingPayment = false
-                    )
-                }
-                val errorMsg = result.exceptionOrNull()?.message ?: "فشل تحديث حالة الدفع"
-                _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                _uiState.update { it.copy(isTogglingPayment = false) }
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(isTogglingPayment = false) }
+                _events.emit(StudentDetailEvent.ShowMessage(e.toArabicErrorMessage()))
             }
         }
     }
@@ -598,52 +604,47 @@ class StudentDetailViewModel(
         if (_uiState.value.isTogglingPayment) return
         val studentId = _uiState.value.student?.studentId ?: return
         val safeAmount = amount.coerceAtLeast(0.0)
-        val oldPayment = _uiState.value.monthlyPayment
-        val oldIsPaid = _uiState.value.isPaymentPaid
 
-        _uiState.update {
-            it.copy(
-                isTogglingPayment = true,
-                isPaymentPaid = if (year == it.selectedYear && month == it.selectedMonth) isPaid else it.isPaymentPaid
-            )
-        }
+        _uiState.update { it.copy(isTogglingPayment = true) }
 
         viewModelScope.launch {
-            val result = paymentRepository.setPaymentStatus(
-                studentId = studentId,
-                year = year,
-                month = month,
-                isPaid = isPaid,
-                amount = safeAmount
-            )
-            if (result.isSuccess) {
-                val updatedPayment = result.getOrNull()
-                val updatedHistory = paymentRepository.getPaymentsForStudentHistory(studentId)
-                _uiState.update { state ->
-                    val isSelectedMonth = (year == state.selectedYear && month == state.selectedMonth)
-                    val mergedHistory = mergePaymentIntoHistory(
-                        base = if (updatedHistory.isNotEmpty()) updatedHistory else state.studentPaymentHistory,
-                        updated = updatedPayment
-                    )
-                    state.copy(
-                        monthlyPayment = if (isSelectedMonth) updatedPayment else state.monthlyPayment,
-                        isPaymentPaid = if (isSelectedMonth) (updatedPayment?.isPaid ?: isPaid) else state.isPaymentPaid,
-                        isTogglingPayment = false,
-                        studentPaymentHistory = mergedHistory
-                    )
+            try {
+                val result = paymentRepository.setPaymentStatus(
+                    studentId = studentId,
+                    year = year,
+                    month = month,
+                    isPaid = isPaid,
+                    amount = safeAmount
+                )
+                if (result.isSuccess) {
+                    val updatedPayment = result.getOrNull()
+                    val updatedHistory = paymentRepository.fetchPaymentsForStudentHistoryResult(studentId).getOrDefault(emptyList())
+                    _uiState.update { state ->
+                        val isSelectedMonth = (year == state.selectedYear && month == state.selectedMonth)
+                        val mergedHistory = mergePaymentIntoHistory(
+                            base = if (updatedHistory.isNotEmpty()) updatedHistory else state.studentPaymentHistory,
+                            updated = updatedPayment
+                        )
+                        state.copy(
+                            monthlyPayment = if (isSelectedMonth) updatedPayment else state.monthlyPayment,
+                            isPaymentPaid = if (isSelectedMonth) (updatedPayment?.isPaid ?: isPaid) else state.isPaymentPaid,
+                            isTogglingPayment = false,
+                            studentPaymentHistory = mergedHistory
+                        )
+                    }
+                    val statusStr = if (isPaid) "مدفوع" else "غير مدفوع"
+                    _events.emit(StudentDetailEvent.ShowMessage("تم حفظ سجل الدفع ($statusStr) بنجاح"))
+                } else {
+                    _uiState.update { it.copy(isTogglingPayment = false) }
+                    val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل حفظ سجل الدفع"
+                    _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
                 }
-                val statusStr = if (isPaid) "مدفوع" else "غير مدفوع"
-                _events.emit(StudentDetailEvent.ShowMessage("تم حفظ سجل الدفع ($statusStr) بنجاح"))
-            } else {
-                _uiState.update {
-                    it.copy(
-                        monthlyPayment = oldPayment,
-                        isPaymentPaid = oldIsPaid,
-                        isTogglingPayment = false
-                    )
-                }
-                val errorMsg = result.exceptionOrNull()?.message ?: "فشل حفظ سجل الدفع"
-                _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                _uiState.update { it.copy(isTogglingPayment = false) }
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(isTogglingPayment = false) }
+                _events.emit(StudentDetailEvent.ShowMessage(e.toArabicErrorMessage()))
             }
         }
     }
@@ -749,10 +750,19 @@ class StudentDetailViewModel(
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch {
             try {
-                dismissDeleteAttendance()
-                attendanceRepository.deleteAttendance(att.attendanceId)
-                _events.emit(StudentDetailEvent.ShowMessage("تم حذف سجل الحضور"))
-                refreshCurrentTabData()
+                val result = attendanceRepository.deleteAttendance(att.attendanceId)
+                if (result.isSuccess) {
+                    dismissDeleteAttendance()
+                    _events.emit(StudentDetailEvent.ShowMessage("تم حذف سجل الحضور"))
+                    refreshCurrentTabData()
+                } else {
+                    val errMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر حذف سجل الحضور"
+                    _events.emit(StudentDetailEvent.ShowMessage(errMsg))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _events.emit(StudentDetailEvent.ShowMessage(e.toArabicErrorMessage()))
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }
@@ -861,12 +871,19 @@ class StudentDetailViewModel(
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch {
             try {
-                dismissDeleteRecitation()
                 val result = recitationRepository.deleteRecitation(rec.recitationId)
                 if (result.isSuccess) {
+                    dismissDeleteRecitation()
                     _events.emit(StudentDetailEvent.ShowMessage("تم حذف التسميع بنجاح"))
                     refreshCurrentTabData()
+                } else {
+                    val errMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر حذف التسميع"
+                    _events.emit(StudentDetailEvent.ShowMessage(errMsg))
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _events.emit(StudentDetailEvent.ShowMessage(e.toArabicErrorMessage()))
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }
@@ -1112,12 +1129,19 @@ class StudentDetailViewModel(
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch {
             try {
-                dismissDeleteExam()
                 val result = examRepository.deleteExam(ex.examId)
                 if (result.isSuccess) {
+                    dismissDeleteExam()
                     _events.emit(StudentDetailEvent.ShowMessage("تم حذف الامتحان بنجاح"))
                     refreshCurrentTabData()
+                } else {
+                    val errMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر حذف الامتحان"
+                    _events.emit(StudentDetailEvent.ShowMessage(errMsg))
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _events.emit(StudentDetailEvent.ShowMessage(e.toArabicErrorMessage()))
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }
@@ -1245,7 +1269,6 @@ class StudentDetailViewModel(
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch {
             try {
-                closeHomeworkDialog()
                 if (editingHomework != null) {
                     val result = homeworkRepository.updateHomework(
                         editingHomework.copy(
@@ -1256,10 +1279,11 @@ class StudentDetailViewModel(
                         )
                     )
                     if (result.isSuccess) {
+                        closeHomeworkDialog()
                         _events.emit(StudentDetailEvent.ShowMessage("تم حفظ الواجب بنجاح"))
                         refreshCurrentTabData()
                     } else {
-                        val errorMsg = result.exceptionOrNull()?.message ?: "فشل حفظ الواجب"
+                        val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل حفظ الواجب"
                         _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
                     }
                 } else {
@@ -1271,13 +1295,18 @@ class StudentDetailViewModel(
                         note = note
                     )
                     if (result.isSuccess) {
+                        closeHomeworkDialog()
                         _events.emit(StudentDetailEvent.ShowMessage("تم حفظ الواجب بنجاح"))
                         refreshCurrentTabData()
                     } else {
-                        val errorMsg = result.exceptionOrNull()?.message ?: "فشل حفظ الواجب"
+                        val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل حفظ الواجب"
                         _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _events.emit(StudentDetailEvent.ShowMessage(e.toArabicErrorMessage()))
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }
@@ -1298,15 +1327,19 @@ class StudentDetailViewModel(
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch {
             try {
-                dismissDeleteHomework()
                 val result = homeworkRepository.deleteHomework(homework.homeworkId)
                 if (result.isSuccess) {
+                    dismissDeleteHomework()
                     _events.emit(StudentDetailEvent.ShowMessage("تم حذف الواجب بنجاح"))
                     refreshCurrentTabData()
                 } else {
-                    val errorMsg = result.exceptionOrNull()?.message ?: "فشل حذف الواجب"
+                    val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل حذف الواجب"
                     _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _events.emit(StudentDetailEvent.ShowMessage(e.toArabicErrorMessage()))
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }
