@@ -1,6 +1,15 @@
 package com.example.data.repository
 
+import android.content.Context
+
 object RepositoryProvider {
+    @Volatile
+    private var appContext: Context? = null
+
+    fun init(context: Context) {
+        appContext = context.applicationContext
+    }
+
     val teacherRepository: TeacherRepository by lazy {
         SupabaseTeacherRepository()
     }
@@ -15,8 +24,9 @@ object RepositoryProvider {
 
     val settingsRepository: SettingsRepository by lazy {
         try {
-            DataStoreSettingsRepository(com.example.data.local.DatabaseProvider.context)
-        } catch (_: IllegalStateException) {
+            val ctx = appContext ?: throw IllegalStateException("RepositoryProvider not initialized with Context.")
+            DataStoreSettingsRepository(ctx)
+        } catch (_: Throwable) {
             MockSettingsRepository()
         }
     }
@@ -42,7 +52,11 @@ object RepositoryProvider {
     }
 
     val groupRepository: GroupRepository by lazy {
-        SupabaseGroupRepository()
+        SupabaseGroupRepository(
+            onStudentUpdated = { updatedStudent ->
+                (studentRepository as? SupabaseStudentRepository)?.updateStudentInMemory(updatedStudent)
+            }
+        )
     }
 
     val paymentRepository: PaymentRepository by lazy {
@@ -57,12 +71,16 @@ object RepositoryProvider {
         SupabaseSubscriptionRepository()
     }
 
-    val syncManager: com.example.data.sync.SyncManager by lazy {
-        val context = com.example.data.local.DatabaseProvider.context
-        val outboxDao = try { com.example.data.local.DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null }
-        com.example.data.sync.DefaultSyncManager(
-            networkMonitor = com.example.data.sync.ConnectivityNetworkMonitor(context),
-            outboxDao = outboxDao
-        )
+    fun clearAllSessionCaches() {
+        (teacherRepository as? SupabaseTeacherRepository)?.clearCache()
+        (gradeRepository as? SupabaseGradeRepository)?.clearCache()
+        (studentRepository as? SupabaseStudentRepository)?.clearCache()
+        (groupRepository as? SupabaseGroupRepository)?.clearCache()
+        (attendanceRepository as? SupabaseAttendanceRepository)?.clearCache()
+        (examRepository as? SupabaseExamRepository)?.clearCache()
+        (recitationRepository as? SupabaseRecitationRepository)?.clearCache()
+        (homeworkRepository as? SupabaseHomeworkRepository)?.clearCache()
+        (paymentRepository as? SupabasePaymentRepository)?.clearCache()
+        (monthlyReportRepository as? SupabaseMonthlyReportRepository)?.clearCache()
     }
 }

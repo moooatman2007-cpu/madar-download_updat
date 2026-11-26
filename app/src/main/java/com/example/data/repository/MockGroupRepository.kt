@@ -36,6 +36,10 @@ class MockGroupRepository(
         return _groups.value.find { it.id == groupId && it.teacherId == teacherId }
     }
 
+    override suspend fun fetchGroupById(teacherId: String, groupId: String): Result<Group?> {
+        return Result.success(getGroupById(teacherId, groupId))
+    }
+
     override suspend fun createGroup(group: Group): Result<Group> {
         _groups.update { it + group }
         return Result.success(group)

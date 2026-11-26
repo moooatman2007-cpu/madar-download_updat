@@ -71,6 +71,21 @@ data class UpdateStudentRequest(
 )
 
 @Serializable
+data class UpdateStudentOnlineDto(
+    @SerialName("grade_id") val gradeId: String,
+    @SerialName("full_name") val fullName: String,
+    @SerialName("parent_phone") val parentPhone: String,
+    @SerialName("has_whatsapp") val hasWhatsApp: Boolean,
+    @SerialName("alternative_phone") val alternativePhone: String?,
+    @SerialName("group_id") val groupId: String?
+)
+
+@Serializable
+data class UpdateStudentGroupDto(
+    @SerialName("group_id") val groupId: String?
+)
+
+@Serializable
 data class SoftDeleteStudentRequest(
     @SerialName("deleted_at") val deletedAt: String
 )

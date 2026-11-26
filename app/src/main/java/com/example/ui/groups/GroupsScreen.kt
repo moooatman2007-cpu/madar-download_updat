@@ -29,7 +29,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.core.model.EducationalStages
 import com.example.core.model.Group
+import com.example.core.model.OnlineLoadState
 import com.example.ui.components.EmptyStateView
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.theme.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -44,6 +47,7 @@ fun GroupsScreen(
     var isStageFilterExpanded by remember { mutableStateOf(false) }
     var isGradeFilterExpanded by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val hasTerminalLoadError = uiState.loadState is OnlineLoadState.Offline || uiState.loadState is OnlineLoadState.Error
 
     LaunchedEffect(uiState.actionMessage) {
         uiState.actionMessage?.let { msg ->
@@ -53,9 +57,11 @@ fun GroupsScreen(
     }
 
     LaunchedEffect(uiState.errorMessage) {
-        uiState.errorMessage?.let { err ->
-            snackbarHostState.showSnackbar(err)
-            viewModel.clearActionMessage()
+        if (uiState.groups.isNotEmpty() || uiState.loadState is OnlineLoadState.Success) {
+            uiState.errorMessage?.let { err ->
+                snackbarHostState.showSnackbar(err)
+                viewModel.clearErrorMessage()
+            }
         }
     }
 
@@ -79,6 +85,13 @@ fun GroupsScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = { viewModel.refresh() }, modifier = Modifier.testTag("groups_refresh_button")) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "تحديث",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                     IconButton(onClick = { viewModel.openAddDialog() }, modifier = Modifier.testTag("add_group_button")) {
                         Icon(
                             imageVector = Icons.Default.Add,
@@ -210,9 +223,29 @@ fun GroupsScreen(
                 }
             }
 
-            if (uiState.isLoading) {
+            if (hasTerminalLoadError && uiState.groups.isNotEmpty()) {
+                OnlineInlineErrorBanner(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.errorMessage ?: "تعذر تحديث المجموعات من السيرفر.",
+                    onRetry = viewModel::retry,
+                    modifier = Modifier.padding(horizontal = Dimens.Spacing20, vertical = Dimens.Spacing4)
+                )
+            }
+
+            if (uiState.isLoading && uiState.groups.isEmpty()) {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = PrimaryIndigo)
+                    CircularProgressIndicator(
+                        color = PrimaryIndigo,
+                        modifier = Modifier.testTag("groups_loading_indicator")
+                    )
+                }
+            } else if (hasTerminalLoadError && uiState.groups.isEmpty()) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    OnlineStatusStateView(
+                        isOffline = uiState.isOfflineError,
+                        message = uiState.errorMessage ?: "تعذر الاتصال بالسيرفر، يرجى التحقق من الإنترنت وإعادة المحاولة.",
+                        onRetry = viewModel::retry
+                    )
                 }
             } else if (uiState.filteredGroups.isEmpty()) {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -315,6 +348,54 @@ fun GroupsScreen(
                 }
             )
         }
+
+        // Blocked Deletion -> Offer Safe Deactivation Dialog
+        if (uiState.groupBlockedToDeactivate != null) {
+            val blockedGroup = uiState.groupBlockedToDeactivate!!
+            AlertDialog(
+                onDismissRequest = { if (!uiState.isDeleting) viewModel.dismissDeactivateBlockedGroup() },
+                icon = {
+                    Icon(Icons.Default.PauseCircle, contentDescription = null, tint = WarmAmber)
+                },
+                title = {
+                    Text(
+                        text = "تعذر حذف المجموعة",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                        textAlign = TextAlign.Center
+                    )
+                },
+                text = {
+                    Text(
+                        text = "المجموعة \"${blockedGroup.name}\" مرتبطة بطلاب مسجلين أو سجلات حضور سابقة، وللحفاظ على سلامة البيانات لا يمكن حذفها. هل تريد تعطيلها بدلاً من حذفها؟",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = { viewModel.confirmDeactivateBlockedGroup() },
+                        enabled = !uiState.isDeleting,
+                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.testTag("confirm_deactivate_blocked_group_button")
+                    ) {
+                        if (uiState.isDeleting) {
+                            CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp))
+                        } else {
+                            Text("تعطيل المجموعة", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { viewModel.dismissDeactivateBlockedGroup() },
+                        enabled = !uiState.isDeleting
+                    ) {
+                        Text("إلغاء")
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -376,6 +457,13 @@ fun GroupCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(0.dp)
                 ) {
+                    IconButton(onClick = onToggleActive, modifier = Modifier.testTag("toggle_group_active_btn_${group.id}")) {
+                        Icon(
+                            imageVector = if (group.active) Icons.Default.PauseCircleOutline else Icons.Default.PlayCircleOutline,
+                            contentDescription = if (group.active) "تعطيل" else "تفعيل",
+                            tint = if (group.active) WarmAmber else EmeraldGreen
+                        )
+                    }
                     IconButton(onClick = onEdit, modifier = Modifier.testTag("edit_group_btn_${group.id}")) {
                         Icon(imageVector = Icons.Default.Edit, contentDescription = "تعديل", tint = PrimaryIndigo)
                     }

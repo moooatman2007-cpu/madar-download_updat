@@ -25,7 +25,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.MenuBook
-import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Groups
@@ -338,30 +337,7 @@ fun MoreScreen(
                             modifier = Modifier.padding(horizontal = Dimens.Spacing16)
                         )
 
-                        // 6. حالة المزامنة المحلية (Outbox)
-                        val totalUnsynced = uiState.pendingOutboxCount + uiState.failedOutboxCount
-                        val outboxSubtitle = when {
-                            uiState.failedOutboxCount > 0 ->
-                                "يوجد ${uiState.failedOutboxCount} عملية فاشلة و ${uiState.pendingOutboxCount} قيد الانتظار"
-                            uiState.pendingOutboxCount > 0 ->
-                                "يوجد ${uiState.pendingOutboxCount} عملية بانتظار المزامنة مع الخادم"
-                            else -> "جميع البيانات متزامنة مع الخادم ✓"
-                        }
-                        SettingMenuItem(
-                            icon = Icons.Default.CloudSync,
-                            title = "حالة المزامنة",
-                            subtitle = outboxSubtitle,
-                            iconBg = if (totalUnsynced > 0) Color(0xFFFEF3C7) else Color(0xFFDCFCE7),
-                            iconColor = if (totalUnsynced > 0) Color(0xFFD97706) else Color(0xFF16A34A),
-                            onClick = viewModel::openOutboxDialog,
-                            testTag = "setting_outbox_sync"
-                        )
-                        HorizontalDivider(
-                            color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
-                            modifier = Modifier.padding(horizontal = Dimens.Spacing16)
-                        )
-
-                        // 6.b ربط WhatsApp
+                        // 6. ربط WhatsApp
                         SettingMenuItem(
                             icon = Icons.Default.Language,
                             title = "ربط WhatsApp",
@@ -707,107 +683,20 @@ fun MoreScreen(
             )
         }
 
-        // Outbox Status & Retry Dialog
-        if (uiState.showOutboxDialog) {
-            AlertDialog(
-                onDismissRequest = viewModel::closeOutboxDialog,
-                title = {
-                    Text(
-                        text = "حالة المزامنة المحلية",
-                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
-                    )
-                },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing10)) {
-                        Text(
-                            text = "بانتظار المزامنة: ${uiState.pendingOutboxCount} • فاشلة: ${uiState.failedOutboxCount}",
-                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
-                        )
-                        if (uiState.unsyncedOutboxItems.isEmpty()) {
-                            Text(
-                                text = "لا توجد أي عمليات معلقة. جميع التعديلات محفوظة ومتزامنة مع الخادم.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else {
-                            uiState.unsyncedOutboxItems.take(5).forEach { op ->
-                                Surface(
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(8.dp)) {
-                                        Text(
-                                            text = "${op.entityType} • ${op.operationType} (${op.status})",
-                                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
-                                        )
-                                        if (!op.lastError.isNullOrBlank()) {
-                                            Text(
-                                                text = op.lastError,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.error,
-                                                maxLines = 2
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                            if (uiState.unsyncedOutboxItems.size > 5) {
-                                Text(
-                                    text = "و ${uiState.unsyncedOutboxItems.size - 5} عمليات أخرى...",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-
-                        if (!uiState.outboxMessage.isNullOrBlank()) {
-                            Text(
-                                text = uiState.outboxMessage!!,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = PrimaryIndigo
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    if (uiState.unsyncedOutboxItems.isNotEmpty()) {
-                        Button(
-                            onClick = viewModel::retryPendingOutbox,
-                            enabled = !uiState.isRetryingOutbox,
-                            modifier = Modifier.testTag("retry_outbox_button")
-                        ) {
-                            Text(if (uiState.isRetryingOutbox) "جاري المحاولة..." else "إعادة المحاولة الآن")
-                        }
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = viewModel::closeOutboxDialog) {
-                        Text("إغلاق")
-                    }
-                },
-                modifier = Modifier.testTag("outbox_status_dialog")
-            )
-        }
-
         // Logout Confirmation Dialog
         if (uiState.showLogoutDialog) {
             AlertDialog(
                 onDismissRequest = viewModel::closeLogoutDialog,
                 title = {
                     Text(
-                        text = if (uiState.requireForceLogoutConfirm) "بيانات غير متزامنة" else "تسجيل الخروج",
+                        text = "تسجيل الخروج",
                         style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
                     )
                 },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing10)) {
                         Text(
-                            text = if (uiState.requireForceLogoutConfirm) {
-                                "يوجد لديك تغييرات محلية لم تكتمل مزامنتها مع الخادم بعد. يمكنك إعادة محاولة المزامنة الآن أو تأكيد الخروج القسري مع حذف البيانات المحلية غير المرسلة."
-                            } else {
-                                "هل أنت متأكد أنك تريد تسجيل الخروج؟"
-                            },
+                            text = "هل أنت متأكد أنك تريد تسجيل الخروج؟",
                             style = MaterialTheme.typography.bodyMedium
                         )
                         if (uiState.logoutError != null) {
@@ -817,74 +706,33 @@ fun MoreScreen(
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
-                        if (uiState.requireForceLogoutConfirm) {
-                            OutlinedButton(
-                                onClick = {
-                                    viewModel.retryPendingOutbox()
-                                },
-                                enabled = !uiState.isLoggingOut && !uiState.isRetryingOutbox,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("logout_retry_sync_button")
-                            ) {
-                                Text("إعادة محاولة المزامنة الآن")
-                            }
-                        }
                     }
                 },
                 confirmButton = {
-                    if (uiState.requireForceLogoutConfirm) {
-                        Button(
-                            onClick = {
-                                viewModel.confirmForceLogout(onSuccess = onLogoutSuccess)
-                            },
-                            enabled = !uiState.isLoggingOut,
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.error,
-                                contentColor = MaterialTheme.colorScheme.onError
-                            ),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.testTag("force_logout_button")
-                        ) {
-                            if (uiState.isLoggingOut) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    color = MaterialTheme.colorScheme.onError,
-                                    strokeWidth = 2.dp
-                                )
-                                Spacer(modifier = Modifier.width(Dimens.Spacing8))
-                            }
-                            Text(
-                                text = "تأكيد الخروج القسري",
-                                fontWeight = FontWeight.Bold
+                    Button(
+                        onClick = {
+                            viewModel.performLogout(onSuccess = onLogoutSuccess)
+                        },
+                        enabled = !uiState.isLoggingOut,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.testTag("confirm_logout_button")
+                    ) {
+                        if (uiState.isLoggingOut) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = MaterialTheme.colorScheme.onError,
+                                strokeWidth = 2.dp
                             )
+                            Spacer(modifier = Modifier.width(Dimens.Spacing8))
                         }
-                    } else {
-                        Button(
-                            onClick = {
-                                viewModel.performLogout(onSuccess = onLogoutSuccess)
-                            },
-                            enabled = !uiState.isLoggingOut,
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.error,
-                                contentColor = MaterialTheme.colorScheme.onError
-                            ),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.testTag("confirm_logout_button")
-                        ) {
-                            if (uiState.isLoggingOut) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    color = MaterialTheme.colorScheme.onError,
-                                    strokeWidth = 2.dp
-                                )
-                                Spacer(modifier = Modifier.width(Dimens.Spacing8))
-                            }
-                            Text(
-                                text = "تسجيل الخروج",
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                        Text(
+                            text = "تسجيل الخروج",
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 },
                 dismissButton = {

@@ -1,6 +1,5 @@
 package com.example.data.repository
 
-import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Recitation
 import com.example.core.model.RecitationSummary
 import com.example.core.model.SyncResult
@@ -10,8 +9,14 @@ interface RecitationRepository {
     fun getRecitationsForStudent(studentId: String): Flow<List<Recitation>>
     fun getRecitationsForStudentByMonth(studentId: String, year: Int, month: Int): Flow<List<Recitation>>
     suspend fun getRecitationSummaryForStudent(studentId: String, year: Int, month: Int): RecitationSummary
+    suspend fun fetchRecitationsForStudentByMonthResult(studentId: String, year: Int, month: Int): Result<List<Recitation>> =
+        runCatching { emptyList() }
     suspend fun getRecitationsCountThisMonth(year: Int, month: Int): Int
+    suspend fun fetchRecitationsCountThisMonthResult(year: Int, month: Int): Result<Int> =
+        runCatching { getRecitationsCountThisMonth(year, month) }
     fun getAllRecitationsForTeacher(): Flow<List<Recitation>>
+    suspend fun refreshAllRecitationsForTeacher(): Result<List<Recitation>> =
+        runCatching { emptyList() }
     suspend fun addRecitation(
         studentId: String,
         date: String,

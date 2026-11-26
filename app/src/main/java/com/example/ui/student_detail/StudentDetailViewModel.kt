@@ -33,6 +33,8 @@ import com.example.data.repository.SettingsRepository
 import com.example.data.repository.StudentRepository
 import io.github.jan.supabase.auth.auth
 import com.example.util.DateUtils
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import android.content.Context
 import java.time.YearMonth
 import kotlinx.coroutines.Job
@@ -134,6 +136,7 @@ data class StudentDetailUiState(
     // Delete Student
     val showDeleteBottomSheet: Boolean = false,
     val error: String? = null,
+    val isOfflineError: Boolean = false,
     val isSaving: Boolean = false
 )
 
@@ -246,14 +249,30 @@ class StudentDetailViewModel(
         loadStudentJob?.cancel()
         refreshJob?.cancel()
         loadStudentJob = viewModelScope.launch {
-            _uiState.update { it.copy(isLoading = true) }
-            val student = studentRepository.getStudentById(studentId)
+            _uiState.update { it.copy(isLoading = true, error = null, isOfflineError = false) }
+            val studentResult = studentRepository.fetchStudentById(studentId)
+            if (studentResult.isFailure) {
+                val err = studentResult.exceptionOrNull()
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        isOfflineError = err?.isOfflineOrNetworkError() == true,
+                        error = err?.toArabicErrorMessage() ?: "تعذر تحميل بيانات الطالب من السيرفر."
+                    )
+                }
+                return@launch
+            }
+            val student = studentResult.getOrNull()
             if (student != null) {
                 val grade = gradeRepository.getGradeById(student.gradeId)
+                val teacherId = student.teacherId ?: ""
+                if (teacherId.isNotBlank()) {
+                    groupRepository.refreshGroups(teacherId)
+                }
                 val group = student.groupId?.let { groupId ->
                     try {
-                        val teacherId = student.teacherId ?: ""
-                        groupRepository.getGroupById(teacherId, groupId)
+                        groupRepository.fetchGroupById(teacherId, groupId).getOrNull()
+                            ?: groupRepository.getGroupById(teacherId, groupId)
                     } catch (_: Exception) {
                         null
                     }
@@ -261,7 +280,7 @@ class StudentDetailViewModel(
                 
                 // Fetch available groups
                 val availableGroups = try {
-                    groupRepository.observeGroupsByGrade(student.teacherId ?: "", student.gradeId).first()
+                    groupRepository.observeGroupsByGrade(teacherId, student.gradeId).first()
                 } catch (_: Exception) {
                     emptyList()
                 }
@@ -276,6 +295,7 @@ class StudentDetailViewModel(
                         group = group,
                         availableGroups = availableGroups,
                         formattedCreatedAt = formattedDate,
+                        isOfflineError = false,
                         error = null
                     )
                 }
@@ -394,6 +414,7 @@ class StudentDetailViewModel(
                 _uiState.update {
                     it.copy(
                         isLoading = false,
+                        isOfflineError = false,
                         error = "عذراً، لم يتم العثور على بيانات الطالب."
                     )
                 }
@@ -702,13 +723,7 @@ class StudentDetailViewModel(
                 )
                 if (result.isSuccess) {
                     closeAttendanceDialog()
-                    val syncRes = result.getOrNull()
-                    val msg = if (syncRes?.syncStatus == BatchSyncStatus.QUEUED_OFFLINE) {
-                        "تم تسجيل الحضور محلياً وسيتم المزامنة عند توفر الاتصال 📡"
-                    } else {
-                        "تم تسجيل الحضور بنجاح"
-                    }
-                    _events.emit(StudentDetailEvent.ShowMessage(msg))
+                    _events.emit(StudentDetailEvent.ShowMessage("تم تسجيل الحضور بنجاح"))
                     refreshCurrentTabData()
                 } else {
                     val errorMsg = result.exceptionOrNull()?.message ?: "تعذر تسجيل الحضور"
@@ -802,13 +817,7 @@ class StudentDetailViewModel(
                     )
                     if (result.isSuccess) {
                         closeRecitationDialog()
-                        val syncRes = result.getOrNull()
-                        val msg = if (syncRes?.syncStatus == BatchSyncStatus.QUEUED_OFFLINE) {
-                            "تم حفظ التسميع محلياً وسيتم المزامنة عند توفر الاتصال 📡"
-                        } else {
-                            "تمت إضافة التسميع بنجاح"
-                        }
-                        _events.emit(StudentDetailEvent.ShowMessage(msg))
+                        _events.emit(StudentDetailEvent.ShowMessage("تمت إضافة التسميع بنجاح"))
                         refreshCurrentTabData()
                     } else {
                         _events.emit(StudentDetailEvent.ShowMessage(result.exceptionOrNull()?.message ?: "حدث خطأ في حفظ التسميع"))
@@ -1059,12 +1068,7 @@ class StudentDetailViewModel(
                                 }
                             }
                         }
-                        val msg = if (syncRes?.syncStatus == BatchSyncStatus.QUEUED_OFFLINE) {
-                            "تم حفظ الامتحان محلياً وسيتم المزامنة عند توفر الاتصال 📡"
-                        } else {
-                            "تمت إضافة الامتحان بنجاح"
-                        }
-                        _events.emit(StudentDetailEvent.ShowMessage(msg))
+                        _events.emit(StudentDetailEvent.ShowMessage("تمت إضافة الامتحان بنجاح"))
                         refreshCurrentTabData()
                     } else {
                         _events.emit(StudentDetailEvent.ShowMessage(result.exceptionOrNull()?.message ?: "حدث خطأ في حفظ الامتحان"))
@@ -1267,13 +1271,7 @@ class StudentDetailViewModel(
                         note = note
                     )
                     if (result.isSuccess) {
-                        val syncRes = result.getOrNull()
-                        val msg = if (syncRes?.syncStatus == BatchSyncStatus.QUEUED_OFFLINE) {
-                            "تم حفظ الواجب محلياً وسيتم المزامنة عند توفر الاتصال 📡"
-                        } else {
-                            "تم حفظ الواجب بنجاح"
-                        }
-                        _events.emit(StudentDetailEvent.ShowMessage(msg))
+                        _events.emit(StudentDetailEvent.ShowMessage("تم حفظ الواجب بنجاح"))
                         refreshCurrentTabData()
                     } else {
                         val errorMsg = result.exceptionOrNull()?.message ?: "فشل حفظ الواجب"
@@ -1333,16 +1331,11 @@ class StudentDetailViewModel(
             _uiState.update { it.copy(showDeleteBottomSheet = false, isLoading = true) }
             val result = studentRepository.deleteStudent(studentId)
             if (result.isSuccess) {
-                val syncRes = result.getOrNull()
-                if (syncRes?.syncStatus == BatchSyncStatus.QUEUED_OFFLINE) {
-                    _events.emit(StudentDetailEvent.ShowMessage("تم حذف الطالب محلياً وسيتم المزامنة عند توفر الاتصال 📡"))
-                } else {
-                    _events.emit(StudentDetailEvent.ShowMessage("تم حذف الطالب بنجاح"))
-                }
+                _events.emit(StudentDetailEvent.ShowMessage("تم حذف الطالب بنجاح"))
                 _events.emit(StudentDetailEvent.StudentDeleted)
             } else {
                 _uiState.update { it.copy(isLoading = false) }
-                val errorMsg = result.exceptionOrNull()?.message ?: "فشل حذف الطالب"
+                val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل حذف الطالب"
                 _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
             }
         }
@@ -1356,11 +1349,11 @@ class StudentDetailViewModel(
             _uiState.update { it.copy(isSaving = true) }
             val result = groupRepository.assignStudentToGroup(teacherId, studentId, groupId)
             if (result.isSuccess) {
-                // Refresh student
                 loadStudent(studentId)
                 _events.emit(StudentDetailEvent.ShowMessage("تم تحديث مجموعة الطالب"))
             } else {
-                _events.emit(StudentDetailEvent.ShowMessage("فشل تحديث مجموعة الطالب"))
+                val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل تحديث مجموعة الطالب"
+                _events.emit(StudentDetailEvent.ShowMessage(errorMsg))
             }
             _uiState.update { it.copy(isSaving = false) }
         }

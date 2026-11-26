@@ -1,260 +1,260 @@
 package com.example.data.repository
 
 import android.util.Log
-
 import com.example.core.model.BatchSyncStatus
-import com.example.core.model.InsertStudentRequest
 import com.example.core.model.SoftDeleteStudentRequest
 import com.example.core.model.Student
-import com.example.core.model.SyncResult
 import com.example.core.model.SupabaseStudentInsertDto
+import com.example.core.model.SyncResult
 import com.example.core.model.TeacherStats
-import com.example.core.model.UpdateStudentRequest
-import androidx.room.withTransaction
+import com.example.core.model.UpdateStudentOnlineDto
 import com.example.data.SupabaseClientProvider
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.dao.StudentDao
-import com.example.data.local.entity.OutboxEntity
-import com.example.data.local.mapper.toDomain
-import com.example.data.local.mapper.toEntity
-import com.example.data.sync.OutboxSyncScheduler
+import com.example.data.auth.AccountSessionManager
+import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.query.Order
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
+import java.time.OffsetDateTime
 import java.util.UUID
 
-class SupabaseStudentRepository(
-    private val studentDao: StudentDao? = try { DatabaseProvider.getDatabase().studentDao() } catch (_: Exception) { null },
-    private val outboxDao: OutboxDao? = try { DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null }
-) : StudentRepository {
-    private val client = SupabaseClientProvider.client
-    private val _students = MutableStateFlow<List<Student>>(emptyList())
-    private var lastFetchTimeMs = 0L
-    private val CACHE_TTL_MS = 30_000L
+interface StudentRemoteDataSource {
+    suspend fun fetchStudents(teacherId: String): List<Student>
+    suspend fun fetchStudentById(teacherId: String, studentId: String): Student?
+    suspend fun fetchStudentByCode(teacherId: String, studentCode: String): Student?
+    suspend fun insertStudent(dto: SupabaseStudentInsertDto): Student
+    suspend fun updateStudent(teacherId: String, studentId: String, request: UpdateStudentOnlineDto): Student
+    suspend fun softDeleteStudent(teacherId: String, studentId: String, deletedAtIso: String)
+}
 
-    fun clearCache() {
-        lastFetchTimeMs = 0L
-        _students.value = emptyList()
+class SupabaseStudentRemoteDataSource(
+    private val client: SupabaseClient = SupabaseClientProvider.client
+) : StudentRemoteDataSource {
+    override suspend fun fetchStudents(teacherId: String): List<Student> {
+        return client.postgrest["students"]
+            .select {
+                filter {
+                    eq("teacher_id", teacherId)
+                    exact("deleted_at", null)
+                }
+                order("created_at", order = Order.DESCENDING)
+            }
+            .decodeList<Student>()
     }
 
-    suspend fun fetchStudents(forceRefresh: Boolean = false): List<Student> = withContext(Dispatchers.IO) {
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: client.auth.currentUserOrNull()?.id
-        if (teacherId == null) {
-            _students.value = emptyList()
-            return@withContext emptyList()
-        }
+    override suspend fun fetchStudentById(teacherId: String, studentId: String): Student? {
+        return client.postgrest["students"]
+            .select {
+                filter {
+                    eq("id", studentId)
+                    eq("teacher_id", teacherId)
+                    exact("deleted_at", null)
+                }
+            }
+            .decodeSingleOrNull<Student>()
+    }
 
-        val now = System.currentTimeMillis()
-        if (!forceRefresh && now - lastFetchTimeMs < CACHE_TTL_MS && _students.value.isNotEmpty()) {
-            return@withContext _students.value
+    override suspend fun fetchStudentByCode(teacherId: String, studentCode: String): Student? {
+        return client.postgrest["students"]
+            .select {
+                filter {
+                    eq("teacher_id", teacherId)
+                    eq("student_code", studentCode)
+                    exact("deleted_at", null)
+                }
+            }
+            .decodeSingleOrNull<Student>()
+    }
+
+    override suspend fun insertStudent(dto: SupabaseStudentInsertDto): Student {
+        return client.postgrest["students"]
+            .insert(dto) {
+                select()
+            }
+            .decodeSingle<Student>()
+    }
+
+    override suspend fun updateStudent(
+        teacherId: String,
+        studentId: String,
+        request: UpdateStudentOnlineDto
+    ): Student {
+        return client.postgrest["students"]
+            .update(request) {
+                filter {
+                    eq("id", studentId)
+                    eq("teacher_id", teacherId)
+                    exact("deleted_at", null)
+                }
+                select()
+            }
+            .decodeSingle<Student>()
+    }
+
+    override suspend fun softDeleteStudent(teacherId: String, studentId: String, deletedAtIso: String) {
+        client.postgrest["students"]
+            .update(SoftDeleteStudentRequest(deletedAt = deletedAtIso)) {
+                filter {
+                    eq("id", studentId)
+                    eq("teacher_id", teacherId)
+                }
+            }
+    }
+}
+
+class SupabaseStudentRepository(
+    private val remoteDataSource: StudentRemoteDataSource = SupabaseStudentRemoteDataSource(),
+    private val teacherIdProvider: () -> String? = {
+        SupabaseClientProvider.mockTeacherId
+            ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+    },
+    private val sessionActiveChecker: (String) -> Boolean = { teacherId ->
+        AccountSessionManager.isSessionActive(teacherId)
+    },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+) : StudentRepository {
+
+    // In-memory session-only state scoped strictly to the active teacherId (never persisted to Room/SQLite).
+    private val _sessionStudents = MutableStateFlow<Pair<String?, List<Student>>>(null to emptyList())
+
+    private fun resolveActiveTeacherId(): String? {
+        val teacherId = teacherIdProvider()?.takeIf { it.isNotBlank() } ?: return null
+        return if (sessionActiveChecker(teacherId)) teacherId else null
+    }
+
+    fun clearCache() {
+        _sessionStudents.value = null to emptyList()
+    }
+
+    internal fun updateStudentInMemory(student: Student) {
+        val teacherId = resolveActiveTeacherId() ?: return
+        if (!student.teacherId.isNullOrBlank() && student.teacherId != teacherId) return
+
+        val (currentOwner, currentList) = _sessionStudents.value
+        if (currentOwner != teacherId) {
+            _sessionStudents.value = teacherId to listOf(student)
+            return
+        }
+        val mutable = currentList.toMutableList()
+        val idx = mutable.indexOfFirst { it.studentId == student.studentId }
+        if (idx >= 0) {
+            mutable[idx] = student
+        } else {
+            mutable.add(0, student)
+        }
+        _sessionStudents.value = teacherId to mutable
+    }
+
+    override suspend fun refreshStudents(): Result<List<Student>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
         }
 
         try {
-            val fetched = client.postgrest["students"]
-                .select {
-                    filter {
-                        eq("teacher_id", teacherId)
-                        exact("deleted_at", null)
-                    }
-                    order("created_at", order = Order.DESCENDING)
-                }
-                .decodeList<Student>()
+            val fetched = remoteDataSource.fetchStudents(teacherId)
 
-            // If session was terminated during network fetch, discard result immediately to prevent stale data re-injection
-            if (!com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                return@withContext emptyList()
+            // Reject late response if session changed or ended during flight
+            if (!sessionActiveChecker(teacherId) || teacherIdProvider() != teacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب بيانات الطلاب."))
             }
 
-            // Safe Offline Sync Reconciliation with Outbox protection inside Transaction
-            val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-            val cachedEntities = studentDao?.getAllStudentsSync(teacherId) ?: emptyList()
-            val localGroupMap = cachedEntities.associate { it.studentId to it.groupId }
-
-            val pendingOperations = outboxDao?.getUnsyncedOperationsForTeacher(teacherId) ?: emptyList()
-            val protectedStudentIds = pendingOperations
-                .filter { it.entityType.equals("STUDENT", ignoreCase = true) }
-                .map { it.entityId }
-                .toSet()
-
-            val fetchedIds = fetched.map { it.studentId }.toSet()
-
-            val entitiesToUpsert = fetched.map { s ->
-                val localGroupId = localGroupMap[s.studentId] ?: s.groupId
-                s.copy(groupId = localGroupId).toEntity()
+            val activeStudents = fetched.filter {
+                it.deletedAt == null && (it.teacherId.isNullOrBlank() || it.teacherId == teacherId)
             }
-
-            if (db != null) {
-                db.withTransaction {
-                    studentDao?.upsertStudents(entitiesToUpsert)
-                    for (cached in cachedEntities) {
-                        if (!fetchedIds.contains(cached.studentId) && !protectedStudentIds.contains(cached.studentId)) {
-                            studentDao?.deleteStudentById(teacherId, cached.studentId)
-                        }
-                    }
-                }
-            } else {
-                studentDao?.upsertStudents(entitiesToUpsert)
-                for (cached in cachedEntities) {
-                    if (!fetchedIds.contains(cached.studentId) && !protectedStudentIds.contains(cached.studentId)) {
-                        studentDao?.deleteStudentById(teacherId, cached.studentId)
-                    }
-                }
-            }
-
-            val mergedList = fetched.map { s ->
-                val localGroupId = localGroupMap[s.studentId] ?: s.groupId
-                s.copy(groupId = localGroupId)
-            }
-            lastFetchTimeMs = now
-            _students.value = mergedList
-            mergedList
+            _sessionStudents.value = teacherId to activeStudents
+            Result.success(activeStudents)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Network failure fallback: preserve local cache without modifying or deleting anything
-            val cachedEntities = studentDao?.getAllStudentsSync(teacherId) ?: emptyList()
-            val cached = if (cachedEntities.isNotEmpty()) cachedEntities.map { it.toDomain() } else _students.value
-            _students.value = cached
-            cached
+            if (_sessionStudents.value.first != teacherId) {
+                clearCache()
+            }
+            Log.e("SupabaseStudentRepo", "Online fetchStudents failed: ${e.message}", e)
+            Result.failure(e)
         }
+    }
+
+    suspend fun fetchStudents(forceRefresh: Boolean = true): List<Student> {
+        return refreshStudents().getOrDefault(emptyList())
     }
 
     override fun getStudents(): Flow<List<Student>> {
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: client.auth.currentUserOrNull()?.id ?: return _students.asStateFlow()
-
-        if (studentDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    try {
-                        fetchStudents()
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                studentDao.getAllStudents(teacherId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    _students.value = list
-                    send(list)
-                }
+        return _sessionStudents.map { (ownerId, list) ->
+            val activeTeacherId = resolveActiveTeacherId()
+            if (activeTeacherId == null || ownerId != activeTeacherId) {
+                emptyList()
+            } else {
+                list
             }
         }
-        return _students.asStateFlow()
     }
 
     override fun getStudentsByGrade(gradeId: String): Flow<List<Student>> {
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: client.auth.currentUserOrNull()?.id ?: return _students.map { list -> list.filter { it.gradeId == gradeId } }
-
-        if (studentDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    try {
-                        fetchStudents()
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                studentDao.getStudentsByGrade(gradeId, teacherId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
-            }
-        }
-        return _students.map { list ->
+        return getStudents().map { list ->
             list.filter { it.gradeId == gradeId }
         }
     }
 
-    override suspend fun getStudentById(studentId: String): Student? = withContext(Dispatchers.IO) {
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: client.auth.currentUserOrNull()?.id
-
-        if (teacherId != null) {
-            val cachedEntity = studentDao?.getStudentByIdSync(teacherId, studentId)
-            if (cachedEntity != null) {
-                return@withContext cachedEntity.toDomain()
-            }
-        }
+    override suspend fun fetchStudentById(studentId: String): Result<Student?> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
         try {
-            if (teacherId == null) return@withContext null
-
-            val student = client.postgrest["students"]
-                .select {
-                    filter {
-                        eq("id", studentId)
-                        eq("teacher_id", teacherId)
-                        exact("deleted_at", null)
-                    }
-                }
-                .decodeSingleOrNull<Student>()
-
-            if (student != null && com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                studentDao?.upsertStudent(student.toEntity())
+            val student = remoteDataSource.fetchStudentById(teacherId, studentId)
+            if (!sessionActiveChecker(teacherId) || teacherIdProvider() != teacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب بيانات الطالب."))
             }
-            student
+            if (student != null && student.deletedAt == null && (student.teacherId.isNullOrBlank() || student.teacherId == teacherId)) {
+                updateStudentInMemory(student)
+                Result.success(student)
+            } else {
+                Result.success(null)
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            _students.value.firstOrNull { it.studentId == studentId && (teacherId == null || it.teacherId == teacherId) }
+            Log.e("SupabaseStudentRepo", "Online fetchStudentById failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun getStudentByCode(studentCode: String): Student? = withContext(Dispatchers.IO) {
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: client.auth.currentUserOrNull()?.id ?: return@withContext null
-
-        val cachedEntity = studentDao?.getStudentByCode(teacherId, studentCode)
-        if (cachedEntity != null) {
-            return@withContext cachedEntity.toDomain()
-        }
-
-        try {
-            val student = client.postgrest["students"]
-                .select {
-                    filter {
-                        eq("teacher_id", teacherId)
-                        eq("student_code", studentCode)
-                        exact("deleted_at", null)
-                    }
-                }
-                .decodeSingleOrNull<Student>()
-
-            if (student != null && com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                studentDao?.upsertStudent(student.toEntity())
-            }
-            student
-        } catch (e: Exception) {
-            e.printStackTrace()
-            _students.value.firstOrNull { it.studentCode == studentCode && it.teacherId == teacherId }
-        }
+    override suspend fun getStudentById(studentId: String): Student? {
+        return fetchStudentById(studentId).getOrNull()
     }
 
-    private suspend fun generateSafeOfflineStudentCode(teacherId: String): String {
-        // Guaranteed collision-free:
-        // Prefixed with "ST-TMP-" to comply with "ST-" prefix conventions while
-        // remaining distinct from 5-digit server codes (ST-00001).
-        // Uses cryptographic random UUID and validates against Room and in-memory caches.
-        for (attempt in 0..20) {
-            val candidate = "ST-TMP-${UUID.randomUUID().toString().replace("-", "").take(6).uppercase()}"
-            val existsInRoom = studentDao?.getStudentByCode(teacherId, candidate) != null
-            val existsInMemory = _students.value.any { it.teacherId == teacherId && it.studentCode.equals(candidate, ignoreCase = true) }
-            if (!existsInRoom && !existsInMemory) {
-                return candidate
+    override suspend fun getStudentByCode(studentCode: String): Student? = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId() ?: return@withContext null
+        val normalized = studentCode.trim()
+        if (normalized.isEmpty()) return@withContext null
+
+        try {
+            val student = remoteDataSource.fetchStudentByCode(teacherId, normalized)
+            if (!sessionActiveChecker(teacherId) || teacherIdProvider() != teacherId) {
+                clearCache()
+                return@withContext null
             }
+            if (student != null && student.deletedAt == null && (student.teacherId.isNullOrBlank() || student.teacherId == teacherId)) {
+                updateStudentInMemory(student)
+                student
+            } else {
+                null
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseStudentRepo", "Online getStudentByCode failed: ${e.message}", e)
+            null
         }
-        return "ST-TMP-${System.nanoTime().toString().takeLast(8)}"
     }
 
     override suspend fun addStudent(
@@ -263,350 +263,115 @@ class SupabaseStudentRepository(
         parentPhone: String,
         hasWhatsApp: Boolean,
         alternativePhone: String?
-    ): Result<SyncResult<Student>> = withContext(Dispatchers.IO) {
-        Log.d("SyncDiag", "REPO ADD START: fullName=${fullName}, gradeId=${gradeId}")
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    ): Result<SyncResult<Student>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
             ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
         val generatedId = UUID.randomUUID().toString()
-        val offlineStudentCode = generateSafeOfflineStudentCode(teacherId)
-        val student = Student(
-            studentId = generatedId,
-            studentCode = offlineStudentCode,
-            fullName = fullName.trim(),
+        val dto = SupabaseStudentInsertDto(
+            id = generatedId,
+            teacherId = teacherId,
             gradeId = gradeId,
+            fullName = fullName.trim(),
             parentPhone = parentPhone.trim(),
             hasWhatsApp = hasWhatsApp,
-            alternativePhone = alternativePhone?.trim()?.ifBlank { null },
-            teacherId = teacherId
+            alternativePhone = alternativePhone?.trim()?.ifBlank { null }
         )
 
         try {
-            val dto = SupabaseStudentInsertDto(
-                id = generatedId,
-                teacherId = teacherId,
-                gradeId = gradeId,
-                fullName = fullName.trim(),
-                parentPhone = parentPhone.trim(),
-                hasWhatsApp = hasWhatsApp,
-                alternativePhone = alternativePhone?.trim()?.ifBlank { null }
-            )
+            val insertedStudent = remoteDataSource.insertStudent(dto)
 
-            val insertedStudent = client.postgrest["students"]
-                .insert(dto) {
-                    select()
-                }
-                .decodeSingle<Student>()
-
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                studentDao?.upsertStudent(insertedStudent.toEntity())
+            if (!sessionActiveChecker(teacherId) || teacherIdProvider() != teacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حفظ الطالب."))
             }
 
-            val currentList = _students.value.toMutableList()
-            currentList.add(0, insertedStudent)
-            _students.value = currentList
+            if (insertedStudent.studentCode.isBlank()) {
+                return@withContext Result.failure(IllegalStateException("لم يُرجع السيرفر كود الطالب بعد الإضافة."))
+            }
+
+            // Update in-memory state ONLY after server confirmation
+            val (currentOwner, currentList) = _sessionStudents.value
+            val baseList = if (currentOwner == teacherId) currentList else emptyList()
+            _sessionStudents.value = teacherId to (listOf(insertedStudent) + baseList.filterNot { it.studentId == insertedStudent.studentId })
 
             Result.success(SyncResult(insertedStudent, BatchSyncStatus.SAVED_TO_CLOUD))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            val isLocalFailure = e is android.database.sqlite.SQLiteException || e.stackTrace.any { it.className.contains("sqlite") || it.className.contains("room") }
-            if (isLocalFailure) {
-                return@withContext Result.failure(Exception("تم الحفظ على السيرفر ولكن فشل التحديث المحلي: ${e.message}"))
-            }
-
-            // Fallback to offline local write and Outbox queue
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            studentDao?.upsertStudent(student.toEntity())
-                            val request = InsertStudentRequest(
-                                id = generatedId,
-                                teacherId = teacherId,
-                                gradeId = gradeId,
-                                fullName = fullName.trim(),
-                                parentPhone = parentPhone.trim(),
-                                hasWhatsApp = hasWhatsApp,
-                                alternativePhone = alternativePhone?.trim()?.ifBlank { null }
-                            )
-                            val payload = Json.encodeToString(request)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "INSERT",
-                                    entityType = "STUDENT",
-                                    entityId = generatedId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        studentDao?.upsertStudent(student.toEntity())
-                        val request = InsertStudentRequest(
-                            id = generatedId,
-                            teacherId = teacherId,
-                            gradeId = gradeId,
-                            fullName = fullName.trim(),
-                            parentPhone = parentPhone.trim(),
-                            hasWhatsApp = hasWhatsApp,
-                            alternativePhone = alternativePhone?.trim()?.ifBlank { null }
-                        )
-                        val payload = Json.encodeToString(request)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "INSERT",
-                                entityType = "STUDENT",
-                                entityId = generatedId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر الحفظ محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                val currentList = _students.value.toMutableList()
-                currentList.add(0, student)
-                _students.value = currentList
-
-                Log.d("SyncDiag", "REPO ADD SUCCESS: id=${student.studentId}")
-                Result.success(SyncResult(student, BatchSyncStatus.QUEUED_OFFLINE))
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception(ex.message ?: "حدث خطأ أثناء إضافة الطالب."))
-            }
+            Log.e("SupabaseStudentRepo", "Online addStudent failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun updateStudent(student: Student): Result<Student> = withContext(Dispatchers.IO) {
-        Log.d("SyncDiag", "REPO UPDATE START: id=${student.studentId}, fullName=${student.fullName}")
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    override suspend fun updateStudent(student: Student): Result<Student> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
             ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
-        val studentWithTeacher = if (student.teacherId.isNullOrBlank()) student.copy(teacherId = teacherId) else student
-
-        // Ensure studentCode and groupId stability during updates
-        val existingEntity = studentDao?.getStudentByIdSync(teacherId, studentWithTeacher.studentId)
-        val preservedCode = if (studentWithTeacher.studentCode.isNotBlank()) {
-            studentWithTeacher.studentCode
-        } else {
-            existingEntity?.studentCode ?: ""
+        if (!student.teacherId.isNullOrBlank() && student.teacherId != teacherId) {
+            return@withContext Result.failure(SecurityException("غير مصرح بتعديل بيانات طالب تابع لحساب آخر."))
         }
-        val safeStudent = studentWithTeacher.copy(studentCode = preservedCode)
+
+        val request = UpdateStudentOnlineDto(
+            gradeId = student.gradeId,
+            fullName = student.fullName.trim(),
+            parentPhone = student.parentPhone.trim(),
+            hasWhatsApp = student.hasWhatsApp,
+            alternativePhone = student.alternativePhone?.trim()?.ifBlank { null },
+            groupId = student.groupId
+        )
 
         try {
-            val request = UpdateStudentRequest(
-                gradeId = safeStudent.gradeId,
-                fullName = safeStudent.fullName.trim(),
-                parentPhone = safeStudent.parentPhone.trim(),
-                hasWhatsApp = safeStudent.hasWhatsApp,
-                alternativePhone = safeStudent.alternativePhone?.trim()?.ifBlank { null },
-                groupId = safeStudent.groupId
-            )
+            val updatedFromServer = remoteDataSource.updateStudent(teacherId, student.studentId, request)
 
-            val updatedStudent = client.postgrest["students"]
-                .update(request) {
-                    filter {
-                        eq("id", safeStudent.studentId)
-                        eq("teacher_id", teacherId)
-                    }
-                    select()
-                }
-                .decodeSingle<Student>()
-
-            val reconciled = updatedStudent.copy(
-                studentCode = if (updatedStudent.studentCode.isNotBlank()) updatedStudent.studentCode else preservedCode,
-                groupId = existingEntity?.groupId ?: updatedStudent.groupId
-            )
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                studentDao?.upsertStudent(reconciled.toEntity())
+            if (!sessionActiveChecker(teacherId) || teacherIdProvider() != teacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تحديث بيانات الطالب."))
             }
 
-            val currentList = _students.value.toMutableList()
-            val index = currentList.indexOfFirst { it.studentId == safeStudent.studentId }
-            if (index >= 0) {
-                currentList[index] = reconciled
-                _students.value = currentList
+            val reconciled = if (updatedFromServer.studentCode.isBlank() && student.studentCode.isNotBlank()) {
+                updatedFromServer.copy(studentCode = student.studentCode)
+            } else {
+                updatedFromServer
             }
 
-            
-        Log.d("SyncDiag", "REPO UPDATE SUCCESS: id=${reconciled.studentId}")
-                Result.success(reconciled)
+            // Update in-memory state ONLY after server confirmation
+            updateStudentInMemory(reconciled)
+
+            Result.success(reconciled)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            studentDao?.upsertStudent(safeStudent.toEntity())
-                            val request = UpdateStudentRequest(
-                                gradeId = safeStudent.gradeId,
-                                fullName = safeStudent.fullName.trim(),
-                                parentPhone = safeStudent.parentPhone.trim(),
-                                hasWhatsApp = safeStudent.hasWhatsApp,
-                                alternativePhone = safeStudent.alternativePhone?.trim()?.ifBlank { null },
-                                groupId = safeStudent.groupId
-                            )
-                            val payload = Json.encodeToString(request)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "UPDATE",
-                                    entityType = "STUDENT",
-                                    entityId = safeStudent.studentId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        studentDao?.upsertStudent(safeStudent.toEntity())
-                        val request = UpdateStudentRequest(
-                            gradeId = safeStudent.gradeId,
-                            fullName = safeStudent.fullName.trim(),
-                            parentPhone = safeStudent.parentPhone.trim(),
-                            hasWhatsApp = safeStudent.hasWhatsApp,
-                            alternativePhone = safeStudent.alternativePhone?.trim()?.ifBlank { null },
-                            groupId = safeStudent.groupId
-                        )
-                        val payload = Json.encodeToString(request)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "UPDATE",
-                                entityType = "STUDENT",
-                                entityId = safeStudent.studentId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر الحفظ محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                val currentList = _students.value.toMutableList()
-                val index = currentList.indexOfFirst { it.studentId == safeStudent.studentId }
-                if (index >= 0) {
-                    currentList[index] = safeStudent
-                    _students.value = currentList
-                } else {
-                    currentList.add(0, safeStudent)
-                    _students.value = currentList
-                }
-
-                Result.success(safeStudent)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception(ex.message ?: "حدث خطأ أثناء تعديل بيانات الطالب."))
-            }
+            Log.e("SupabaseStudentRepo", "Online updateStudent failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun deleteStudent(studentId: String): Result<SyncResult<Unit>> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    override suspend fun deleteStudent(studentId: String): Result<SyncResult<Unit>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
             ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
         try {
-            val nowIso = java.time.OffsetDateTime.now().toString()
-            val request = SoftDeleteStudentRequest(deletedAt = nowIso)
+            val nowIso = OffsetDateTime.now().toString()
+            remoteDataSource.softDeleteStudent(teacherId, studentId, nowIso)
 
-            client.postgrest["students"]
-                .update(request) {
-                    filter {
-                        eq("id", studentId)
-                        eq("teacher_id", teacherId)
-                    }
-                }
+            if (!sessionActiveChecker(teacherId) || teacherIdProvider() != teacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حذف الطالب."))
+            }
 
-            studentDao?.deleteStudentById(teacherId, studentId)
-
-            _students.value = _students.value.filterNot { it.studentId == studentId }
+            // Remove from in-memory state ONLY after server confirmation
+            val (currentOwner, currentList) = _sessionStudents.value
+            if (currentOwner == teacherId) {
+                _sessionStudents.value = teacherId to currentList.filterNot { it.studentId == studentId }
+            }
 
             Result.success(SyncResult(Unit, BatchSyncStatus.SAVED_TO_CLOUD))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val deleted = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            studentDao?.deleteStudentById(teacherId, studentId)
-                            val nowIso = java.time.OffsetDateTime.now().toString()
-                            val request = SoftDeleteStudentRequest(deletedAt = nowIso)
-                            val payload = Json.encodeToString(request)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "DELETE",
-                                    entityType = "STUDENT",
-                                    entityId = studentId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        studentDao?.deleteStudentById(teacherId, studentId)
-                        val nowIso = java.time.OffsetDateTime.now().toString()
-                        val request = SoftDeleteStudentRequest(deletedAt = nowIso)
-                        val payload = Json.encodeToString(request)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "DELETE",
-                                entityType = "STUDENT",
-                                entityId = studentId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (deleted == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر الحذف محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                _students.value = _students.value.filterNot { it.studentId == studentId }
-
-                Result.success(SyncResult(Unit, BatchSyncStatus.QUEUED_OFFLINE))
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception(ex.message ?: "حدث خطأ أثناء حذف الطالب."))
-            }
+            Log.e("SupabaseStudentRepo", "Online deleteStudent failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
@@ -616,9 +381,9 @@ class SupabaseStudentRepository(
                 val matchesGrade = gradeId == null || student.gradeId == gradeId
                 val q = query.trim().lowercase()
                 val matchesQuery = q.isEmpty() ||
-                        student.fullName.lowercase().contains(q) ||
-                        student.studentCode.lowercase().contains(q) ||
-                        student.parentPhone.contains(q)
+                    student.fullName.lowercase().contains(q) ||
+                    student.studentCode.lowercase().contains(q) ||
+                    student.parentPhone.contains(q)
                 matchesGrade && matchesQuery
             }
         }

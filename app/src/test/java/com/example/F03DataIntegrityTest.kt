@@ -66,9 +66,36 @@ class F03DataIntegrityTest {
         outboxDao = db.outboxDao()
 
         com.example.data.SupabaseClientProvider.mockTeacherId = "teacher_test"
+        com.example.data.auth.AccountSessionManager.setActiveTeacherId("teacher_test")
         com.example.data.local.DatabaseProvider.setDatabase(db, context)
 
-        studentRepository = SupabaseStudentRepository(studentDao, outboxDao)
+        val studentRemote = object : StudentRemoteDataSource {
+            override suspend fun fetchStudents(teacherId: String) = emptyList<Student>()
+            override suspend fun fetchStudentById(teacherId: String, studentId: String): Student? = null
+            override suspend fun fetchStudentByCode(teacherId: String, studentCode: String): Student? = null
+            override suspend fun insertStudent(dto: SupabaseStudentInsertDto): Student {
+                return Student(
+                    studentId = dto.id,
+                    studentCode = "ST-00001",
+                    fullName = dto.fullName,
+                    gradeId = dto.gradeId,
+                    parentPhone = dto.parentPhone,
+                    hasWhatsApp = dto.hasWhatsApp,
+                    alternativePhone = dto.alternativePhone,
+                    teacherId = dto.teacherId
+                )
+            }
+            override suspend fun updateStudent(teacherId: String, studentId: String, request: UpdateStudentOnlineDto): Student {
+                error("not used")
+            }
+            override suspend fun softDeleteStudent(teacherId: String, studentId: String, deletedAtIso: String) {}
+        }
+
+        studentRepository = SupabaseStudentRepository(
+            remoteDataSource = studentRemote,
+            teacherIdProvider = { "teacher_test" },
+            sessionActiveChecker = { true }
+        )
         recitationRepository = SupabaseRecitationRepository(recitationDao, outboxDao)
         attendanceRepository = SupabaseAttendanceRepository(attendanceDao, outboxDao, appDatabase = db)
         examRepository = SupabaseExamRepository(examDao, outboxDao)
@@ -80,13 +107,13 @@ class F03DataIntegrityTest {
     fun tearDown() {
         db.close()
         com.example.data.local.DatabaseProvider.resetForTesting()
+        com.example.data.auth.AccountSessionManager.setActiveTeacherId(null)
         com.example.data.SupabaseClientProvider.mockTeacherId = null
         Dispatchers.resetMain()
     }
 
     @Test
-    fun testSameIdReusedAfterRetry_andOfflineStudentSyncIdempotency() = runBlocking {
-        // F03-01: ID must be generated once and reused on retry
+    fun testOnlineStudentCreation_returnsServerCodeWithoutRoomOrOutbox() = runBlocking {
         val result = studentRepository.addStudent(
             fullName = "Idempotent Student",
             gradeId = "grade_test",
@@ -96,20 +123,15 @@ class F03DataIntegrityTest {
         )
 
         assertTrue(result.isSuccess)
-        val student = result.getOrNull()?.data
+        val syncResult = result.getOrNull()
+        assertEquals(BatchSyncStatus.SAVED_TO_CLOUD, syncResult?.syncStatus)
+        val student = syncResult?.data
         assertNotNull(student)
-        val firstId = student!!.studentId
+        assertEquals("ST-00001", student?.studentCode)
 
-        // Verify Room
-        val cached = studentDao.getStudentByIdSync("teacher_test", firstId)
-        assertNotNull(cached)
-        assertEquals(firstId, cached?.studentId)
-
-        // Verify Outbox
-        val pending = outboxDao.getPendingOperations()
-        assertEquals(1, pending.size)
-        assertEquals(firstId, pending[0].entityId)
-        assertEquals("INSERT", pending[0].operationType)
+        // Online-Only Phase 1: Room & Outbox remain completely empty for Students
+        assertTrue(studentDao.getAllStudentsSync("teacher_test").isEmpty())
+        assertTrue(outboxDao.getPendingOperations().isEmpty())
     }
 
     @Test

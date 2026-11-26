@@ -1,331 +1,376 @@
 package com.example.data.repository
 
+import android.util.Log
 import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Exam
 import com.example.core.model.ExamSummary
 import com.example.core.model.SupabaseExamDto
 import com.example.core.model.SyncResult
 import com.example.data.SupabaseClientProvider
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.ExamDao
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.entity.OutboxEntity
-import com.example.data.local.mapper.toDomain
-import com.example.data.local.mapper.toEntity
-import com.example.data.sync.OutboxSyncScheduler
-import androidx.room.withTransaction
+import com.example.data.auth.AccountSessionManager
 import com.example.util.DateUtils
+import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.query.Count
 import io.github.jan.supabase.postgrest.query.Order
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
+interface ExamRemoteDataSource {
+    suspend fun fetchExamsForStudent(teacherId: String, studentId: String): List<Exam>
+    suspend fun fetchExamsForStudentByMonth(
+        teacherId: String,
+        studentId: String,
+        startDate: String,
+        endDate: String
+    ): List<Exam>
+    suspend fun fetchExamsCountThisMonth(teacherId: String, startDate: String, endDate: String): Int
+    suspend fun fetchAllExamsForTeacher(teacherId: String): List<Exam>
+    suspend fun insertExam(dto: SupabaseExamDto): Exam
+    suspend fun updateExam(teacherId: String, dto: SupabaseExamDto): Exam
+    suspend fun deleteExam(teacherId: String, examId: String)
+    suspend fun fetchExamById(teacherId: String, examId: String): Exam?
+}
+
+class SupabaseExamRemoteDataSource(
+    private val client: SupabaseClient = SupabaseClientProvider.client
+) : ExamRemoteDataSource {
+
+    override suspend fun fetchExamsForStudent(teacherId: String, studentId: String): List<Exam> {
+        return client.postgrest["exams"]
+            .select {
+                filter {
+                    eq("student_id", studentId)
+                    eq("teacher_id", teacherId)
+                }
+                order("date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseExamDto>()
+            .map { it.toExam(teacherId = teacherId) }
+    }
+
+    override suspend fun fetchExamsForStudentByMonth(
+        teacherId: String,
+        studentId: String,
+        startDate: String,
+        endDate: String
+    ): List<Exam> {
+        return client.postgrest["exams"]
+            .select {
+                filter {
+                    eq("student_id", studentId)
+                    eq("teacher_id", teacherId)
+                    gte("date", startDate)
+                    lte("date", endDate)
+                }
+                order("date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseExamDto>()
+            .map { it.toExam(teacherId = teacherId) }
+    }
+
+    override suspend fun fetchExamsCountThisMonth(
+        teacherId: String,
+        startDate: String,
+        endDate: String
+    ): Int {
+        val result = client.postgrest["exams"].select {
+            head = true
+            count(Count.EXACT)
+            filter {
+                eq("teacher_id", teacherId)
+                gte("date", startDate)
+                lte("date", endDate)
+            }
+        }
+        return result.countOrNull()?.toInt() ?: 0
+    }
+
+    override suspend fun fetchAllExamsForTeacher(teacherId: String): List<Exam> {
+        return client.postgrest["exams"]
+            .select {
+                filter { eq("teacher_id", teacherId) }
+                order("date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseExamDto>()
+            .map { it.toExam(teacherId = teacherId) }
+    }
+
+    override suspend fun insertExam(dto: SupabaseExamDto): Exam {
+        val inserted = client.postgrest["exams"]
+            .insert(dto) { select() }
+            .decodeSingle<SupabaseExamDto>()
+        return inserted.toExam(teacherId = dto.teacherId ?: "")
+    }
+
+    override suspend fun updateExam(teacherId: String, dto: SupabaseExamDto): Exam {
+        val updated = client.postgrest["exams"]
+            .update(dto) {
+                filter {
+                    eq("id", dto.id ?: "")
+                    eq("teacher_id", teacherId)
+                }
+                select()
+            }
+            .decodeSingle<SupabaseExamDto>()
+        return updated.toExam(teacherId = teacherId)
+    }
+
+    override suspend fun deleteExam(teacherId: String, examId: String) {
+        client.postgrest["exams"].delete {
+            filter {
+                eq("id", examId)
+                eq("teacher_id", teacherId)
+            }
+        }
+    }
+
+    override suspend fun fetchExamById(teacherId: String, examId: String): Exam? {
+        return client.postgrest["exams"]
+            .select {
+                filter {
+                    eq("id", examId)
+                    eq("teacher_id", teacherId)
+                }
+            }
+            .decodeSingleOrNull<SupabaseExamDto>()
+            ?.toExam(teacherId = teacherId)
+    }
+}
+
 class SupabaseExamRepository(
-    private val examDao: ExamDao? = try { DatabaseProvider.getDatabase().examDao() } catch (_: Exception) { null },
-    private val outboxDao: OutboxDao? = try { DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null }
+    private val remoteDataSource: ExamRemoteDataSource = SupabaseExamRemoteDataSource(),
+    private val teacherIdProvider: () -> String? = {
+        SupabaseClientProvider.mockTeacherId
+            ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+    },
+    private val sessionActiveChecker: (String) -> Boolean = { teacherId ->
+        AccountSessionManager.isSessionActive(teacherId)
+    },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : ExamRepository {
-    private val client = SupabaseClientProvider.client
 
-    private suspend fun fetchAndCacheExamsForStudent(studentId: String) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return
-        try {
-            val list = client.postgrest["exams"]
-                .select {
-                    filter {
-                        eq("student_id", studentId)
-                        eq("teacher_id", teacherId)
-                    }
-                    order("date", order = Order.DESCENDING)
-                }
-                .decodeList<SupabaseExamDto>()
-                .map { it.toExam(teacherId = teacherId) }
+    private val _sessionExams = MutableStateFlow<Pair<String?, List<Exam>>>(null to emptyList())
 
-            if (!com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) return
-            examDao?.upsertExams(list.map { it.toEntity() })
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            e.printStackTrace()
-        }
+    private fun resolveActiveTeacherId(): String? {
+        val teacherId = teacherIdProvider()?.takeIf { it.isNotBlank() } ?: return null
+        return if (sessionActiveChecker(teacherId)) teacherId else null
     }
 
-    private suspend fun fetchAndCacheExamsByMonth(studentId: String, startDate: String, endDate: String) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return
-        try {
-            val list = client.postgrest["exams"]
-                .select {
-                    filter {
-                        eq("student_id", studentId)
-                        eq("teacher_id", teacherId)
-                        gte("date", startDate)
-                        lte("date", endDate)
-                    }
-                    order("date", order = Order.DESCENDING)
-                }
-                .decodeList<SupabaseExamDto>()
-                .map { it.toExam(teacherId = teacherId) }
+    private fun isStillAuthorized(teacherId: String): Boolean =
+        sessionActiveChecker(teacherId) && teacherIdProvider() == teacherId
 
-            if (!com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) return
-            examDao?.upsertExams(list.map { it.toEntity() })
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            e.printStackTrace()
-        }
+    fun clearCache() {
+        _sessionExams.value = null to emptyList()
     }
 
-    override fun getExamsForStudent(studentId: String): Flow<List<Exam>> {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    private fun replaceScopedExamsInMemory(
+        teacherId: String,
+        fetched: List<Exam>,
+        predicateToReplace: (Exam) -> Boolean
+    ) {
+        val (owner, current) = _sessionExams.value
+        val base = if (owner == teacherId) current.filterNot(predicateToReplace) else emptyList()
+        val combined = (fetched + base).distinctBy { it.examId }.sortedByDescending { it.date }
+        _sessionExams.value = teacherId to combined
+    }
 
-        if (teacherId != null && examDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    fetchAndCacheExamsForStudent(studentId)
-                }
-                examDao.getExamsByStudent(teacherId, studentId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
-            }
+    private fun upsertExamInMemory(teacherId: String, exam: Exam) {
+        val (owner, current) = _sessionExams.value
+        val base = if (owner == teacherId) current else emptyList()
+        _sessionExams.value = teacherId to (listOf(exam) + base.filterNot { it.examId == exam.examId })
+            .sortedByDescending { it.date }
+    }
+
+    override fun getExamsForStudent(studentId: String): Flow<List<Exam>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
-            }
+        launch(ioDispatcher) {
             try {
-                val list = client.postgrest["exams"]
-                    .select {
-                        filter {
-                            eq("student_id", studentId)
-                            eq("teacher_id", teacherId)
-                        }
-                        order("date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseExamDto>()
-                    .map { it.toExam(teacherId = teacherId) }
-                emit(list)
+                val list = remoteDataSource.fetchExamsForStudent(teacherId, studentId)
+                if (!isStillAuthorized(teacherId)) {
+                    clearCache()
+                    return@launch
+                }
+                replaceScopedExamsInMemory(teacherId, list) { it.studentId == studentId }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
+                Log.e("SupabaseExamRepo", "getExamsForStudent failed: ${e.message}", e)
             }
-        }.flowOn(Dispatchers.IO)
-    }
+        }
+
+        _sessionExams
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList()
+                else list.filter { it.studentId == studentId }.sortedByDescending { it.date }
+            }
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
 
     override fun getExamsForStudentByMonth(
         studentId: String,
         year: Int,
         month: Int
-    ): Flow<List<Exam>> {
+    ): Flow<List<Exam>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
+        }
+
         val dateRange = DateUtils.getMonthDateRange(year, month)
         val startDate = dateRange.startDate
         val endDate = dateRange.endDate
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
 
-        if (teacherId != null && examDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    fetchAndCacheExamsByMonth(studentId, startDate, endDate)
-                }
-                examDao.getExamsByStudentAndRange(teacherId, studentId, startDate, endDate).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
-            }
+        launch(ioDispatcher) {
+            fetchExamsForStudentByMonthResult(studentId, year, month)
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
+        _sessionExams
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList()
+                else list.filter { it.studentId == studentId && it.date in startDate..endDate }
+                    .sortedByDescending { it.date }
             }
-            try {
-                val list = client.postgrest["exams"]
-                    .select {
-                        filter {
-                            eq("student_id", studentId)
-                            eq("teacher_id", teacherId)
-                            gte("date", startDate)
-                            lte("date", endDate)
-                        }
-                        order("date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseExamDto>()
-                    .map { it.toExam(teacherId = teacherId) }
-                emit(list)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
+
+    override suspend fun fetchExamsForStudentByMonthResult(
+        studentId: String,
+        year: Int,
+        month: Int
+    ): Result<List<Exam>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
+
+        val dateRange = DateUtils.getMonthDateRange(year, month)
+        val startDate = dateRange.startDate
+        val endDate = dateRange.endDate
+
+        try {
+            val list = remoteDataSource.fetchExamsForStudentByMonth(teacherId, studentId, startDate, endDate)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب الامتحانات."))
             }
-        }.flowOn(Dispatchers.IO)
+            replaceScopedExamsInMemory(teacherId, list) {
+                it.studentId == studentId && it.date in startDate..endDate
+            }
+            Result.success(list)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseExamRepo", "fetchExamsForStudentByMonthResult failed: ${e.message}", e)
+            Result.failure(e)
+        }
     }
 
     override suspend fun getExamSummaryForStudent(
         studentId: String,
         year: Int,
         month: Int
-    ): ExamSummary = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext ExamSummary()
-        val dateRange = DateUtils.getMonthDateRange(year, month)
-        val startDate = dateRange.startDate
-        val endDate = dateRange.endDate
+    ): ExamSummary {
+        val list = fetchExamsForStudentByMonthResult(studentId, year, month).getOrNull() ?: emptyList()
+        if (list.isEmpty()) return ExamSummary()
 
-        try {
-            val list = client.postgrest["exams"]
-                .select {
-                    filter {
-                        eq("student_id", studentId)
-                        eq("teacher_id", teacherId)
-                        gte("date", startDate)
-                        lte("date", endDate)
-                    }
-                }
-                .decodeList<SupabaseExamDto>()
-                .map { it.toExam(teacherId = teacherId) }
+        val totalCount = list.size
+        val avgScore = list.map { it.score }.average()
+        val percentages = list.map { if (it.maxScore > 0) (it.score / it.maxScore) * 100.0 else 0.0 }
+        val avgPct = percentages.average().toFloat()
+        val highestPct = percentages.maxOrNull()?.toFloat() ?: 0f
+        val lowestPct = percentages.minOrNull()?.toFloat() ?: 0f
 
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                examDao?.upsertExams(list.map { it.toEntity() })
-            }
-
-            if (list.isEmpty()) return@withContext ExamSummary()
-
-            val totalCount = list.size
-            val avgScore = list.map { it.score }.average()
-            val percentages = list.map { (it.score / it.maxScore) * 100.0 }
-            val avgPct = percentages.average().toFloat()
-            val highestPct = percentages.maxOrNull()?.toFloat() ?: 0f
-            val lowestPct = percentages.minOrNull()?.toFloat() ?: 0f
-
-            ExamSummary(
-                totalCount = totalCount,
-                averageScore = avgScore,
-                averagePercentage = avgPct,
-                highestPercentage = highestPct,
-                lowestPercentage = lowestPct
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-            val cachedEntities = examDao?.getExamsByStudentSync(teacherId, studentId)?.filter {
-                it.date >= startDate && it.date <= endDate
-            } ?: emptyList()
-
-            val list = cachedEntities.map { it.toDomain() }
-            if (list.isEmpty()) return@withContext ExamSummary()
-
-            val totalCount = list.size
-            val avgScore = list.map { it.score }.average()
-            val percentages = list.map { (it.score / it.maxScore) * 100.0 }
-            val avgPct = percentages.average().toFloat()
-            val highestPct = percentages.maxOrNull()?.toFloat() ?: 0f
-            val lowestPct = percentages.minOrNull()?.toFloat() ?: 0f
-
-            ExamSummary(
-                totalCount = totalCount,
-                averageScore = avgScore,
-                averagePercentage = avgPct,
-                highestPercentage = highestPct,
-                lowestPercentage = lowestPct
-            )
-        }
+        return ExamSummary(
+            totalCount = totalCount,
+            averageScore = avgScore,
+            averagePercentage = avgPct,
+            highestPercentage = highestPct,
+            lowestPercentage = lowestPct
+        )
     }
 
-    override suspend fun getExamsCountThisMonth(year: Int, month: Int): Int = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext 0
+    override suspend fun fetchExamsCountThisMonthResult(year: Int, month: Int): Result<Int> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
+
         try {
             val dateRange = DateUtils.getMonthDateRange(year, month)
-            val startDate = dateRange.startDate
-            val endDate = dateRange.endDate
-
-            val result = client.postgrest["exams"]
-                .select {
-                    head = true
-                    count(Count.EXACT)
-                    filter {
-                        eq("teacher_id", teacherId)
-                        gte("date", startDate)
-                        lte("date", endDate)
-                    }
-                }
-
-            result.countOrNull()?.toInt() ?: 0
+            val count = remoteDataSource.fetchExamsCountThisMonth(teacherId, dateRange.startDate, dateRange.endDate)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة."))
+            }
+            Result.success(count)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            0
+            Log.e("SupabaseExamRepo", "fetchExamsCountThisMonthResult failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override fun getAllExamsForTeacher(): Flow<List<Exam>> {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    override suspend fun getExamsCountThisMonth(year: Int, month: Int): Int {
+        return fetchExamsCountThisMonthResult(year, month).getOrDefault(0)
+    }
 
-        if (teacherId != null && examDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    try {
-                        val list = client.postgrest["exams"]
-                            .select {
-                                filter {
-                                    eq("teacher_id", teacherId)
-                                }
-                                order("date", order = Order.DESCENDING)
-                            }
-                            .decodeList<SupabaseExamDto>()
-                            .map { it.toExam(teacherId = teacherId) }
+    override suspend fun refreshAllExamsForTeacher(): Result<List<Exam>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
-                        if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                            examDao.upsertExams(list.map { it.toEntity() })
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                examDao.getAllExamsByTeacher(teacherId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
+        try {
+            val list = remoteDataSource.fetchAllExamsForTeacher(teacherId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب الامتحانات."))
             }
+            _sessionExams.value = teacherId to list.sortedByDescending { it.date }
+            Result.success(list)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseExamRepo", "refreshAllExamsForTeacher failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override fun getAllExamsForTeacher(): Flow<List<Exam>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
+        launch(ioDispatcher) {
+            refreshAllExamsForTeacher()
+        }
+
+        _sessionExams
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList() else list
             }
-            try {
-                val list = client.postgrest["exams"]
-                    .select {
-                        filter {
-                            eq("teacher_id", teacherId)
-                        }
-                        order("date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseExamDto>()
-                    .map { it.toExam(teacherId = teacherId) }
-                emit(list)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
-            }
-        }.flowOn(Dispatchers.IO)
-    }
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
 
     override suspend fun addExam(
         studentId: String,
@@ -335,302 +380,138 @@ class SupabaseExamRepository(
         score: Double,
         maxScore: Double,
         note: String?
-    ): Result<SyncResult<Exam>> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
-            ?: return@withContext Result.failure(Exception("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
+    ): Result<SyncResult<Exam>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
 
-        val generatedId = UUID.randomUUID().toString()
+        if (examName.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("اسم الامتحان مطلوب"))
+        }
+        if (maxScore <= 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة الكاملة يجب أن تكون أكبر من صفر"))
+        }
+        if (score < 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون سالبة"))
+        }
+        if (score > maxScore) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون أكبر من الدرجة الكاملة"))
+        }
+
         val dto = SupabaseExamDto(
-            id = generatedId,
+            id = UUID.randomUUID().toString(),
             teacherId = teacherId,
             studentId = studentId,
-            date = date,
-            examName = examName,
-            subject = subject,
+            date = date.trim(),
+            examName = examName.trim(),
+            subject = subject?.trim()?.ifBlank { null },
             score = score,
             maxScore = maxScore,
-            note = note
+            note = note?.trim()?.ifBlank { null }
         )
 
         try {
-            val inserted = client.postgrest["exams"]
-                .insert(dto) {
-                    select()
-                }
-                .decodeSingle<SupabaseExamDto>()
-
-            val exam = inserted.toExam(teacherId = teacherId)
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                examDao?.upsertSingleExam(exam.toEntity())
+            val exam = remoteDataSource.insertExam(dto)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حفظ الامتحان."))
             }
-
+            upsertExamInMemory(teacherId, exam)
             Result.success(SyncResult(exam, BatchSyncStatus.SAVED_TO_CLOUD))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            val isLocalFailure = e is android.database.sqlite.SQLiteException || e.stackTrace.any { it.className.contains("sqlite") || it.className.contains("room") }
-            if (isLocalFailure) {
-                return@withContext Result.failure(Exception("تم إضافة الامتحان على السيرفر ولكن فشل التحديث المحلي: ${e.message}"))
-            }
-
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val exam = dto.toExam(teacherId = teacherId)
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            examDao?.upsertSingleExam(exam.toEntity())
-                            val payload = kotlinx.serialization.json.Json.encodeToString(dto)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "INSERT",
-                                    entityType = "EXAM",
-                                    entityId = generatedId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        examDao?.upsertSingleExam(exam.toEntity())
-                        val payload = kotlinx.serialization.json.Json.encodeToString(dto)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "INSERT",
-                                entityType = "EXAM",
-                                entityId = generatedId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر إضافة الامتحان محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                Result.success(SyncResult(exam, BatchSyncStatus.QUEUED_OFFLINE))
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل إضافة الامتحان: ${ex.message}"))
-            }
+            Log.e("SupabaseExamRepo", "addExam failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun updateExam(exam: Exam): Result<Exam> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
-            ?: return@withContext Result.failure(Exception("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
+    override suspend fun updateExam(exam: Exam): Result<Exam> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
+
+        if (exam.teacherId.isNotBlank() && exam.teacherId != teacherId) {
+            return@withContext Result.failure(SecurityException("غير مصرح بتعديل امتحان تابع لحساب آخر."))
+        }
+        if (exam.examName.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("اسم الامتحان مطلوب"))
+        }
+        if (exam.maxScore <= 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة الكاملة يجب أن تكون أكبر من صفر"))
+        }
+        if (exam.score < 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون سالبة"))
+        }
+        if (exam.score > exam.maxScore) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون أكبر من الدرجة الكاملة"))
+        }
+
+        val dto = SupabaseExamDto(
+            id = exam.examId,
+            teacherId = teacherId,
+            studentId = exam.studentId,
+            date = exam.date.trim(),
+            examName = exam.examName.trim(),
+            subject = exam.subject?.trim()?.ifBlank { null },
+            score = exam.score,
+            maxScore = exam.maxScore,
+            note = exam.note?.trim()?.ifBlank { null }
+        )
 
         try {
-            val dto = SupabaseExamDto(
-                id = exam.examId,
-                teacherId = teacherId,
-                studentId = exam.studentId,
-                date = exam.date,
-                examName = exam.examName,
-                subject = exam.subject,
-                score = exam.score,
-                maxScore = exam.maxScore,
-                note = exam.note
-            )
-            val updated = client.postgrest["exams"].update(dto) {
-                filter {
-                    eq("id", exam.examId)
-                    eq("teacher_id", teacherId)
-                }
-                select()
-            }.decodeSingle<SupabaseExamDto>()
-
-            val result = updated.toExam(teacherId = teacherId)
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                examDao?.upsertSingleExam(result.toEntity())
+            val updated = remoteDataSource.updateExam(teacherId, dto)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تعديل الامتحان."))
             }
-
-            Result.success(result)
+            upsertExamInMemory(teacherId, updated)
+            Result.success(updated)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val examWithTeacher = exam.copy(teacherId = teacherId)
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            examDao?.upsertSingleExam(examWithTeacher.toEntity())
-                            val dto = SupabaseExamDto(
-                                id = exam.examId,
-                                teacherId = teacherId,
-                                studentId = exam.studentId,
-                                date = exam.date,
-                                examName = exam.examName,
-                                subject = exam.subject,
-                                score = exam.score,
-                                maxScore = exam.maxScore,
-                                note = exam.note
-                            )
-                            val payload = kotlinx.serialization.json.Json.encodeToString(dto)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "UPDATE",
-                                    entityType = "EXAM",
-                                    entityId = exam.examId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        examDao?.upsertSingleExam(examWithTeacher.toEntity())
-                        val dto = SupabaseExamDto(
-                            id = exam.examId,
-                            teacherId = teacherId,
-                            studentId = exam.studentId,
-                            date = exam.date,
-                            examName = exam.examName,
-                            subject = exam.subject,
-                            score = exam.score,
-                            maxScore = exam.maxScore,
-                            note = exam.note
-                        )
-                        val payload = kotlinx.serialization.json.Json.encodeToString(dto)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "UPDATE",
-                                entityType = "EXAM",
-                                entityId = exam.examId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر تعديل الامتحان محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                Result.success(examWithTeacher)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل تعديل الامتحان: ${ex.message}"))
-            }
+            Log.e("SupabaseExamRepo", "updateExam failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun deleteExam(examId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
-            ?: return@withContext Result.failure(Exception("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
+    override suspend fun deleteExam(examId: String): Result<Unit> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
 
         try {
-            client.postgrest["exams"].delete {
-                filter {
-                    eq("id", examId)
-                    eq("teacher_id", teacherId)
-                }
+            remoteDataSource.deleteExam(teacherId, examId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حذف الامتحان."))
             }
-            examDao?.deleteById(teacherId, examId)
+            val (owner, current) = _sessionExams.value
+            if (owner == teacherId) {
+                _sessionExams.value = teacherId to current.filterNot { it.examId == examId }
+            }
             Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val deleted = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            examDao?.deleteById(teacherId, examId)
-                            val payload = "{\"id\":\"$examId\"}"
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "DELETE",
-                                    entityType = "EXAM",
-                                    entityId = examId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        examDao?.deleteById(teacherId, examId)
-                        val payload = "{\"id\":\"$examId\"}"
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "DELETE",
-                                entityType = "EXAM",
-                                entityId = examId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (deleted == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر حذف الامتحان محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                Result.success(Unit)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل حذف الامتحان: ${ex.message}"))
-            }
+            Log.e("SupabaseExamRepo", "deleteExam failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun getExamById(examId: String): Exam? = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext null
-
-        val cached = examDao?.getExamByIdSync(teacherId, examId)
-        if (cached != null) {
-            return@withContext cached.toDomain()
-        }
-
+    override suspend fun getExamById(examId: String): Exam? = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId() ?: return@withContext null
         try {
-            val dto = client.postgrest["exams"]
-                .select {
-                    filter {
-                        eq("id", examId)
-                        eq("teacher_id", teacherId)
-                    }
-                }
-                .decodeSingleOrNull<SupabaseExamDto>()
-
-            val exam = dto?.toExam(teacherId = teacherId)
-            if (exam != null && com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                examDao?.upsertSingleExam(exam.toEntity())
+            val exam = remoteDataSource.fetchExamById(teacherId, examId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext null
+            }
+            if (exam != null) {
+                upsertExamInMemory(teacherId, exam)
             }
             exam
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseExamRepo", "getExamById failed: ${e.message}", e)
             null
         }
     }

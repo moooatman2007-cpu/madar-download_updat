@@ -1,327 +1,374 @@
 package com.example.data.repository
 
+import android.util.Log
 import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Recitation
 import com.example.core.model.RecitationSummary
-import com.example.core.model.SyncResult
 import com.example.core.model.SupabaseRecitationDto
+import com.example.core.model.SyncResult
 import com.example.data.SupabaseClientProvider
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.dao.RecitationDao
-import com.example.data.local.entity.OutboxEntity
-import com.example.data.local.mapper.toDomain
-import com.example.data.local.mapper.toEntity
-import com.example.data.sync.OutboxSyncScheduler
-import androidx.room.withTransaction
+import com.example.data.auth.AccountSessionManager
 import com.example.util.DateUtils
+import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.query.Count
 import io.github.jan.supabase.postgrest.query.Order
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 import java.util.UUID
 
+interface RecitationRemoteDataSource {
+    suspend fun fetchRecitationsForStudent(teacherId: String, studentId: String): List<Recitation>
+    suspend fun fetchRecitationsForStudentByMonth(
+        teacherId: String,
+        studentId: String,
+        startDate: String,
+        endDate: String
+    ): List<Recitation>
+    suspend fun fetchRecitationsCountThisMonth(teacherId: String, startDate: String, endDate: String): Int
+    suspend fun fetchAllRecitationsForTeacher(teacherId: String): List<Recitation>
+    suspend fun insertRecitation(dto: SupabaseRecitationDto): Recitation
+    suspend fun updateRecitation(teacherId: String, dto: SupabaseRecitationDto): Recitation
+    suspend fun deleteRecitation(teacherId: String, recitationId: String)
+    suspend fun fetchRecitationById(teacherId: String, recitationId: String): Recitation?
+}
+
+class SupabaseRecitationRemoteDataSource(
+    private val client: SupabaseClient = SupabaseClientProvider.client
+) : RecitationRemoteDataSource {
+
+    override suspend fun fetchRecitationsForStudent(teacherId: String, studentId: String): List<Recitation> {
+        return client.postgrest["recitations"]
+            .select {
+                filter {
+                    eq("student_id", studentId)
+                    eq("teacher_id", teacherId)
+                }
+                order("date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseRecitationDto>()
+            .map { it.toRecitation(teacherId = teacherId) }
+    }
+
+    override suspend fun fetchRecitationsForStudentByMonth(
+        teacherId: String,
+        studentId: String,
+        startDate: String,
+        endDate: String
+    ): List<Recitation> {
+        return client.postgrest["recitations"]
+            .select {
+                filter {
+                    eq("student_id", studentId)
+                    eq("teacher_id", teacherId)
+                    gte("date", startDate)
+                    lte("date", endDate)
+                }
+                order("date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseRecitationDto>()
+            .map { it.toRecitation(teacherId = teacherId) }
+    }
+
+    override suspend fun fetchRecitationsCountThisMonth(
+        teacherId: String,
+        startDate: String,
+        endDate: String
+    ): Int {
+        val result = client.postgrest["recitations"].select {
+            head = true
+            count(Count.EXACT)
+            filter {
+                eq("teacher_id", teacherId)
+                gte("date", startDate)
+                lte("date", endDate)
+            }
+        }
+        return result.countOrNull()?.toInt() ?: 0
+    }
+
+    override suspend fun fetchAllRecitationsForTeacher(teacherId: String): List<Recitation> {
+        return client.postgrest["recitations"]
+            .select {
+                filter { eq("teacher_id", teacherId) }
+                order("date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseRecitationDto>()
+            .map { it.toRecitation(teacherId = teacherId) }
+    }
+
+    override suspend fun insertRecitation(dto: SupabaseRecitationDto): Recitation {
+        val inserted = client.postgrest["recitations"]
+            .insert(dto) { select() }
+            .decodeSingle<SupabaseRecitationDto>()
+        return inserted.toRecitation(teacherId = dto.teacherId ?: "")
+    }
+
+    override suspend fun updateRecitation(teacherId: String, dto: SupabaseRecitationDto): Recitation {
+        val updated = client.postgrest["recitations"]
+            .update(dto) {
+                filter {
+                    eq("id", dto.id ?: "")
+                    eq("teacher_id", teacherId)
+                }
+                select()
+            }
+            .decodeSingle<SupabaseRecitationDto>()
+        return updated.toRecitation(teacherId = teacherId)
+    }
+
+    override suspend fun deleteRecitation(teacherId: String, recitationId: String) {
+        client.postgrest["recitations"].delete {
+            filter {
+                eq("id", recitationId)
+                eq("teacher_id", teacherId)
+            }
+        }
+    }
+
+    override suspend fun fetchRecitationById(teacherId: String, recitationId: String): Recitation? {
+        return client.postgrest["recitations"]
+            .select {
+                filter {
+                    eq("id", recitationId)
+                    eq("teacher_id", teacherId)
+                }
+            }
+            .decodeSingleOrNull<SupabaseRecitationDto>()
+            ?.toRecitation(teacherId = teacherId)
+    }
+}
+
 class SupabaseRecitationRepository(
-    private val recitationDao: RecitationDao? = try { DatabaseProvider.getDatabase().recitationDao() } catch (_: Exception) { null },
-    private val outboxDao: OutboxDao? = try { DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null }
+    private val remoteDataSource: RecitationRemoteDataSource = SupabaseRecitationRemoteDataSource(),
+    private val teacherIdProvider: () -> String? = {
+        SupabaseClientProvider.mockTeacherId
+            ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+    },
+    private val sessionActiveChecker: (String) -> Boolean = { teacherId ->
+        AccountSessionManager.isSessionActive(teacherId)
+    },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : RecitationRepository {
-    private val client = SupabaseClientProvider.client
 
-    private suspend fun fetchAndCacheRecitationsForStudent(studentId: String) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return
-        try {
-            val list = client.postgrest["recitations"]
-                .select {
-                    filter {
-                        eq("student_id", studentId)
-                        eq("teacher_id", teacherId)
-                    }
-                    order("date", order = Order.DESCENDING)
-                }
-                .decodeList<SupabaseRecitationDto>()
-                .map { it.toRecitation(teacherId = teacherId) }
+    private val _sessionRecitations = MutableStateFlow<Pair<String?, List<Recitation>>>(null to emptyList())
 
-            if (!com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) return
-            recitationDao?.upsertRecitations(list.map { it.toEntity() })
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            e.printStackTrace()
-        }
+    private fun resolveActiveTeacherId(): String? {
+        val teacherId = teacherIdProvider()?.takeIf { it.isNotBlank() } ?: return null
+        return if (sessionActiveChecker(teacherId)) teacherId else null
     }
 
-    private suspend fun fetchAndCacheRecitationsByMonth(studentId: String, startDate: String, endDate: String) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return
-        try {
-            val list = client.postgrest["recitations"]
-                .select {
-                    filter {
-                        eq("student_id", studentId)
-                        eq("teacher_id", teacherId)
-                        gte("date", startDate)
-                        lte("date", endDate)
-                    }
-                    order("date", order = Order.DESCENDING)
-                }
-                .decodeList<SupabaseRecitationDto>()
-                .map { it.toRecitation(teacherId = teacherId) }
+    private fun isStillAuthorized(teacherId: String): Boolean =
+        sessionActiveChecker(teacherId) && teacherIdProvider() == teacherId
 
-            if (!com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) return
-            recitationDao?.upsertRecitations(list.map { it.toEntity() })
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            e.printStackTrace()
-        }
+    fun clearCache() {
+        _sessionRecitations.value = null to emptyList()
     }
 
-    override fun getRecitationsForStudent(studentId: String): Flow<List<Recitation>> {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    private fun replaceScopedRecitationsInMemory(
+        teacherId: String,
+        fetched: List<Recitation>,
+        predicateToReplace: (Recitation) -> Boolean
+    ) {
+        val (owner, current) = _sessionRecitations.value
+        val base = if (owner == teacherId) current.filterNot(predicateToReplace) else emptyList()
+        val combined = (fetched + base).distinctBy { it.recitationId }.sortedByDescending { it.date }
+        _sessionRecitations.value = teacherId to combined
+    }
 
-        if (teacherId != null && recitationDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    fetchAndCacheRecitationsForStudent(studentId)
-                }
-                recitationDao.getRecitationsByStudent(teacherId, studentId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
-            }
+    private fun upsertRecitationInMemory(teacherId: String, recitation: Recitation) {
+        val (owner, current) = _sessionRecitations.value
+        val base = if (owner == teacherId) current else emptyList()
+        _sessionRecitations.value = teacherId to (listOf(recitation) + base.filterNot { it.recitationId == recitation.recitationId })
+            .sortedByDescending { it.date }
+    }
+
+    override fun getRecitationsForStudent(studentId: String): Flow<List<Recitation>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
-            }
+        launch(ioDispatcher) {
             try {
-                val list = client.postgrest["recitations"]
-                    .select {
-                        filter {
-                            eq("student_id", studentId)
-                            eq("teacher_id", teacherId)
-                        }
-                        order("date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseRecitationDto>()
-                    .map { it.toRecitation(teacherId = teacherId) }
-                emit(list)
+                val list = remoteDataSource.fetchRecitationsForStudent(teacherId, studentId)
+                if (!isStillAuthorized(teacherId)) {
+                    clearCache()
+                    return@launch
+                }
+                replaceScopedRecitationsInMemory(teacherId, list) { it.studentId == studentId }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
+                Log.e("SupabaseRecitationRepo", "getRecitationsForStudent failed: ${e.message}", e)
             }
-        }.flowOn(Dispatchers.IO)
-    }
+        }
+
+        _sessionRecitations
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList()
+                else list.filter { it.studentId == studentId }.sortedByDescending { it.date }
+            }
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
 
     override fun getRecitationsForStudentByMonth(
         studentId: String,
         year: Int,
         month: Int
-    ): Flow<List<Recitation>> {
+    ): Flow<List<Recitation>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
+        }
+
         val dateRange = DateUtils.getMonthDateRange(year, month)
         val startDate = dateRange.startDate
         val endDate = dateRange.endDate
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
 
-        if (teacherId != null && recitationDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    fetchAndCacheRecitationsByMonth(studentId, startDate, endDate)
-                }
-                recitationDao.getRecitationsByStudentAndRange(teacherId, studentId, startDate, endDate).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
-            }
+        launch(ioDispatcher) {
+            fetchRecitationsForStudentByMonthResult(studentId, year, month)
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
+        _sessionRecitations
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList()
+                else list.filter { it.studentId == studentId && it.date in startDate..endDate }
+                    .sortedByDescending { it.date }
             }
-            try {
-                val list = client.postgrest["recitations"]
-                    .select {
-                        filter {
-                            eq("student_id", studentId)
-                            eq("teacher_id", teacherId)
-                            gte("date", startDate)
-                            lte("date", endDate)
-                        }
-                        order("date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseRecitationDto>()
-                    .map { it.toRecitation(teacherId = teacherId) }
-                emit(list)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
+
+    override suspend fun fetchRecitationsForStudentByMonthResult(
+        studentId: String,
+        year: Int,
+        month: Int
+    ): Result<List<Recitation>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
+
+        val dateRange = DateUtils.getMonthDateRange(year, month)
+        val startDate = dateRange.startDate
+        val endDate = dateRange.endDate
+
+        try {
+            val list = remoteDataSource.fetchRecitationsForStudentByMonth(teacherId, studentId, startDate, endDate)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب التسميعات."))
             }
-        }.flowOn(Dispatchers.IO)
+            replaceScopedRecitationsInMemory(teacherId, list) {
+                it.studentId == studentId && it.date in startDate..endDate
+            }
+            Result.success(list)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseRecitationRepo", "fetchRecitationsForStudentByMonthResult failed: ${e.message}", e)
+            Result.failure(e)
+        }
     }
 
     override suspend fun getRecitationSummaryForStudent(
         studentId: String,
         year: Int,
         month: Int
-    ): RecitationSummary = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext RecitationSummary()
-        val dateRange = DateUtils.getMonthDateRange(year, month)
-        val startDate = dateRange.startDate
-        val endDate = dateRange.endDate
+    ): RecitationSummary {
+        val list = fetchRecitationsForStudentByMonthResult(studentId, year, month).getOrNull() ?: emptyList()
+        if (list.isEmpty()) return RecitationSummary()
 
-        try {
-            val list = client.postgrest["recitations"]
-                .select {
-                    filter {
-                        eq("student_id", studentId)
-                        eq("teacher_id", teacherId)
-                        gte("date", startDate)
-                        lte("date", endDate)
-                    }
-                }
-                .decodeList<SupabaseRecitationDto>()
-                .map { it.toRecitation(teacherId = teacherId) }
+        val totalCount = list.size
+        val avgScore = list.map { it.score }.average()
+        val avgMaxScore = list.map { it.maxScore }.average()
+        val avgPct = list.map { if (it.maxScore > 0) (it.score / it.maxScore) * 100.0 else 0.0 }
+            .average().toFloat()
 
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                recitationDao?.upsertRecitations(list.map { it.toEntity() })
-            }
-
-            if (list.isEmpty()) return@withContext RecitationSummary()
-
-            val totalCount = list.size
-            val avgScore = list.map { it.score }.average()
-            val avgMaxScore = list.map { it.maxScore }.average()
-            val avgPct = list.map { (it.score / it.maxScore) * 100.0 }.average().toFloat()
-
-            RecitationSummary(
-                totalCount = totalCount,
-                averageScore = avgScore,
-                averageMaxScore = avgMaxScore,
-                averagePercentage = avgPct
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-            val cachedEntities = recitationDao?.getRecitationsByStudentSync(teacherId, studentId)?.filter {
-                it.date >= startDate && it.date <= endDate
-            } ?: emptyList()
-
-            val list = cachedEntities.map { it.toDomain() }
-            if (list.isEmpty()) return@withContext RecitationSummary()
-
-            val totalCount = list.size
-            val avgScore = list.map { it.score }.average()
-            val avgMaxScore = list.map { it.maxScore }.average()
-            val avgPct = list.map { (it.score / it.maxScore) * 100.0 }.average().toFloat()
-
-            RecitationSummary(
-                totalCount = totalCount,
-                averageScore = avgScore,
-                averageMaxScore = avgMaxScore,
-                averagePercentage = avgPct
-            )
-        }
+        return RecitationSummary(
+            totalCount = totalCount,
+            averageScore = avgScore,
+            averageMaxScore = avgMaxScore,
+            averagePercentage = avgPct
+        )
     }
 
-    override suspend fun getRecitationsCountThisMonth(year: Int, month: Int): Int = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext 0
+    override suspend fun fetchRecitationsCountThisMonthResult(year: Int, month: Int): Result<Int> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
+
         try {
             val dateRange = DateUtils.getMonthDateRange(year, month)
-            val startDate = dateRange.startDate
-            val endDate = dateRange.endDate
-
-            val result = client.postgrest["recitations"]
-                .select {
-                    head = true
-                    count(Count.EXACT)
-                    filter {
-                        eq("teacher_id", teacherId)
-                        gte("date", startDate)
-                        lte("date", endDate)
-                    }
-                }
-
-            result.countOrNull()?.toInt() ?: 0
+            val count = remoteDataSource.fetchRecitationsCountThisMonth(teacherId, dateRange.startDate, dateRange.endDate)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة."))
+            }
+            Result.success(count)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            0
+            Log.e("SupabaseRecitationRepo", "fetchRecitationsCountThisMonthResult failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override fun getAllRecitationsForTeacher(): Flow<List<Recitation>> {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    override suspend fun getRecitationsCountThisMonth(year: Int, month: Int): Int {
+        return fetchRecitationsCountThisMonthResult(year, month).getOrDefault(0)
+    }
 
-        if (teacherId != null && recitationDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    try {
-                        val list = client.postgrest["recitations"]
-                            .select {
-                                filter {
-                                    eq("teacher_id", teacherId)
-                                }
-                                order("date", order = Order.DESCENDING)
-                            }
-                            .decodeList<SupabaseRecitationDto>()
-                            .map { it.toRecitation(teacherId = teacherId) }
+    override suspend fun refreshAllRecitationsForTeacher(): Result<List<Recitation>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
-                        if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                            recitationDao.upsertRecitations(list.map { it.toEntity() })
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                recitationDao.getAllRecitationsByTeacher(teacherId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
+        try {
+            val list = remoteDataSource.fetchAllRecitationsForTeacher(teacherId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب التسميعات."))
             }
+            _sessionRecitations.value = teacherId to list.sortedByDescending { it.date }
+            Result.success(list)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseRecitationRepo", "refreshAllRecitationsForTeacher failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override fun getAllRecitationsForTeacher(): Flow<List<Recitation>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
+        launch(ioDispatcher) {
+            refreshAllRecitationsForTeacher()
+        }
+
+        _sessionRecitations
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList() else list
             }
-            try {
-                val list = client.postgrest["recitations"]
-                    .select {
-                        filter {
-                            eq("teacher_id", teacherId)
-                        }
-                        order("date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseRecitationDto>()
-                    .map { it.toRecitation(teacherId = teacherId) }
-                emit(list)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
-            }
-        }.flowOn(Dispatchers.IO)
-    }
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
 
     override suspend fun addRecitation(
         studentId: String,
@@ -331,302 +378,138 @@ class SupabaseRecitationRepository(
         score: Double,
         maxScore: Double,
         note: String?
-    ): Result<SyncResult<Recitation>> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    ): Result<SyncResult<Recitation>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
             ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
-        val generatedId = UUID.randomUUID().toString()
+        if (title.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("عنوان التسميع مطلوب"))
+        }
+        if (maxScore <= 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة الكاملة يجب أن تكون أكبر من صفر"))
+        }
+        if (score < 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون سالبة"))
+        }
+        if (score > maxScore) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون أكبر من الدرجة الكاملة"))
+        }
+
         val dto = SupabaseRecitationDto(
-            id = generatedId,
+            id = UUID.randomUUID().toString(),
             teacherId = teacherId,
             studentId = studentId,
-            date = date,
-            title = title,
-            content = content,
+            date = date.trim(),
+            title = title.trim(),
+            content = content.trim(),
             score = score,
             maxScore = maxScore,
-            note = note
+            note = note?.trim()?.ifBlank { null }
         )
 
         try {
-            val inserted = client.postgrest["recitations"]
-                .insert(dto) {
-                    select()
-                }
-                .decodeSingle<SupabaseRecitationDto>()
-
-            val recitation = inserted.toRecitation(teacherId = teacherId)
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                recitationDao?.upsertSingleRecitation(recitation.toEntity())
+            val recitation = remoteDataSource.insertRecitation(dto)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حفظ التسميع."))
             }
-
+            upsertRecitationInMemory(teacherId, recitation)
             Result.success(SyncResult(recitation, BatchSyncStatus.SAVED_TO_CLOUD))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            val isLocalFailure = e is android.database.sqlite.SQLiteException || e.stackTrace.any { it.className.contains("sqlite") || it.className.contains("room") }
-            if (isLocalFailure) {
-                return@withContext Result.failure(Exception("تم حفظ التسميع على السيرفر ولكن فشل التحديث المحلي: ${e.message}"))
-            }
-
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val recitation = dto.toRecitation(teacherId = teacherId)
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            recitationDao?.upsertSingleRecitation(recitation.toEntity())
-                            val payload = Json.encodeToString(dto)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "INSERT",
-                                    entityType = "RECITATION",
-                                    entityId = generatedId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        recitationDao?.upsertSingleRecitation(recitation.toEntity())
-                        val payload = Json.encodeToString(dto)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "INSERT",
-                                entityType = "RECITATION",
-                                entityId = generatedId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر إضافة التسميع محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                Result.success(SyncResult(recitation, BatchSyncStatus.QUEUED_OFFLINE))
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل إضافة التسميع: ${ex.message}"))
-            }
+            Log.e("SupabaseRecitationRepo", "addRecitation failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun updateRecitation(recitation: Recitation): Result<Recitation> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    override suspend fun updateRecitation(recitation: Recitation): Result<Recitation> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
             ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
+        if (recitation.teacherId.isNotBlank() && recitation.teacherId != teacherId) {
+            return@withContext Result.failure(SecurityException("غير مصرح بتعديل تسميع تابع لحساب آخر."))
+        }
+        if (recitation.title.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("عنوان التسميع مطلوب"))
+        }
+        if (recitation.maxScore <= 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة الكاملة يجب أن تكون أكبر من صفر"))
+        }
+        if (recitation.score < 0.0) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون سالبة"))
+        }
+        if (recitation.score > recitation.maxScore) {
+            return@withContext Result.failure(IllegalArgumentException("الدرجة لا يمكن أن تكون أكبر من الدرجة الكاملة"))
+        }
+
+        val dto = SupabaseRecitationDto(
+            id = recitation.recitationId,
+            teacherId = teacherId,
+            studentId = recitation.studentId,
+            date = recitation.date.trim(),
+            title = recitation.title.trim(),
+            content = recitation.content.trim(),
+            score = recitation.score,
+            maxScore = recitation.maxScore,
+            note = recitation.note?.trim()?.ifBlank { null }
+        )
+
         try {
-            val dto = SupabaseRecitationDto(
-                id = recitation.recitationId,
-                teacherId = teacherId,
-                studentId = recitation.studentId,
-                date = recitation.date,
-                title = recitation.title,
-                content = recitation.content,
-                score = recitation.score,
-                maxScore = recitation.maxScore,
-                note = recitation.note
-            )
-            val updated = client.postgrest["recitations"].update(dto) {
-                filter {
-                    eq("id", recitation.recitationId)
-                    eq("teacher_id", teacherId)
-                }
-                select()
-            }.decodeSingle<SupabaseRecitationDto>()
-
-            val result = updated.toRecitation(teacherId = teacherId)
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                recitationDao?.upsertSingleRecitation(result.toEntity())
+            val updated = remoteDataSource.updateRecitation(teacherId, dto)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تعديل التسميع."))
             }
-
-            Result.success(result)
+            upsertRecitationInMemory(teacherId, updated)
+            Result.success(updated)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val recitationWithTeacher = recitation.copy(teacherId = teacherId)
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            recitationDao?.upsertSingleRecitation(recitationWithTeacher.toEntity())
-                            val dto = SupabaseRecitationDto(
-                                id = recitation.recitationId,
-                                teacherId = teacherId,
-                                studentId = recitation.studentId,
-                                date = recitation.date,
-                                title = recitation.title,
-                                content = recitation.content,
-                                score = recitation.score,
-                                maxScore = recitation.maxScore,
-                                note = recitation.note
-                            )
-                            val payload = Json.encodeToString(dto)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "UPDATE",
-                                    entityType = "RECITATION",
-                                    entityId = recitation.recitationId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        recitationDao?.upsertSingleRecitation(recitationWithTeacher.toEntity())
-                        val dto = SupabaseRecitationDto(
-                            id = recitation.recitationId,
-                            teacherId = teacherId,
-                            studentId = recitation.studentId,
-                            date = recitation.date,
-                            title = recitation.title,
-                            content = recitation.content,
-                            score = recitation.score,
-                            maxScore = recitation.maxScore,
-                            note = recitation.note
-                        )
-                        val payload = Json.encodeToString(dto)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "UPDATE",
-                                entityType = "RECITATION",
-                                entityId = recitation.recitationId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر تعديل التسميع محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                Result.success(recitationWithTeacher)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل تعديل التسميع: ${ex.message}"))
-            }
+            Log.e("SupabaseRecitationRepo", "updateRecitation failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun deleteRecitation(recitationId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    override suspend fun deleteRecitation(recitationId: String): Result<Unit> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
             ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
         try {
-            client.postgrest["recitations"].delete {
-                filter {
-                    eq("id", recitationId)
-                    eq("teacher_id", teacherId)
-                }
+            remoteDataSource.deleteRecitation(teacherId, recitationId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حذف التسميع."))
             }
-            recitationDao?.deleteById(teacherId, recitationId)
+            val (owner, current) = _sessionRecitations.value
+            if (owner == teacherId) {
+                _sessionRecitations.value = teacherId to current.filterNot { it.recitationId == recitationId }
+            }
             Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val deleted = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            recitationDao?.deleteById(teacherId, recitationId)
-                            val payload = "{\"id\":\"$recitationId\"}"
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "DELETE",
-                                    entityType = "RECITATION",
-                                    entityId = recitationId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        recitationDao?.deleteById(teacherId, recitationId)
-                        val payload = "{\"id\":\"$recitationId\"}"
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "DELETE",
-                                entityType = "RECITATION",
-                                entityId = recitationId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (deleted == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر حذف التسميع محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-
-                Result.success(Unit)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل حذف التسميع: ${ex.message}"))
-            }
+            Log.e("SupabaseRecitationRepo", "deleteRecitation failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun getRecitationById(recitationId: String): Recitation? = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext null
-
-        val cached = recitationDao?.getRecitationByIdSync(teacherId, recitationId)
-        if (cached != null) {
-            return@withContext cached.toDomain()
-        }
-
+    override suspend fun getRecitationById(recitationId: String): Recitation? = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId() ?: return@withContext null
         try {
-            val dto = client.postgrest["recitations"]
-                .select {
-                    filter {
-                        eq("id", recitationId)
-                        eq("teacher_id", teacherId)
-                    }
-                }
-                .decodeSingleOrNull<SupabaseRecitationDto>()
-
-            val recitation = dto?.toRecitation(teacherId = teacherId)
-            if (recitation != null && com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                recitationDao?.upsertSingleRecitation(recitation.toEntity())
+            val recitation = remoteDataSource.fetchRecitationById(teacherId, recitationId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext null
+            }
+            if (recitation != null) {
+                upsertRecitationInMemory(teacherId, recitation)
             }
             recitation
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseRecitationRepo", "getRecitationById failed: ${e.message}", e)
             null
         }
     }

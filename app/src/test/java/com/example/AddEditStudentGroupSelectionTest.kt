@@ -6,20 +6,24 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.model.Grade
 import com.example.core.model.Group
+import com.example.core.model.GroupDay
 import com.example.core.model.Student
 import com.example.core.model.Teacher
 import com.example.data.SupabaseClientProvider
+import com.example.data.auth.AccountSessionManager
 import com.example.data.local.AppDatabase
 import com.example.data.local.DatabaseProvider
 import com.example.data.local.dao.GroupDao
 import com.example.data.local.dao.OutboxDao
 import com.example.data.local.dao.StudentDao
 import com.example.data.local.mapper.toEntity
+import com.example.data.repository.GroupRemoteDataSource
 import com.example.data.repository.MockGradeRepository
 import com.example.data.repository.MockGroupRepository
 import com.example.data.repository.MockStudentRepository
 import com.example.data.repository.MockTeacherRepository
 import com.example.data.repository.SupabaseGroupRepository
+import java.net.UnknownHostException
 import com.example.ui.add_edit_student.AddEditStudentEvent
 import com.example.ui.add_edit_student.AddEditStudentViewModel
 import kotlinx.coroutines.Dispatchers
@@ -398,9 +402,9 @@ class AddEditStudentGroupSelectionTest {
         assertNull(finalState.createdStudent?.groupId)
     }
 
-    // 11. offline student update keeps groupId locally in Room
+    // 11. offline group assignment fails in Online-Only mode and does not modify Room
     @Test
-    fun `11 offline student update keeps groupId locally in Room`() = runBlocking {
+    fun `11 offline student group assignment fails without mutating Room`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -411,59 +415,62 @@ class AddEditStudentGroupSelectionTest {
 
         DatabaseProvider.setDatabase(db, context)
         SupabaseClientProvider.mockTeacherId = "teacher_1"
+        AccountSessionManager.setActiveTeacherId("teacher_1")
 
         try {
-            val group = createTestGroup(id = "grp_1", teacherId = "teacher_1", gradeId = "grade_1", name = "المتفوقين", active = true)
-            groupDao.insertGroup(group.toEntity())
-
-            val student = Student(
-                studentId = "s_offline_1",
-                studentCode = "ST-10001",
-                fullName = "طارق عمر",
-                gradeId = "grade_1",
-                parentPhone = "01012345678",
-                teacherId = "teacher_1"
-            )
-            studentDao.upsertStudent(student.toEntity())
+            val offlineRemote = object : GroupRemoteDataSource {
+                override suspend fun fetchGroups(teacherId: String) = throw UnknownHostException("offline")
+                override suspend fun fetchGroupDays(teacherId: String) = throw UnknownHostException("offline")
+                override suspend fun fetchGroupById(teacherId: String, groupId: String) = throw UnknownHostException("offline")
+                override suspend fun fetchGroupDaysForGroup(teacherId: String, groupId: String) = throw UnknownHostException("offline")
+                override suspend fun createGroup(group: Group) = throw UnknownHostException("offline")
+                override suspend fun updateGroup(group: Group) = throw UnknownHostException("offline")
+                override suspend fun setGroupActive(teacherId: String, groupId: String, active: Boolean) = throw UnknownHostException("offline")
+                override suspend fun hasStudentsInGroup(teacherId: String, groupId: String) = false
+                override suspend fun hasAttendanceInGroup(teacherId: String, groupId: String) = false
+                override suspend fun deleteGroupDays(teacherId: String, groupId: String) {}
+                override suspend fun insertGroupDays(days: List<GroupDay>) {}
+                override suspend fun deleteGroupRow(teacherId: String, groupId: String) {}
+                override suspend fun fetchStudentById(teacherId: String, studentId: String) = throw UnknownHostException("offline")
+                override suspend fun updateStudentGroup(teacherId: String, studentId: String, groupId: String?) = throw UnknownHostException("offline")
+            }
 
             val supabaseGroupRepo = SupabaseGroupRepository(
-                groupDao = groupDao,
-                studentDao = studentDao,
-                outboxDao = outboxDao
+                remoteDataSource = offlineRemote,
+                teacherIdProvider = { "teacher_1" },
+                sessionActiveChecker = { true }
             )
 
-            // Assign student to group offline
             val assignResult = supabaseGroupRepo.assignStudentToGroup("teacher_1", "s_offline_1", "grp_1")
-            assertTrue(assignResult.isSuccess)
-
-            val localStudent = studentDao.getStudentByIdSync("teacher_1", "s_offline_1")
-            assertNotNull(localStudent)
-            assertEquals("grp_1", localStudent?.groupId)
+            assertTrue(assignResult.isFailure)
+            assertTrue(studentDao.getAllStudentsSync("teacher_1").isEmpty())
+            assertTrue(groupDao.getGroupsSync("teacher_1").isEmpty())
+            assertTrue(outboxDao.getPendingOperationsForTeacher("teacher_1").isEmpty())
         } finally {
+            AccountSessionManager.setActiveTeacherId(null)
+            SupabaseClientProvider.mockTeacherId = null
             db.close()
             DatabaseProvider.resetForTesting()
         }
     }
 
-    // 12. Outbox contains correct student update
+    // 12. online group assignment updates server directly without writing to Room or Outbox
     @Test
-    fun `12 Outbox contains correct student update on group assignment`() = runBlocking {
+    fun `12 online group assignment updates server directly without Outbox or Room`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
             .build()
         val studentDao = db.studentDao()
-        val groupDao = db.groupDao()
         val outboxDao = db.outboxDao()
 
         DatabaseProvider.setDatabase(db, context)
         SupabaseClientProvider.mockTeacherId = "teacher_1"
+        AccountSessionManager.setActiveTeacherId("teacher_1")
 
         try {
             val group = createTestGroup(id = "grp_1", teacherId = "teacher_1", gradeId = "grade_1", name = "المتفوقين", active = true)
-            groupDao.insertGroup(group.toEntity())
-
-            val student = Student(
+            var student = Student(
                 studentId = "s_outbox_1",
                 studentCode = "ST-10002",
                 fullName = "إسلام صبحي",
@@ -471,24 +478,46 @@ class AddEditStudentGroupSelectionTest {
                 parentPhone = "01012345678",
                 teacherId = "teacher_1"
             )
-            studentDao.upsertStudent(student.toEntity())
+            var updatedOnServer: Student? = null
 
+            val onlineRemote = object : GroupRemoteDataSource {
+                override suspend fun fetchGroups(teacherId: String) = listOf(group)
+                override suspend fun fetchGroupDays(teacherId: String) = emptyList<GroupDay>()
+                override suspend fun fetchGroupById(teacherId: String, groupId: String) = if (groupId == "grp_1") group else null
+                override suspend fun fetchGroupDaysForGroup(teacherId: String, groupId: String) = emptyList<GroupDay>()
+                override suspend fun createGroup(group: Group) = group
+                override suspend fun updateGroup(group: Group) = group
+                override suspend fun setGroupActive(teacherId: String, groupId: String, active: Boolean) = group.copy(active = active)
+                override suspend fun hasStudentsInGroup(teacherId: String, groupId: String) = false
+                override suspend fun hasAttendanceInGroup(teacherId: String, groupId: String) = false
+                override suspend fun deleteGroupDays(teacherId: String, groupId: String) {}
+                override suspend fun insertGroupDays(days: List<GroupDay>) {}
+                override suspend fun deleteGroupRow(teacherId: String, groupId: String) {}
+                override suspend fun fetchStudentById(teacherId: String, studentId: String) = if (studentId == student.studentId) student else null
+                override suspend fun updateStudentGroup(teacherId: String, studentId: String, groupId: String?): Student {
+                    student = student.copy(groupId = groupId)
+                    updatedOnServer = student
+                    return student
+                }
+            }
+
+            var callbackStudent: Student? = null
             val supabaseGroupRepo = SupabaseGroupRepository(
-                groupDao = groupDao,
-                studentDao = studentDao,
-                outboxDao = outboxDao
+                remoteDataSource = onlineRemote,
+                teacherIdProvider = { "teacher_1" },
+                sessionActiveChecker = { true },
+                onStudentUpdated = { callbackStudent = it }
             )
 
-            supabaseGroupRepo.assignStudentToGroup("teacher_1", "s_outbox_1", "grp_1")
-
-            val pendingOps = outboxDao.getPendingOperationsForTeacher("teacher_1")
-            val studentOp = pendingOps.find { it.entityId == "s_outbox_1" }
-            assertNotNull(studentOp)
-            assertEquals("UPDATE", studentOp?.operationType)
-            assertEquals("STUDENT", studentOp?.entityType)
-            assertEquals("teacher_1", studentOp?.teacherId)
-            assertTrue(studentOp?.payload?.contains("grp_1") == true || studentOp?.payload?.contains("s_outbox_1") == true)
+            val res = supabaseGroupRepo.assignStudentToGroup("teacher_1", "s_outbox_1", "grp_1")
+            assertTrue(res.isSuccess)
+            assertEquals("grp_1", updatedOnServer?.groupId)
+            assertEquals("grp_1", callbackStudent?.groupId)
+            assertTrue(outboxDao.getPendingOperationsForTeacher("teacher_1").isEmpty())
+            assertTrue(studentDao.getAllStudentsSync("teacher_1").isEmpty())
         } finally {
+            AccountSessionManager.setActiveTeacherId(null)
+            SupabaseClientProvider.mockTeacherId = null
             db.close()
             DatabaseProvider.resetForTesting()
         }

@@ -75,7 +75,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.core.model.OnlineLoadState
 import com.example.core.model.Student
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.components.StudentAvatar
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.Dimens
@@ -170,7 +172,29 @@ fun AddEditStudentScreen(
         containerColor = MaterialTheme.colorScheme.background,
         modifier = modifier.testTag("add_edit_student_screen")
     ) { innerPadding ->
-        if (uiState.createdStudent != null && !uiState.isEditMode) {
+        if (uiState.loadState is OnlineLoadState.Loading) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = PrimaryIndigo)
+            }
+        } else if (uiState.loadState is OnlineLoadState.Offline || uiState.loadState is OnlineLoadState.Error) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentAlignment = Alignment.Center
+            ) {
+                OnlineStatusStateView(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.loadErrorMessage ?: "تعذر تحميل بيانات الطالب من السيرفر.",
+                    onRetry = viewModel::retryLoad
+                )
+            }
+        } else if (uiState.createdStudent != null && !uiState.isEditMode) {
             val student = uiState.createdStudent!!
             val gradeName = uiState.grades.find { it.id == student.gradeId }?.name ?: selectedGradeName
             AddStudentSuccessContent(

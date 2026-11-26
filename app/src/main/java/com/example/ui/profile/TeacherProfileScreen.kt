@@ -86,6 +86,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.theme.Dimens
 import com.example.ui.theme.ElectricBlue
 import com.example.ui.theme.PrimaryIndigo
@@ -152,7 +154,7 @@ fun TeacherProfileScreen(
         containerColor = MaterialTheme.colorScheme.background,
         modifier = modifier.testTag("teacher_profile_screen")
     ) { innerPadding ->
-        if (uiState.isLoading) {
+        if (uiState.isLoading && uiState.id.isBlank()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -160,6 +162,19 @@ fun TeacherProfileScreen(
                 contentAlignment = Alignment.Center
             ) {
                 CircularProgressIndicator(color = PrimaryIndigo)
+            }
+        } else if (uiState.id.isBlank() && uiState.loadError != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentAlignment = Alignment.Center
+            ) {
+                OnlineStatusStateView(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.loadError!!,
+                    onRetry = { viewModel.loadData() }
+                )
             }
         } else {
             LazyColumn(
@@ -173,6 +188,15 @@ fun TeacherProfileScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(Dimens.Spacing16)
             ) {
+                if (uiState.loadError != null) {
+                    item {
+                        OnlineInlineErrorBanner(
+                            isOffline = uiState.isOfflineError,
+                            message = uiState.loadError!!,
+                            onRetry = { viewModel.loadData() }
+                        )
+                    }
+                }
                 // Section 1: Teacher Avatar & Basic Info Card
                 item {
                     Card(

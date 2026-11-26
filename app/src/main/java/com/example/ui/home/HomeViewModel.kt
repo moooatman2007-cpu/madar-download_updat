@@ -22,8 +22,8 @@ import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.SettingsRepository
 import com.example.data.repository.StudentRepository
 import com.example.data.repository.TeacherRepository
-import com.example.data.sync.SyncManager
-import com.example.data.sync.SyncStatus
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -73,7 +73,8 @@ data class HomeUiState(
     val examsThisMonth: Int = 0,
     val followUpStudents: List<FollowUpStudent> = emptyList(),
     val todayGroups: List<TodayGroup> = emptyList(),
-    val syncStatus: SyncStatus = SyncStatus()
+    val errorMessage: String? = null,
+    val isOfflineError: Boolean = false
 )
 
 class HomeViewModel(
@@ -84,28 +85,21 @@ class HomeViewModel(
     private val examRepository: ExamRepository = RepositoryProvider.examRepository,
     private val homeworkRepository: com.example.data.repository.HomeworkRepository = RepositoryProvider.homeworkRepository,
     private val groupRepository: com.example.data.repository.GroupRepository = RepositoryProvider.groupRepository,
-    private val teacherRepository: TeacherRepository = RepositoryProvider.teacherRepository,
-    private val syncManager: SyncManager = RepositoryProvider.syncManager
+    private val teacherRepository: TeacherRepository = RepositoryProvider.teacherRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState(isLoading = true))
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
 
+    private val _loadError = MutableStateFlow<Pair<String?, Boolean>>(null to false)
+    private var streamsStarted = false
+
     init {
         loadData()
-        observeSyncStatus()
     }
 
-    private fun observeSyncStatus() {
-        viewModelScope.launch {
-            syncManager.syncStatus.collect { status ->
-                _uiState.update { it.copy(syncStatus = status) }
-            }
-        }
-    }
-
-    fun retrySync() {
-        syncManager.retrySync()
+    fun retry() {
+        loadData()
     }
 
     fun loadData() {
@@ -116,30 +110,68 @@ class HomeViewModel(
         val currentYear = calendar.get(Calendar.YEAR)
         val currentMonth = calendar.get(Calendar.MONTH) + 1
 
-        _uiState.update { it.copy(currentDate = todayStr) }
+        _loadError.value = null to false
+        _uiState.update { it.copy(currentDate = todayStr, isLoading = true, errorMessage = null, isOfflineError = false) }
 
-        // 1. Fetch teacher, grades and monthly stats concurrently in background without blocking UI
+        // 1. Fetch teacher, counts, and core collections directly from Supabase
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val teacherDeferred = async { teacherRepository.fetchCurrentTeacher() }
-                val todayAttDeferred = async { attendanceRepository.getTodayAttendanceCount() }
-                val recCountDeferred = async { recitationRepository.getRecitationsCountThisMonth(currentYear, currentMonth) }
-                val exCountDeferred = async { examRepository.getExamsCountThisMonth(currentYear, currentMonth) }
+                val teacherDeferred = async { runCatching { teacherRepository.fetchCurrentTeacher() } }
+                val todayAttDeferred = async { attendanceRepository.fetchTodayAttendanceCountResult() }
+                val recCountDeferred = async { recitationRepository.fetchRecitationsCountThisMonthResult(currentYear, currentMonth) }
+                val exCountDeferred = async { examRepository.fetchExamsCountThisMonthResult(currentYear, currentMonth) }
 
-                val teacher = teacherDeferred.await()
-                val (todayPresent, todayAbsent) = todayAttDeferred.await()
-                val recThisMonth = recCountDeferred.await()
-                val exThisMonth = exCountDeferred.await()
+                val teacherRes = teacherDeferred.await()
+                val teacher = teacherRes.getOrNull()
+                val todayAttRes = todayAttDeferred.await()
+                val recCountRes = recCountDeferred.await()
+                val exCountRes = exCountDeferred.await()
 
-                // Refresh grades in background
-                gradeRepository.refreshGrades(teacher?.educationalStage)
+                val gradesDeferred = async { gradeRepository.refreshGradesResult(teacher?.educationalStage) }
+                val studentsDeferred = async { studentRepository.refreshStudents() }
+                val groupsDeferred = teacher?.id?.takeIf { it.isNotBlank() }?.let { teacherId ->
+                    async { groupRepository.refreshGroups(teacherId) }
+                }
+                val attListDeferred = async { attendanceRepository.refreshAllAttendanceForTeacher() }
+                val recListDeferred = async { recitationRepository.refreshAllRecitationsForTeacher() }
+                val exListDeferred = async { examRepository.refreshAllExamsForTeacher() }
+                val hwListDeferred = async { homeworkRepository.refreshHomeworkForTeacher() }
 
+                val gradesRes = gradesDeferred.await()
+                val studentsRes = studentsDeferred.await()
+                val groupsRes = groupsDeferred?.await()
+                attListDeferred.await()
+                recListDeferred.await()
+                exListDeferred.await()
+                hwListDeferred.await()
+
+                val firstFailure = listOfNotNull(
+                    teacherRes.exceptionOrNull(),
+                    studentsRes.exceptionOrNull(),
+                    gradesRes.exceptionOrNull(),
+                    groupsRes?.exceptionOrNull(),
+                    todayAttRes.exceptionOrNull(),
+                    recCountRes.exceptionOrNull(),
+                    exCountRes.exceptionOrNull()
+                ).firstOrNull()
+
+                if (firstFailure != null) {
+                    _loadError.value = firstFailure.toArabicErrorMessage() to firstFailure.isOfflineOrNetworkError()
+                } else {
+                    _loadError.value = null to false
+                }
+
+                val (todayPresent, todayAbsent) = todayAttRes.getOrElse { 0 to 0 }
+                val recThisMonth = recCountRes.getOrElse { 0 }
+                val exThisMonth = exCountRes.getOrElse { 0 }
                 val teacherName = teacher?.fullName?.ifBlank { null } ?: teacher?.email ?: ""
                 _uiState.update { current ->
                     val notRecorded = (current.stats.totalStudents - (todayPresent + todayAbsent)).coerceAtLeast(0)
                     val totalRecorded = todayPresent + todayAbsent
                     val attendancePct = if (current.stats.totalStudents > 0) (totalRecorded.toFloat() / current.stats.totalStudents.toFloat()) * 100f else 0f
+                    val (errMsg, isOff) = _loadError.value
                     current.copy(
+                        isLoading = false,
                         teacherName = if (current.teacherName.isBlank()) teacherName else current.teacherName,
                         avatarUrl = current.avatarUrl ?: teacher?.avatarUrl,
                         todayPresentCount = todayPresent,
@@ -147,13 +179,26 @@ class HomeViewModel(
                         todayNotRecordedCount = notRecorded,
                         attendancePercentage = attendancePct,
                         recitationsThisMonth = recThisMonth,
-                        examsThisMonth = exThisMonth
+                        examsThisMonth = exThisMonth,
+                        errorMessage = errMsg,
+                        isOfflineError = isOff
                     )
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                _loadError.value = e.toArabicErrorMessage() to e.isOfflineOrNetworkError()
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = _loadError.value.first,
+                        isOfflineError = _loadError.value.second
+                    )
+                }
             }
         }
+
+        if (streamsStarted) return
+        streamsStarted = true
 
         // 2. Observe reactive local Room streams immediately (Stale-While-Revalidate)
         viewModelScope.launch {
@@ -190,7 +235,7 @@ class HomeViewModel(
                 DataBundle2(recitations, exams, homework, groups, days)
             }
 
-            combine(firstFive, lastThree) { b1, b2 ->
+            combine(firstFive, lastThree, _loadError) { b1, b2, (errMsg, isOffline) ->
                 val liveGrades = b1.liveGrades
                 val stats = b1.stats
                 val liveTeacher = b1.liveTeacher
@@ -268,7 +313,9 @@ class HomeViewModel(
                     recitationsThisMonth = _uiState.value.recitationsThisMonth,
                     examsThisMonth = _uiState.value.examsThisMonth,
                     followUpStudents = followUp,
-                    todayGroups = groupsToday
+                    todayGroups = groupsToday,
+                    errorMessage = errMsg,
+                    isOfflineError = isOffline
                 )
             }.collect { newState ->
                 _uiState.value = newState

@@ -171,6 +171,7 @@ class SupabaseTeacherRepository : TeacherRepository {
                 phoneNumber = current?.phoneNumber,
                 subject = current?.subject,
                 centerName = current?.centerName,
+                educationalStage = current?.educationalStage,
                 avatarUrl = null
             )
             Result.success(Unit)

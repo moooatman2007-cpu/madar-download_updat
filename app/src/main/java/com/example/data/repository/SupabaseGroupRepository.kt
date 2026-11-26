@@ -1,347 +1,513 @@
 package com.example.data.repository
 
-import androidx.room.withTransaction
-import com.example.core.model.*
+import android.util.Log
+import com.example.core.model.Group
+import com.example.core.model.GroupDay
+import com.example.core.model.Student
+import com.example.core.model.SupabaseGroupDayDto
+import com.example.core.model.SupabaseGroupDto
+import com.example.core.model.UpdateGroupActiveDto
+import com.example.core.model.UpdateStudentGroupDto
+import com.example.core.model.toDomain
+import com.example.core.model.toSupabaseDto
+import com.example.core.model.toUpdateOnlineDto
 import com.example.data.SupabaseClientProvider
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.GroupDao
-import com.example.data.local.dao.GroupDayDao
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.entity.GroupDayEntity
-import com.example.data.local.entity.GroupEntity
-import com.example.data.local.entity.OutboxEntity
-import com.example.data.local.mapper.*
-import com.example.data.sync.OutboxSyncScheduler
+import com.example.data.auth.AccountSessionManager
+import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
-import kotlinx.coroutines.CoroutineScope
+import io.github.jan.supabase.postgrest.query.Columns
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-import java.util.UUID
+import kotlinx.serialization.Serializable
+
+class GroupDeletionBlockedException(message: String) : IllegalStateException(message)
+
+interface GroupRemoteDataSource {
+    suspend fun fetchGroups(teacherId: String): List<Group>
+    suspend fun fetchGroupDays(teacherId: String): List<GroupDay>
+    suspend fun fetchGroupById(teacherId: String, groupId: String): Group?
+    suspend fun fetchGroupDaysForGroup(teacherId: String, groupId: String): List<GroupDay>
+    suspend fun createGroup(group: Group): Group
+    suspend fun updateGroup(group: Group): Group
+    suspend fun setGroupActive(teacherId: String, groupId: String, active: Boolean): Group?
+    suspend fun hasStudentsInGroup(teacherId: String, groupId: String): Boolean
+    suspend fun hasAttendanceInGroup(teacherId: String, groupId: String): Boolean
+    suspend fun deleteGroupDays(teacherId: String, groupId: String)
+    suspend fun insertGroupDays(days: List<GroupDay>)
+    suspend fun deleteGroupRow(teacherId: String, groupId: String)
+    suspend fun fetchStudentById(teacherId: String, studentId: String): Student?
+    suspend fun updateStudentGroup(teacherId: String, studentId: String, groupId: String?): Student
+}
+
+@Serializable
+private data class RemoteIdRow(val id: String)
+
+class SupabaseGroupRemoteDataSource(
+    private val client: SupabaseClient = SupabaseClientProvider.client
+) : GroupRemoteDataSource {
+
+    override suspend fun fetchGroups(teacherId: String): List<Group> {
+        return client.postgrest["groups"].select {
+            filter {
+                eq("teacher_id", teacherId)
+            }
+        }.decodeList<SupabaseGroupDto>().map { it.toDomain() }
+    }
+
+    override suspend fun fetchGroupDays(teacherId: String): List<GroupDay> {
+        return client.postgrest["group_days"].select {
+            filter {
+                eq("teacher_id", teacherId)
+            }
+        }.decodeList<SupabaseGroupDayDto>().map { it.toDomain() }
+    }
+
+    override suspend fun fetchGroupById(teacherId: String, groupId: String): Group? {
+        return client.postgrest["groups"].select {
+            filter {
+                eq("id", groupId)
+                eq("teacher_id", teacherId)
+            }
+        }.decodeSingleOrNull<SupabaseGroupDto>()?.toDomain()
+    }
+
+    override suspend fun fetchGroupDaysForGroup(teacherId: String, groupId: String): List<GroupDay> {
+        return client.postgrest["group_days"].select {
+            filter {
+                eq("teacher_id", teacherId)
+                eq("group_id", groupId)
+            }
+        }.decodeList<SupabaseGroupDayDto>().map { it.toDomain() }
+    }
+
+    override suspend fun createGroup(group: Group): Group {
+        return client.postgrest["groups"].insert(group.toSupabaseDto()) {
+            select()
+        }.decodeSingle<SupabaseGroupDto>().toDomain()
+    }
+
+    override suspend fun updateGroup(group: Group): Group {
+        return client.postgrest["groups"].update(group.toUpdateOnlineDto()) {
+            filter {
+                eq("id", group.id)
+                eq("teacher_id", group.teacherId)
+            }
+            select()
+        }.decodeSingle<SupabaseGroupDto>().toDomain()
+    }
+
+    override suspend fun setGroupActive(teacherId: String, groupId: String, active: Boolean): Group? {
+        return client.postgrest["groups"].update(UpdateGroupActiveDto(active = active)) {
+            filter {
+                eq("id", groupId)
+                eq("teacher_id", teacherId)
+            }
+            select()
+        }.decodeSingleOrNull<SupabaseGroupDto>()?.toDomain()
+    }
+
+    override suspend fun hasStudentsInGroup(teacherId: String, groupId: String): Boolean {
+        return client.postgrest["students"].select(columns = Columns.list("id")) {
+            filter {
+                eq("teacher_id", teacherId)
+                eq("group_id", groupId)
+            }
+            limit(1)
+        }.decodeList<RemoteIdRow>().isNotEmpty()
+    }
+
+    override suspend fun hasAttendanceInGroup(teacherId: String, groupId: String): Boolean {
+        return client.postgrest["attendance"].select(columns = Columns.list("id")) {
+            filter {
+                eq("teacher_id", teacherId)
+                eq("group_id", groupId)
+            }
+            limit(1)
+        }.decodeList<RemoteIdRow>().isNotEmpty()
+    }
+
+    override suspend fun deleteGroupDays(teacherId: String, groupId: String) {
+        client.postgrest["group_days"].delete {
+            filter {
+                eq("group_id", groupId)
+                eq("teacher_id", teacherId)
+            }
+        }
+    }
+
+    override suspend fun insertGroupDays(days: List<GroupDay>) {
+        if (days.isEmpty()) return
+        client.postgrest["group_days"].insert(days.map { it.toSupabaseDto() })
+    }
+
+    override suspend fun deleteGroupRow(teacherId: String, groupId: String) {
+        client.postgrest["groups"].delete {
+            filter {
+                eq("id", groupId)
+                eq("teacher_id", teacherId)
+            }
+        }
+    }
+
+    override suspend fun fetchStudentById(teacherId: String, studentId: String): Student? {
+        return client.postgrest["students"].select {
+            filter {
+                eq("id", studentId)
+                eq("teacher_id", teacherId)
+                exact("deleted_at", null)
+            }
+        }.decodeSingleOrNull<Student>()
+    }
+
+    override suspend fun updateStudentGroup(teacherId: String, studentId: String, groupId: String?): Student {
+        return client.postgrest["students"].update(UpdateStudentGroupDto(groupId = groupId)) {
+            filter {
+                eq("id", studentId)
+                eq("teacher_id", teacherId)
+                exact("deleted_at", null)
+            }
+            select()
+        }.decodeSingle<Student>()
+    }
+}
 
 class SupabaseGroupRepository(
-    private val groupDao: GroupDao? = try { DatabaseProvider.getDatabase().groupDao() } catch (_: Exception) { null },
-    private val groupDayDao: GroupDayDao? = try { DatabaseProvider.getDatabase().groupDayDao() } catch (_: Exception) { null },
-    private val outboxDao: OutboxDao? = try { DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null },
-    private val studentDao: com.example.data.local.dao.StudentDao? = try { DatabaseProvider.getDatabase().studentDao() } catch (_: Exception) { null }
+    private val remoteDataSource: GroupRemoteDataSource = SupabaseGroupRemoteDataSource(),
+    private val teacherIdProvider: () -> String? = {
+        SupabaseClientProvider.mockTeacherId
+            ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+    },
+    private val sessionActiveChecker: (String) -> Boolean = { teacherId ->
+        AccountSessionManager.isSessionActive(teacherId)
+    },
+    private val onStudentUpdated: ((Student) -> Unit)? = null,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : GroupRepository {
-    private val client = SupabaseClientProvider.client
 
-    private fun getAuthenticatedTeacherId(): String =
-        SupabaseClientProvider.mockTeacherId ?: client.auth.currentUserOrNull()?.id ?: throw Exception("Not authenticated")
+    // Session-scoped in-memory state only (never persisted to Room/SQLite).
+    private val _sessionGroups = MutableStateFlow<Pair<String?, List<Group>>>(null to emptyList())
+    private val _sessionGroupDays = MutableStateFlow<Pair<String?, List<GroupDay>>>(null to emptyList())
 
-    override fun observeGroups(teacherId: String): Flow<List<Group>> = 
-        groupDao?.observeGroupsByTeacher(teacherId)?.map { it.map { e -> e.toDomain() } } ?: kotlinx.coroutines.flow.flowOf(emptyList())
+    private fun resolveAuthorizedTeacherId(requestedTeacherId: String): String? {
+        if (requestedTeacherId.isBlank()) return null
+        val activeId = teacherIdProvider()?.takeIf { it.isNotBlank() } ?: return null
+        if (activeId != requestedTeacherId) return null
+        return if (sessionActiveChecker(activeId)) activeId else null
+    }
+
+    fun clearCache() {
+        _sessionGroups.value = null to emptyList()
+        _sessionGroupDays.value = null to emptyList()
+    }
+
+    override fun observeGroups(teacherId: String): Flow<List<Group>> =
+        _sessionGroups.map { (ownerId, list) ->
+            val validId = resolveAuthorizedTeacherId(teacherId)
+            if (validId == null || ownerId != validId) emptyList() else list.filter { it.teacherId == validId }
+        }
 
     override fun observeActiveGroups(teacherId: String): Flow<List<Group>> =
-        groupDao?.observeActiveGroupsByTeacher(teacherId)?.map { it.map { e -> e.toDomain() } } ?: kotlinx.coroutines.flow.flowOf(emptyList())
+        observeGroups(teacherId).map { list -> list.filter { it.active } }
 
     override fun observeGroupsByGrade(teacherId: String, gradeId: String): Flow<List<Group>> =
-        groupDao?.observeGroupsByGrade(teacherId, gradeId)?.map { it.map { e -> e.toDomain() } } ?: kotlinx.coroutines.flow.flowOf(emptyList())
+        observeGroups(teacherId).map { list -> list.filter { it.gradeId == gradeId } }
 
-    override suspend fun getGroupById(teacherId: String, groupId: String): Group? =
-        withContext(Dispatchers.IO) {
-            val entity = groupDao?.getGroupById(teacherId, groupId)
-            entity?.toDomain()
+    override suspend fun fetchGroupById(teacherId: String, groupId: String): Result<Group?> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(teacherId)
+            ?: return@withContext Result.failure(IllegalStateException("غير مصرح أو انتهت الجلسة."))
+
+        try {
+            val group = remoteDataSource.fetchGroupById(validTeacherId, groupId)
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب بيانات المجموعة."))
+            }
+            if (group != null && group.teacherId == validTeacherId) {
+                upsertGroupInMemory(validTeacherId, group)
+                Result.success(group)
+            } else {
+                Result.success(null)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseGroupRepo", "Online fetchGroupById failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun getGroupById(teacherId: String, groupId: String): Group? {
+        return fetchGroupById(teacherId, groupId).getOrNull()
+    }
+
+    override suspend fun refreshGroups(teacherId: String): Result<Unit> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(teacherId)
+        if (validTeacherId == null) {
+            clearCache()
+            return@withContext Result.failure(IllegalStateException("غير مصرح أو انتهت الجلسة."))
         }
 
-    override suspend fun refreshGroups(teacherId: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            val remoteGroups = client.postgrest["groups"].select {
-                filter {
-                    eq("teacher_id", teacherId)
-                }
-            }.decodeList<SupabaseGroupDto>()
+            val remoteGroups = remoteDataSource.fetchGroups(validTeacherId)
+                .filter { it.teacherId == validTeacherId }
+            val remoteGroupDays = remoteDataSource.fetchGroupDays(validTeacherId)
+                .filter { it.teacherId == validTeacherId }
 
-            val remoteGroupDays = client.postgrest["group_days"].select {
-                filter {
-                    eq("teacher_id", teacherId)
-                }
-            }.decodeList<SupabaseGroupDayDto>()
-
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                val db = try { com.example.data.local.DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val cachedGroups = groupDao?.getGroupsSync(teacherId) ?: emptyList()
-                val pendingOps = outboxDao?.getUnsyncedOperationsForTeacher(teacherId) ?: emptyList()
-                val protectedGroupIds = pendingOps
-                    .filter { it.entityType.equals("GROUP", ignoreCase = true) || it.entityType.equals("GROUP_DAYS", ignoreCase = true) }
-                    .map { it.entityId }
-                    .toSet()
-
-                val remoteGroupIds = remoteGroups.map { it.id }.toSet()
-                val groupEntities = remoteGroups.map { it.toDomain().toEntity() }
-                val groupDayEntities = remoteGroupDays.map { it.toDomain().toEntity() }
-
-                if (db != null) {
-                    db.withTransaction {
-                        for (g in groupEntities) {
-                            groupDao?.insertGroup(g)
-                        }
-                        groupDayDao?.deleteGroupDaysByTeacher(teacherId)
-                        if (groupDayEntities.isNotEmpty()) {
-                            groupDayDao?.insertGroupDays(groupDayEntities)
-                        }
-                        for (cached in cachedGroups) {
-                            if (!remoteGroupIds.contains(cached.id) && !protectedGroupIds.contains(cached.id)) {
-                                groupDayDao?.deleteGroupDays(cached.id)
-                                groupDao?.deleteGroup(cached)
-                            }
-                        }
-                    }
-                } else {
-                    for (g in groupEntities) {
-                        groupDao?.insertGroup(g)
-                    }
-                    groupDayDao?.deleteGroupDaysByTeacher(teacherId)
-                    if (groupDayEntities.isNotEmpty()) {
-                        groupDayDao?.insertGroupDays(groupDayEntities)
-                    }
-                    for (cached in cachedGroups) {
-                        if (!remoteGroupIds.contains(cached.id) && !protectedGroupIds.contains(cached.id)) {
-                            groupDayDao?.deleteGroupDays(cached.id)
-                            groupDao?.deleteGroup(cached)
-                        }
-                    }
-                }
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تحديث المجموعات."))
             }
+
+            _sessionGroups.value = validTeacherId to remoteGroups
+            _sessionGroupDays.value = validTeacherId to remoteGroupDays
             Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            android.util.Log.e("SupabaseGroupRepo", "Failed to refresh remote groups: ${e.message}")
+            if (_sessionGroups.value.first != validTeacherId) {
+                clearCache()
+            }
+            Log.e("SupabaseGroupRepo", "Online refreshGroups failed: ${e.message}", e)
             Result.failure(e)
         }
     }
 
-    override suspend fun createGroup(group: Group): Result<Group> = withContext(Dispatchers.IO) {
-        try {
-            val entity = group.toEntity()
-            groupDao?.insertGroup(entity)
+    override suspend fun createGroup(group: Group): Result<Group> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(group.teacherId)
+            ?: return@withContext Result.failure(SecurityException("غير مصرح بإنشاء مجموعة لهذا الحساب."))
 
-            val dto = group.toSupabaseDto()
-            try {
-                client.postgrest["groups"].upsert(dto)
-            } catch (cloudEx: Exception) {
-                android.util.Log.w("SupabaseGroupRepo", "Direct group cloud insert failed, queuing to outbox: ${cloudEx.message}")
-                enqueueOutbox(dto, "INSERT", "GROUP")
-                OutboxSyncScheduler.scheduleSync()
+        try {
+            val created = remoteDataSource.createGroup(group)
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء إنشاء المجموعة."))
+            }
+            upsertGroupInMemory(validTeacherId, created)
+            Result.success(created)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseGroupRepo", "Online createGroup failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun updateGroup(group: Group): Result<Group> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(group.teacherId)
+            ?: return@withContext Result.failure(SecurityException("غير مصرح بتعديل هذه المجموعة."))
+
+        try {
+            val updated = remoteDataSource.updateGroup(group)
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تحديث المجموعة."))
+            }
+            upsertGroupInMemory(validTeacherId, updated)
+            Result.success(updated)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseGroupRepo", "Online updateGroup failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun deactivateGroup(teacherId: String, groupId: String): Result<Unit> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(teacherId)
+            ?: return@withContext Result.failure(SecurityException("غير مصرح بتعطيل هذه المجموعة."))
+
+        try {
+            val updated = remoteDataSource.setGroupActive(validTeacherId, groupId, false)
+                ?: return@withContext Result.failure(NoSuchElementException("المجموعة غير موجودة."))
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تعطيل المجموعة."))
+            }
+            upsertGroupInMemory(validTeacherId, updated)
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseGroupRepo", "Online deactivateGroup failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun deleteGroup(teacherId: String, groupId: String): Result<Unit> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(teacherId)
+            ?: return@withContext Result.failure(SecurityException("غير مصرح بحذف هذه المجموعة."))
+
+        try {
+            val group = remoteDataSource.fetchGroupById(validTeacherId, groupId)
+                ?: return@withContext Result.failure(NoSuchElementException("المجموعة غير موجودة."))
+            if (group.teacherId != validTeacherId) {
+                return@withContext Result.failure(SecurityException("غير مصرح بحذف هذه المجموعة."))
             }
 
-            Result.success(group)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun updateGroup(group: Group): Result<Group> = withContext(Dispatchers.IO) {
-        try {
-            val entity = group.toEntity()
-            groupDao?.updateGroup(entity)
-
-            val dto = group.toSupabaseDto()
-            try {
-                client.postgrest["groups"].upsert(dto)
-            } catch (cloudEx: Exception) {
-                android.util.Log.w("SupabaseGroupRepo", "Direct group cloud update failed, queuing to outbox: ${cloudEx.message}")
-                enqueueOutbox(dto, "UPDATE", "GROUP")
-                OutboxSyncScheduler.scheduleSync()
+            // CRITICAL SAFETY CHECK: Never delete group_days before confirming deletion is allowed!
+            val hasLinkedStudents = remoteDataSource.hasStudentsInGroup(validTeacherId, groupId)
+            val hasLinkedAttendance = remoteDataSource.hasAttendanceInGroup(validTeacherId, groupId)
+            if (hasLinkedStudents || hasLinkedAttendance) {
+                return@withContext Result.failure(
+                    GroupDeletionBlockedException(
+                        "لا يمكن حذف المجموعة لأنها مرتبطة بطلاب مسجلين أو سجلات حضور سابقة. يمكنك تعطيل المجموعة بدلاً من حذفها."
+                    )
+                )
             }
 
-            Result.success(group)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+            // Backup current group_days in case a concurrent insert causes a FK failure on deleteGroupRow
+            val backupDays = remoteDataSource.fetchGroupDaysForGroup(validTeacherId, groupId)
 
-    override suspend fun deleteGroup(teacherId: String, groupId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        try {
-            val authId = getAuthenticatedTeacherId()
-            if (authId != teacherId) return@withContext Result.failure(Exception("غير مصرح بحذف هذه المجموعة."))
-
-            val group = groupDao?.getGroupById(teacherId, groupId) ?: return@withContext Result.failure(Exception("المجموعة غير موجودة."))
-            if (group.teacherId != teacherId) return@withContext Result.failure(Exception("غير مصرح بحذف هذه المجموعة."))
-
-            // Try cloud delete first to properly check foreign key constraints (students / attendance)
+            remoteDataSource.deleteGroupDays(validTeacherId, groupId)
             try {
-                client.postgrest["group_days"].delete {
-                    filter {
-                        eq("group_id", groupId)
-                        eq("teacher_id", teacherId)
+                remoteDataSource.deleteGroupRow(validTeacherId, groupId)
+            } catch (deleteEx: Exception) {
+                if (backupDays.isNotEmpty()) {
+                    try {
+                        remoteDataSource.insertGroupDays(backupDays)
+                    } catch (restoreEx: Exception) {
+                        Log.w("SupabaseGroupRepo", "Failed to restore group_days after delete rollback: ${restoreEx.message}")
                     }
                 }
-                client.postgrest["groups"].delete {
-                    filter {
-                        eq("id", groupId)
-                        eq("teacher_id", teacherId)
-                    }
-                }
-
-                // If cloud delete succeeded, remove from local Room
-                groupDayDao?.deleteGroupDays(groupId)
-                groupDao?.deleteGroup(group)
-                Result.success(Unit)
-            } catch (cloudEx: Exception) {
-                val msg = cloudEx.message?.lowercase() ?: ""
+                val msg = deleteEx.message?.lowercase() ?: ""
                 if (msg.contains("foreign key") || msg.contains("23503") || msg.contains("violates foreign key") || msg.contains("is still referenced")) {
-                    Result.failure(Exception("لا يمكن حذف المجموعة لأنها مرتبطة بطلاب مسجلين أو سجلات حضور سابقة. يمكنك إلغاء تفعيل المجموعة بدلاً من حذفها."))
-                } else {
-                    // Offline fallback: delete locally and queue delete op
-                    groupDayDao?.deleteGroupDays(groupId)
-                    groupDao?.deleteGroup(group)
-                    enqueueOutbox(group.toDomain().toSupabaseDto(), "DELETE", "GROUP")
-                    OutboxSyncScheduler.scheduleSync()
-                    Result.success(Unit)
+                    return@withContext Result.failure(
+                        GroupDeletionBlockedException(
+                            "لا يمكن حذف المجموعة لأنها مرتبطة بطلاب مسجلين أو سجلات حضور سابقة. يمكنك تعطيل المجموعة بدلاً من حذفها."
+                        )
+                    )
                 }
-            }
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun deactivateGroup(teacherId: String, groupId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        try {
-            val entity = groupDao?.getGroupById(teacherId, groupId) ?: return@withContext Result.failure(Exception("Group not found"))
-            if (entity.teacherId != teacherId) return@withContext Result.failure(Exception("Cross-tenant group update rejected"))
-            val updated = entity.toDomain().copy(active = false)
-            updateGroup(updated).map { }
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun assignStudentToGroup(teacherId: String, studentId: String, groupId: String?): Result<Unit> = withContext(Dispatchers.IO) {
-        try {
-            val authId = getAuthenticatedTeacherId()
-            if (authId != teacherId) return@withContext Result.failure(Exception("Cross-tenant assignment rejected"))
-            
-            val student = studentDao?.getStudentByIdSync(teacherId, studentId) ?: return@withContext Result.failure(Exception("Student not found"))
-            
-            if (groupId != null) {
-                val group = groupDao?.getGroupById(teacherId, groupId) ?: return@withContext Result.failure(Exception("Group not found"))
-                if (group.teacherId != teacherId) return@withContext Result.failure(Exception("Cross-tenant group assignment rejected"))
-                if (group.gradeId != student.gradeId) return@withContext Result.failure(Exception("Incompatible grade"))
+                return@withContext Result.failure(deleteEx)
             }
 
-            val updatedStudent = student.copy(groupId = groupId)
-            studentDao?.upsertStudent(updatedStudent)
-            
-            val updateReq = UpdateStudentRequest(
-                gradeId = updatedStudent.gradeId,
-                fullName = updatedStudent.fullName,
-                parentPhone = updatedStudent.parentPhone,
-                hasWhatsApp = updatedStudent.hasWhatsApp,
-                alternativePhone = updatedStudent.alternativePhone,
-                groupId = updatedStudent.groupId
-            )
-            val json = Json.encodeToString(updateReq)
-            val outbox = OutboxEntity(
-                id = UUID.randomUUID().toString(),
-                operationType = "UPDATE",
-                entityType = "STUDENT",
-                entityId = studentId,
-                payload = json,
-                createdAt = System.currentTimeMillis(),
-                teacherId = authId
-            )
-            val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(authId) {
-                outboxDao?.insertOperation(outbox)
-                true
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.success(Unit)
             }
-            if (written == null) {
-                return@withContext Result.failure(Exception("انتهت الجلسة، تعذر تحديث مجموعة الطالب محلياً."))
+
+            // Remove from in-memory state ONLY after server deletion succeeds
+            val (gOwner, gList) = _sessionGroups.value
+            if (gOwner == validTeacherId) {
+                _sessionGroups.value = validTeacherId to gList.filterNot { it.id == groupId }
             }
-            OutboxSyncScheduler.scheduleSync()
+            val (dOwner, dList) = _sessionGroupDays.value
+            if (dOwner == validTeacherId) {
+                _sessionGroupDays.value = validTeacherId to dList.filterNot { it.groupId == groupId }
+            }
 
             Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
+            Log.e("SupabaseGroupRepo", "Online deleteGroup failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun assignStudentToGroup(teacherId: String, studentId: String, groupId: String?): Result<Unit> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(teacherId)
+            ?: return@withContext Result.failure(SecurityException("غير مصرح بتحديث مجموعة الطالب."))
+
+        try {
+            val student = remoteDataSource.fetchStudentById(validTeacherId, studentId)
+                ?: return@withContext Result.failure(NoSuchElementException("لم يتم العثور على الطالب."))
+
+            if (groupId != null) {
+                val group = remoteDataSource.fetchGroupById(validTeacherId, groupId)
+                    ?: return@withContext Result.failure(NoSuchElementException("المجموعة غير موجودة."))
+                if (group.teacherId != validTeacherId) {
+                    return@withContext Result.failure(SecurityException("غير مصرح بتعيين الطالب لهذه المجموعة."))
+                }
+                if (group.gradeId != student.gradeId) {
+                    return@withContext Result.failure(IllegalArgumentException("المجموعة غير متوافقة مع الصف الدراسي للطالب."))
+                }
+            }
+
+            val updatedStudent = remoteDataSource.updateStudentGroup(validTeacherId, studentId, groupId)
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تعيين المجموعة."))
+            }
+
+            onStudentUpdated?.invoke(updatedStudent)
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseGroupRepo", "Online assignStudentToGroup failed: ${e.message}", e)
             Result.failure(e)
         }
     }
 
     override fun observeGroupDays(teacherId: String, groupId: String): Flow<List<GroupDay>> =
-        groupDayDao?.observeGroupDays(groupId)?.map { it.map { e -> e.toDomain() } } ?: kotlinx.coroutines.flow.flowOf(emptyList())
+        observeAllGroupDays(teacherId).map { list -> list.filter { it.groupId == groupId } }
 
     override fun observeAllGroupDays(teacherId: String): Flow<List<GroupDay>> =
-        groupDayDao?.observeGroupDaysByTeacher(teacherId)?.map { it.map { e -> e.toDomain() } } ?: kotlinx.coroutines.flow.flowOf(emptyList())
+        _sessionGroupDays.map { (ownerId, list) ->
+            val validId = resolveAuthorizedTeacherId(teacherId)
+            if (validId == null || ownerId != validId) emptyList() else list.filter { it.teacherId == validId }
+        }
 
-    override suspend fun replaceGroupDays(teacherId: String, groupId: String, days: List<String>): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun replaceGroupDays(teacherId: String, groupId: String, days: List<String>): Result<Unit> = withContext(ioDispatcher) {
+        val validTeacherId = resolveAuthorizedTeacherId(teacherId)
+            ?: return@withContext Result.failure(SecurityException("غير مصرح بتعديل أيام المجموعة."))
+
+        val cleanDays = days.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        val newGroupDays = cleanDays.map { GroupDay(teacherId = validTeacherId, groupId = groupId, dayOfWeek = it) }
+
         try {
-            val authId = getAuthenticatedTeacherId()
-            if (authId != teacherId) return@withContext Result.failure(Exception("Cross-tenant rejected"))
-            
-            val entities = days.map { GroupDayEntity(teacherId, groupId, it) }
-            val dtos = days.map { SupabaseGroupDayDto(teacherId, groupId, it) }
-            
+            val previousDays = remoteDataSource.fetchGroupDaysForGroup(validTeacherId, groupId)
+            remoteDataSource.deleteGroupDays(validTeacherId, groupId)
             try {
-                DatabaseProvider.getDatabase().withTransaction {
-                    groupDayDao?.deleteGroupDays(groupId)
-                    groupDayDao?.insertGroupDays(entities)
+                if (newGroupDays.isNotEmpty()) {
+                    remoteDataSource.insertGroupDays(newGroupDays)
                 }
-            } catch (_: Exception) {
-                groupDayDao?.deleteGroupDays(groupId)
-                groupDayDao?.insertGroupDays(entities)
-            }
-            
-            try {
-                client.postgrest["group_days"].delete {
-                    filter {
-                        eq("group_id", groupId)
-                        eq("teacher_id", teacherId)
+            } catch (insertEx: Exception) {
+                if (previousDays.isNotEmpty()) {
+                    try {
+                        remoteDataSource.insertGroupDays(previousDays)
+                    } catch (restoreEx: Exception) {
+                        Log.w("SupabaseGroupRepo", "Failed to restore previous group_days: ${restoreEx.message}")
                     }
                 }
-                if (dtos.isNotEmpty()) {
-                    client.postgrest["group_days"].upsert(dtos)
-                }
-            } catch (cloudEx: Exception) {
-                android.util.Log.w("SupabaseGroupRepo", "Direct group_days cloud replace failed, queuing outbox: ${cloudEx.message}")
-                enqueueOutbox(dtos, "REPLACE", "GROUP_DAYS")
-                OutboxSyncScheduler.scheduleSync()
+                return@withContext Result.failure(insertEx)
             }
-            
+
+            if (!sessionActiveChecker(validTeacherId) || teacherIdProvider() != validTeacherId) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حفظ أيام المجموعة."))
+            }
+
+            // Update in-memory state ONLY after server confirmation
+            val (ownerId, currentDays) = _sessionGroupDays.value
+            val baseDays = if (ownerId == validTeacherId) currentDays else emptyList()
+            _sessionGroupDays.value = validTeacherId to (baseDays.filterNot { it.groupId == groupId } + newGroupDays)
+
             Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
+            Log.e("SupabaseGroupRepo", "Online replaceGroupDays failed: ${e.message}", e)
             Result.failure(e)
         }
     }
 
-    private suspend fun enqueueOutbox(payloadObject: Any, operation: String, type: String) {
-        val authId = getAuthenticatedTeacherId()
-        val json = when (payloadObject) {
-            is SupabaseGroupDto -> Json.encodeToString(payloadObject)
-            is SupabaseGroupDayDto -> Json.encodeToString(payloadObject)
-            is List<*> -> {
-                val groupDays = payloadObject.filterIsInstance<SupabaseGroupDayDto>()
-                if (groupDays.isNotEmpty()) {
-                    Json.encodeToString(groupDays)
-                } else {
-                    "[]"
-                }
-            }
-            is Group -> Json.encodeToString(payloadObject.toSupabaseDto())
-            is GroupEntity -> Json.encodeToString(payloadObject.toDomain().toSupabaseDto())
-            else -> "{}"
+    private fun upsertGroupInMemory(teacherId: String, group: Group) {
+        val (ownerId, currentList) = _sessionGroups.value
+        val baseList = if (ownerId == teacherId) currentList else emptyList()
+        val mutable = baseList.toMutableList()
+        val idx = mutable.indexOfFirst { it.id == group.id }
+        if (idx >= 0) {
+            mutable[idx] = group
+        } else {
+            mutable.add(0, group)
         }
-        val outbox = OutboxEntity(
-            id = UUID.randomUUID().toString(),
-            operationType = operation,
-            entityType = type,
-            entityId = when(payloadObject) {
-                is SupabaseGroupDto -> payloadObject.id
-                is SupabaseGroupDayDto -> payloadObject.groupId
-                is Group -> payloadObject.id
-                is GroupEntity -> payloadObject.id
-                is List<*> -> (payloadObject.firstOrNull() as? SupabaseGroupDayDto)?.groupId ?: "BATCH"
-                else -> ""
-            },
-            payload = json,
-            createdAt = System.currentTimeMillis(),
-            teacherId = authId
-        )
-        com.example.data.auth.AccountSessionManager.runIfSessionActive(authId) {
-            outboxDao?.insertOperation(outbox)
-        }
+        _sessionGroups.value = teacherId to mutable
     }
 }

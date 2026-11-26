@@ -3,15 +3,18 @@ package com.example.ui.add_edit_student
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Grade
 import com.example.core.model.Group
+import com.example.core.model.OnlineLoadState
 import com.example.core.model.Student
+import com.example.data.SupabaseClientProvider
 import com.example.data.repository.GradeRepository
 import com.example.data.repository.GroupRepository
 import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
 import com.example.data.repository.TeacherRepository
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,7 +42,11 @@ data class AddEditStudentUiState(
     val selectedGroupId: String? = null,
     val isSaving: Boolean = false,
     val createdStudent: Student? = null,
-    val showSuccessDialog: Boolean = false
+    val showSuccessDialog: Boolean = false,
+    val loadState: OnlineLoadState<Unit> = OnlineLoadState.Success(Unit),
+    val isOfflineError: Boolean = false,
+    val loadErrorMessage: String? = null,
+    val groupsErrorMessage: String? = null
 )
 
 sealed class AddEditStudentEvent {
@@ -62,7 +69,8 @@ class AddEditStudentViewModel(
         AddEditStudentUiState(
             isEditMode = studentIdArg != null,
             studentId = studentIdArg,
-            selectedGradeId = gradeIdArg ?: ""
+            selectedGradeId = gradeIdArg ?: "",
+            loadState = if (studentIdArg != null) OnlineLoadState.Loading else OnlineLoadState.Success(Unit)
         )
     )
     val uiState: StateFlow<AddEditStudentUiState> = _uiState.asStateFlow()
@@ -102,6 +110,18 @@ class AddEditStudentViewModel(
         }
     }
 
+    fun retryLoad() {
+        val id = _uiState.value.studentId ?: studentIdArg
+        if (!id.isNullOrBlank()) {
+            loadExistingStudent(id)
+        } else {
+            val gradeId = _uiState.value.selectedGradeId
+            if (gradeId.isNotBlank()) {
+                loadGroups(gradeId, _uiState.value.selectedGroupId)
+            }
+        }
+    }
+
     private fun loadGrades() {
         viewModelScope.launch {
             gradeRepository.refreshGrades()
@@ -129,17 +149,24 @@ class AddEditStudentViewModel(
     fun loadGroups(gradeId: String, currentAssignedGroupId: String? = _uiState.value.selectedGroupId) {
         groupsObserveJob?.cancel()
         if (gradeId.isBlank()) {
-            _uiState.update { it.copy(groups = emptyList(), selectedGroupId = null) }
+            _uiState.update { it.copy(groups = emptyList(), selectedGroupId = null, groupsErrorMessage = null) }
             return
         }
 
         groupsObserveJob = viewModelScope.launch {
             val teacher = teacherRepository.fetchCurrentTeacher()
-            val teacherId = teacher?.id ?: com.example.data.SupabaseClientProvider.mockTeacherId ?: ""
+            val teacherId = teacher?.id ?: SupabaseClientProvider.mockTeacherId ?: ""
             if (teacherId.isBlank()) return@launch
 
+            val refreshResult = groupRepository.refreshGroups(teacherId)
+            if (refreshResult.isFailure) {
+                val msg = refreshResult.exceptionOrNull()?.toArabicErrorMessage()
+                _uiState.update { it.copy(groupsErrorMessage = msg) }
+            } else {
+                _uiState.update { it.copy(groupsErrorMessage = null) }
+            }
+
             groupRepository.observeGroupsByGrade(teacherId, gradeId).collect { groupsList ->
-                // Filter: Active groups for this grade, PLUS if currentAssignedGroupId is in groupsList (even if inactive), include it
                 val eligibleGroups = groupsList.filter { group ->
                     group.active || (group.id == currentAssignedGroupId)
                 }
@@ -159,34 +186,70 @@ class AddEditStudentViewModel(
 
     private fun loadExistingStudent(studentId: String) {
         viewModelScope.launch {
-            val student = studentRepository.getStudentById(studentId)
-            if (student != null) {
-                initialStudentGroupId = student.groupId
-                val existingGrade = gradeRepository.getGradeById(student.gradeId)
-                if (existingGrade != null) {
-                    val isAlreadyInCurrentGrades = _uiState.value.grades.any { it.id == existingGrade.id }
-                    if (!isAlreadyInCurrentGrades) {
-                        previousStageGrade = existingGrade.copy(name = "${existingGrade.name} — مرحلة سابقة")
-                    }
-                }
+            _uiState.update {
+                it.copy(
+                    loadState = OnlineLoadState.Loading,
+                    isOfflineError = false,
+                    loadErrorMessage = null
+                )
+            }
 
-                _uiState.update { current ->
-                    val combinedGrades = buildCombinedGradesList(current.grades, previousStageGrade)
-                    current.copy(
-                        isEditMode = true,
-                        studentId = student.studentId,
-                        fullName = student.fullName,
-                        selectedGradeId = student.gradeId,
-                        parentPhone = student.parentPhone,
-                        hasWhatsApp = student.hasWhatsApp,
-                        alternativePhone = student.alternativePhone ?: "",
-                        existingStudentCode = student.studentCode,
-                        selectedGroupId = student.groupId,
-                        grades = combinedGrades
+            val studentResult = studentRepository.fetchStudentById(studentId)
+            if (studentResult.isFailure) {
+                val ex = studentResult.exceptionOrNull()
+                val offline = ex?.isOfflineOrNetworkError() ?: true
+                val msg = ex?.toArabicErrorMessage() ?: "تعذر جلب بيانات الطالب من السيرفر."
+                _uiState.update {
+                    it.copy(
+                        loadState = if (offline) OnlineLoadState.Offline(msg) else OnlineLoadState.Error(msg),
+                        isOfflineError = offline,
+                        loadErrorMessage = msg
                     )
                 }
-                loadGroups(student.gradeId, student.groupId)
+                return@launch
             }
+
+            val student = studentResult.getOrNull()
+            if (student == null) {
+                val msg = "لم يتم العثور على بيانات الطالب على السيرفر."
+                _uiState.update {
+                    it.copy(
+                        loadState = OnlineLoadState.Error(msg),
+                        isOfflineError = false,
+                        loadErrorMessage = msg
+                    )
+                }
+                return@launch
+            }
+
+            initialStudentGroupId = student.groupId
+            val existingGrade = gradeRepository.getGradeById(student.gradeId)
+            if (existingGrade != null) {
+                val isAlreadyInCurrentGrades = _uiState.value.grades.any { it.id == existingGrade.id }
+                if (!isAlreadyInCurrentGrades) {
+                    previousStageGrade = existingGrade.copy(name = "${existingGrade.name} — مرحلة سابقة")
+                }
+            }
+
+            _uiState.update { current ->
+                val combinedGrades = buildCombinedGradesList(current.grades, previousStageGrade)
+                current.copy(
+                    isEditMode = true,
+                    studentId = student.studentId,
+                    fullName = student.fullName,
+                    selectedGradeId = student.gradeId,
+                    parentPhone = student.parentPhone,
+                    hasWhatsApp = student.hasWhatsApp,
+                    alternativePhone = student.alternativePhone ?: "",
+                    existingStudentCode = student.studentCode,
+                    selectedGroupId = student.groupId,
+                    grades = combinedGrades,
+                    loadState = OnlineLoadState.Success(Unit),
+                    isOfflineError = false,
+                    loadErrorMessage = null
+                )
+            }
+            loadGroups(student.gradeId, student.groupId)
         }
     }
 
@@ -242,7 +305,6 @@ class AddEditStudentViewModel(
     }
 
     private fun validatePhone(phone: String): Boolean {
-        // Egyptian phone number check (010, 011, 012, 015 + 8 digits = 11 digits)
         return phone.length == 11 && phone.startsWith("01")
     }
 
@@ -281,16 +343,22 @@ class AddEditStudentViewModel(
             return
         }
 
-        // Set isSaving synchronously to block subsequent clicks immediately
         _uiState.update { it.copy(isSaving = true) }
 
         viewModelScope.launch {
             val teacher = teacherRepository.fetchCurrentTeacher()
-            val tId = teacher?.id ?: ""
+            val tId = teacher?.id ?: SupabaseClientProvider.mockTeacherId ?: ""
 
-            // Validation: Group must belong to current teacher and match selected gradeId
             if (state.selectedGroupId != null) {
-                val group = groupRepository.getGroupById(tId, state.selectedGroupId)
+                val groupResult = groupRepository.fetchGroupById(tId, state.selectedGroupId)
+                if (groupResult.isFailure) {
+                    _uiState.update { it.copy(isSaving = false) }
+                    val errorMsg = groupResult.exceptionOrNull()?.toArabicErrorMessage()
+                        ?: "تعذر التحقق من المجموعة على السيرفر."
+                    _events.emit(AddEditStudentEvent.ShowError(errorMsg))
+                    return@launch
+                }
+                val group = groupResult.getOrNull()
                 if (group == null || group.teacherId != tId || group.gradeId != state.selectedGradeId) {
                     _uiState.update { it.copy(isSaving = false) }
                     _events.emit(AddEditStudentEvent.ShowError("المجموعة غير متوافقة مع الصف الدراسي."))
@@ -312,12 +380,22 @@ class AddEditStudentViewModel(
                 )
                 val result = studentRepository.updateStudent(updatedStudent)
                 if (result.isSuccess) {
-                    groupRepository.assignStudentToGroup(tId, state.studentId, state.selectedGroupId)
+                    val serverStudent = result.getOrNull()
+                    if (serverStudent?.groupId != state.selectedGroupId) {
+                        val assignRes = groupRepository.assignStudentToGroup(tId, state.studentId, state.selectedGroupId)
+                        if (assignRes.isFailure) {
+                            _uiState.update { it.copy(isSaving = false) }
+                            val msg = assignRes.exceptionOrNull()?.toArabicErrorMessage()
+                                ?: "تم تحديث بيانات الطالب لكن تعذر تحديث المجموعة على السيرفر."
+                            _events.emit(AddEditStudentEvent.ShowError(msg))
+                            return@launch
+                        }
+                    }
                     _uiState.update { it.copy(isSaving = false) }
                     _events.emit(AddEditStudentEvent.StudentUpdated)
                 } else {
                     _uiState.update { it.copy(isSaving = false) }
-                    val errorMsg = result.exceptionOrNull()?.message ?: "فشل تحديث بيانات الطالب"
+                    val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل تحديث بيانات الطالب"
                     _events.emit(AddEditStudentEvent.ShowError(errorMsg))
                 }
             } else {
@@ -329,25 +407,44 @@ class AddEditStudentViewModel(
                     alternativePhone = state.alternativePhone.ifBlank { null }
                 )
                 if (result.isSuccess) {
-                    val syncResult = result.getOrNull()
-                    val newStudent = syncResult?.data
+                    val newStudent = result.getOrNull()?.data
                     if (newStudent != null && state.selectedGroupId != null) {
-                        groupRepository.assignStudentToGroup(tId, newStudent.studentId, state.selectedGroupId)
+                        val assignResult = groupRepository.assignStudentToGroup(tId, newStudent.studentId, state.selectedGroupId)
+                        if (assignResult.isFailure) {
+                            // Switch to edit mode so a retry updates this server-created student without creating a duplicate
+                            _uiState.update { current ->
+                                current.copy(
+                                    isSaving = false,
+                                    isEditMode = true,
+                                    studentId = newStudent.studentId,
+                                    existingStudentCode = newStudent.studentCode
+                                )
+                            }
+                            val errMsg = assignResult.exceptionOrNull()?.toArabicErrorMessage()
+                                ?: "تعذر ربط الطالب بالمجموعة على السيرفر."
+                            _events.emit(
+                                AddEditStudentEvent.ShowError(
+                                    "تم إنشاء الطالب (${newStudent.studentCode}) لكن تعذر تعيين المجموعة: $errMsg"
+                                )
+                            )
+                            return@launch
+                        }
                     }
-                    val isQueuedOffline = syncResult?.syncStatus == BatchSyncStatus.QUEUED_OFFLINE
+
                     _uiState.update { current ->
                         current.copy(
                             isSaving = false,
-                            createdStudent = if (state.selectedGroupId != null && newStudent != null) newStudent.copy(groupId = state.selectedGroupId) else newStudent,
+                            createdStudent = if (state.selectedGroupId != null && newStudent != null) {
+                                newStudent.copy(groupId = state.selectedGroupId)
+                            } else {
+                                newStudent
+                            },
                             showSuccessDialog = true
                         )
                     }
-                    if (isQueuedOffline) {
-                        _events.emit(AddEditStudentEvent.ShowError("تم حفظ الطالب محلياً وسيعاد مزامنته فور توفر الاتصال 📡"))
-                    }
                 } else {
                     _uiState.update { it.copy(isSaving = false) }
-                    val errorMsg = result.exceptionOrNull()?.message ?: "فشل إضافة الطالب"
+                    val errorMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "فشل إضافة الطالب"
                     _events.emit(AddEditStudentEvent.ShowError(errorMsg))
                 }
             }

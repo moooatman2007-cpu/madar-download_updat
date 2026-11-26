@@ -132,8 +132,16 @@ class MockStudentRepository(
         }
     }
 
+    override suspend fun refreshStudents(): Result<List<Student>> {
+        return Result.success(_students.value)
+    }
+
     override suspend fun getStudentById(studentId: String): Student? {
         return _students.value.find { it.studentId == studentId }
+    }
+
+    override suspend fun fetchStudentById(studentId: String): Result<Student?> {
+        return Result.success(getStudentById(studentId))
     }
 
     override suspend fun getStudentByCode(studentCode: String): Student? {

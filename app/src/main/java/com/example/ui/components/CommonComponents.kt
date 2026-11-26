@@ -672,3 +672,118 @@ fun AddSuccessDialog(
         }
     }
 }
+
+@Composable
+fun OnlineStatusStateView(
+    isOffline: Boolean,
+    message: String,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(Dimens.Spacing32)
+            .testTag(if (isOffline) "offline_state_view" else "error_state_view"),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(72.dp)
+                .clip(CircleShape)
+                .background(DangerRedLight)
+        ) {
+            Icon(
+                imageVector = if (isOffline) Icons.Default.Clear else Icons.Default.Delete,
+                contentDescription = if (isOffline) "لا يوجد اتصال بالإنترنت" else "خطأ في التحميل",
+                tint = DangerRed,
+                modifier = Modifier.size(34.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(Dimens.Spacing16))
+
+        Text(
+            text = if (isOffline) "لا يوجد اتصال بالإنترنت" else "تعذر تحميل البيانات",
+            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+            color = MaterialTheme.colorScheme.onSurface,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(Dimens.Spacing8))
+
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = Dimens.Spacing12)
+        )
+
+        Spacer(modifier = Modifier.height(Dimens.Spacing20))
+
+        Button(
+            onClick = onRetry,
+            shape = RoundedCornerShape(Dimens.Radius16),
+            colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo),
+            modifier = Modifier
+                .height(48.dp)
+                .testTag("online_retry_button")
+        ) {
+            Text(
+                text = "إعادة المحاولة",
+                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                color = Color.White,
+                modifier = Modifier.padding(horizontal = Dimens.Spacing12)
+            )
+        }
+    }
+}
+
+@Composable
+fun OnlineInlineErrorBanner(
+    isOffline: Boolean,
+    message: String,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(Dimens.Radius12),
+        color = DangerRedLight,
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("online_inline_error_banner")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = Dimens.Spacing12, vertical = Dimens.Spacing10),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (isOffline) "انقطع الاتصال بالسيرفر" else "تعذر تحديث البيانات",
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                    color = DangerRed
+                )
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(modifier = Modifier.width(Dimens.Spacing8))
+            OutlinedButton(
+                onClick = onRetry,
+                shape = RoundedCornerShape(Dimens.Radius12),
+                modifier = Modifier.testTag("online_inline_retry_button")
+            ) {
+                Text("إعادة المحاولة", color = DangerRed, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+

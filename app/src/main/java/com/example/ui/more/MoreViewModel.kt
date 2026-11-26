@@ -4,16 +4,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.model.Grade
 import com.example.data.SupabaseClientProvider
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.entity.OutboxEntity
 import com.example.data.repository.GradeRepository
 import com.example.data.repository.NotificationPreferences
 import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.SettingsRepository
 import com.example.data.repository.TeacherRepository
 import com.example.data.repository.ThemeMode
-import com.example.data.sync.OutboxSyncScheduler
 import io.github.jan.supabase.auth.auth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -69,14 +65,7 @@ data class MoreUiState(
     val defaultMonthlyFee: Double = 0.0,
     val notificationPrefs: NotificationPreferences = NotificationPreferences(),
     val showNotificationsDialog: Boolean = false,
-    val showLanguageDialog: Boolean = false,
-    val showOutboxDialog: Boolean = false,
-    val pendingOutboxCount: Int = 0,
-    val failedOutboxCount: Int = 0,
-    val unsyncedOutboxItems: List<OutboxEntity> = emptyList(),
-    val isRetryingOutbox: Boolean = false,
-    val outboxMessage: String? = null,
-    val requireForceLogoutConfirm: Boolean = false
+    val showLanguageDialog: Boolean = false
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -87,8 +76,7 @@ class MoreViewModel(
     private val okHttpClient: OkHttpClient = defaultOkHttpClient,
     private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
     private val runInitialCheck: Boolean = true,
-    edgeFunctionUrl: String? = null,
-    private val outboxDao: OutboxDao? = try { DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null }
+    edgeFunctionUrl: String? = null
 ) : ViewModel() {
 
     companion object {
@@ -150,30 +138,6 @@ class MoreViewModel(
             }.collect { newState ->
                 _uiState.value = newState
             }
-        }
-
-        viewModelScope.launch {
-            val dao = outboxDao ?: return@launch
-            teacherRepository.getCurrentTeacher()
-                .map { teacher ->
-                    teacher?.id
-                        ?: SupabaseClientProvider.mockTeacherId
-                        ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
-                }
-                .distinctUntilChanged()
-                .flatMapLatest { tId ->
-                    if (tId.isNullOrBlank()) flowOf(emptyList())
-                    else dao.observeUnsyncedOperationsForTeacher(tId)
-                }
-                .collect { ops ->
-                    _uiState.update {
-                        it.copy(
-                            pendingOutboxCount = ops.count { op -> op.status == "PENDING" },
-                            failedOutboxCount = ops.count { op -> op.status == "FAILED" },
-                            unsyncedOutboxItems = ops
-                        )
-                    }
-                }
         }
     }
 
@@ -282,80 +246,11 @@ class MoreViewModel(
         _uiState.update { it.copy(showLanguageDialog = false) }
     }
 
-    fun openOutboxDialog() {
-        _uiState.update { it.copy(showOutboxDialog = true, outboxMessage = null) }
-    }
-
-    fun closeOutboxDialog() {
-        _uiState.update { it.copy(showOutboxDialog = false, outboxMessage = null) }
-    }
-
-    fun retryPendingOutbox() {
-        if (_uiState.value.isRetryingOutbox) return
-        viewModelScope.launch {
-            _uiState.update { it.copy(isRetryingOutbox = true, outboxMessage = null) }
-            try {
-                val teacherId = com.example.data.auth.AccountSessionManager.getActiveTeacherId()
-                if (teacherId.isNullOrBlank() || outboxDao == null) {
-                    _uiState.update {
-                        it.copy(
-                            isRetryingOutbox = false,
-                            outboxMessage = "تعذر الوصول إلى قائمة المزامنة المحلية."
-                        )
-                    }
-                    return@launch
-                }
-
-                var resetCount = 0
-                var permanentCount = 0
-                withContext(ioDispatcher) {
-                    val ops = outboxDao.getUnsyncedOperationsForTeacher(teacherId)
-                    for (op in ops) {
-                        if (op.status == "FAILED") {
-                            val err = op.lastError?.lowercase().orEmpty()
-                            val isPermanentConstraint = err.contains("violates foreign key") ||
-                                err.contains("violates unique constraint") ||
-                                err.contains("duplicate key") ||
-                                err.contains("23503") ||
-                                err.contains("23505") ||
-                                err.contains("23502")
-                            if (isPermanentConstraint) {
-                                permanentCount++
-                            } else {
-                                outboxDao.updateOperation(op.copy(status = "PENDING", retryCount = 0))
-                                resetCount++
-                            }
-                        }
-                    }
-                    OutboxSyncScheduler.retryNow()
-                }
-
-                val msg = when {
-                    permanentCount > 0 && resetCount == 0 ->
-                        "يوجد $permanentCount عملية متعثرة بسبب تعارض في البيانات (يرجى المراجعة قبل الإزالة)."
-                    resetCount > 0 ->
-                        "تمت إعادة جدولة $resetCount عملية للمزامنة الفورية عبر الشبكة."
-                    else ->
-                        "تم إرسال طلب المزامنة الفورية للعمليات المعلقة."
-                }
-                _uiState.update { it.copy(isRetryingOutbox = false, outboxMessage = msg) }
-            } catch (e: Exception) {
-                _uiState.update {
-                    it.copy(
-                        isRetryingOutbox = false,
-                        outboxMessage = e.localizedMessage ?: "تعذر إعادة جدولة المزامنة"
-                    )
-                }
-            }
-        }
-    }
-
     fun openLogoutDialog() {
         _uiState.update {
             it.copy(
                 showLogoutDialog = true,
-                logoutError = null,
-                requireForceLogoutConfirm = false
+                logoutError = null
             )
         }
     }
@@ -364,8 +259,7 @@ class MoreViewModel(
         _uiState.update {
             it.copy(
                 showLogoutDialog = false,
-                logoutError = null,
-                requireForceLogoutConfirm = false
+                logoutError = null
             )
         }
     }
@@ -378,8 +272,7 @@ class MoreViewModel(
                 _uiState.update {
                     it.copy(
                         isLoggingOut = false,
-                        showLogoutDialog = false,
-                        requireForceLogoutConfirm = false
+                        showLogoutDialog = false
                     )
                 }
                 onSuccess()
@@ -389,31 +282,9 @@ class MoreViewModel(
                 _uiState.update {
                     it.copy(
                         isLoggingOut = false,
-                        logoutError = errorMsg,
-                        requireForceLogoutConfirm = true
+                        logoutError = errorMsg
                     )
                 }
-            }
-        }
-    }
-
-    fun confirmForceLogout(onSuccess: () -> Unit) {
-        if (_uiState.value.isLoggingOut) return
-        viewModelScope.launch {
-            _uiState.update { it.copy(isLoggingOut = true, logoutError = null) }
-            val result = com.example.data.auth.AccountSessionManager.logout(force = true)
-            if (result.isSuccess) {
-                _uiState.update {
-                    it.copy(
-                        isLoggingOut = false,
-                        showLogoutDialog = false,
-                        requireForceLogoutConfirm = false
-                    )
-                }
-                onSuccess()
-            } else {
-                val errorMsg = result.exceptionOrNull()?.localizedMessage ?: "فشل تسجيل الخروج القسري."
-                _uiState.update { it.copy(isLoggingOut = false, logoutError = errorMsg) }
             }
         }
     }

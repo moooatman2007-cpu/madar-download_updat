@@ -11,6 +11,8 @@ import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
 import com.example.data.repository.SupabaseGradeRepository
 import com.example.data.repository.TeacherRepository
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -35,7 +37,9 @@ data class TeacherProfileUiState(
     val isSaving: Boolean = false,
     val errorMessage: String? = null,
     val successMessage: String? = null,
-    val nameError: String? = null
+    val nameError: String? = null,
+    val loadError: String? = null,
+    val isOfflineError: Boolean = false
 )
 
 val PREDEFINED_STAGES = listOf(
@@ -67,12 +71,12 @@ class TeacherProfileViewModel(
         loadData()
     }
 
+    private var gradesObserved = false
+
     fun loadData() {
-        viewModelScope.launch {
-            _uiState.update { it.copy(isLoading = true, errorMessage = null) }
-            
-            // Load grades
-            launch {
+        if (!gradesObserved) {
+            gradesObserved = true
+            viewModelScope.launch {
                 combine(
                     gradeRepository.getGrades(),
                     studentRepository.getStudents()
@@ -86,30 +90,54 @@ class TeacherProfileViewModel(
                     _uiState.update { it.copy(grades = updatedGrades) }
                 }
             }
+        }
 
-            // Fetch Teacher profile
-            val teacher = teacherRepository.fetchCurrentTeacher()
-            if (teacher != null) {
-                val isCustom = teacher.subject != null && !PREDEFINED_SUBJECTS.contains(teacher.subject) && teacher.subject != "أخرى"
-                val selectedSubj = if (isCustom) "أخرى" else (teacher.subject ?: "")
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true, errorMessage = null, loadError = null, isOfflineError = false) }
+            try {
+                val teacher = teacherRepository.fetchCurrentTeacher()
+                if (teacher != null) {
+                    val gradesRes = gradeRepository.refreshGradesResult(teacher.educationalStage)
+                    val studentsRes = studentRepository.refreshStudents()
+                    val subErr = gradesRes.exceptionOrNull() ?: studentsRes.exceptionOrNull()
+                    val isCustom = teacher.subject != null && !PREDEFINED_SUBJECTS.contains(teacher.subject) && teacher.subject != "أخرى"
+                    val selectedSubj = if (isCustom) "أخرى" else (teacher.subject ?: "")
 
+                    _uiState.update {
+                        it.copy(
+                            id = teacher.id,
+                            fullName = teacher.fullName,
+                            email = teacher.email,
+                            phoneNumber = teacher.phoneNumber ?: "",
+                            subject = selectedSubj,
+                            customSubject = if (isCustom) (teacher.subject ?: "") else "",
+                            isCustomSubject = isCustom || selectedSubj == "أخرى",
+                            centerName = teacher.centerName ?: "",
+                            educationalStage = teacher.educationalStage ?: "",
+                            avatarUrl = teacher.avatarUrl,
+                            isLoading = false,
+                            loadError = subErr?.toArabicErrorMessage(),
+                            isOfflineError = subErr?.isOfflineOrNetworkError() ?: false
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            loadError = "تعذر تحميل بيانات الحساب من الخادم.",
+                            isOfflineError = false
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 _uiState.update {
                     it.copy(
-                        id = teacher.id,
-                        fullName = teacher.fullName,
-                        email = teacher.email,
-                        phoneNumber = teacher.phoneNumber ?: "",
-                        subject = selectedSubj,
-                        customSubject = if (isCustom) (teacher.subject ?: "") else "",
-                        isCustomSubject = isCustom || selectedSubj == "أخرى",
-                        centerName = teacher.centerName ?: "",
-                        educationalStage = teacher.educationalStage ?: "",
-                        avatarUrl = teacher.avatarUrl,
-                        isLoading = false
+                        isLoading = false,
+                        loadError = e.toArabicErrorMessage(),
+                        isOfflineError = e.isOfflineOrNetworkError()
                     )
                 }
-            } else {
-                _uiState.update { it.copy(isLoading = false) }
             }
         }
     }
@@ -268,7 +296,7 @@ class TeacherProfileViewModel(
                 _uiState.update { 
                     it.copy(
                         isSaving = false,
-                        errorMessage = error.localizedMessage ?: "فشل حفظ بيانات الحساب، يرجى المحاولة مرة أخرى."
+                        errorMessage = error.toArabicErrorMessage()
                     ) 
                 }
             }

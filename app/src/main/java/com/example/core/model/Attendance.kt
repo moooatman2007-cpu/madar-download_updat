@@ -105,7 +105,6 @@ data class BatchAttendanceResultDto(
 
 enum class BatchSyncStatus {
     SAVED_TO_CLOUD,
-    QUEUED_OFFLINE,
     FAILED
 }
 

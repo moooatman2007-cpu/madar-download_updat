@@ -63,6 +63,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.core.model.Grade
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.Dimens
 import com.example.ui.theme.PrimaryIndigo
@@ -159,6 +161,19 @@ fun GradesScreen(
             ) {
                 CircularProgressIndicator(color = PrimaryIndigo)
             }
+        } else if (uiState.errorMessage != null && uiState.grades.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentAlignment = Alignment.Center
+            ) {
+                OnlineStatusStateView(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.errorMessage!!,
+                    onRetry = { viewModel.refresh() }
+                )
+            }
         } else {
             LazyColumn(
                 modifier = Modifier
@@ -172,6 +187,15 @@ fun GradesScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12)
             ) {
+                if (uiState.errorMessage != null) {
+                    item {
+                        OnlineInlineErrorBanner(
+                            isOffline = uiState.isOfflineError,
+                            message = uiState.errorMessage!!,
+                            onRetry = { viewModel.refresh() }
+                        )
+                    }
+                }
                 // Summary Banner
                 item {
                     Card(
@@ -345,10 +369,19 @@ fun GradesScreen(
                 )
             },
             text = {
-                Text(
-                    text = "هل أنت متأكد من حذف صف \"${target.name}\"؟",
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(Dimens.Spacing8)) {
+                    Text(
+                        text = "هل أنت متأكد من حذف صف \"${target.name}\"؟",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    if (!uiState.deleteError.isNullOrBlank()) {
+                        Text(
+                            text = uiState.deleteError!!,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = DangerRed
+                        )
+                    }
+                }
             },
             confirmButton = {
                 Button(

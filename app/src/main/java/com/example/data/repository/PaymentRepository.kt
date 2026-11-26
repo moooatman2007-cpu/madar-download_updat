@@ -5,34 +5,20 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 
 interface PaymentRepository {
-    /**
-     * Observes/fetches all payments for all students of the current teacher for a specific month and year in a single query.
-     */
     fun getMonthlyPayments(year: Int, month: Int): Flow<List<LessonPayment>>
-
-    /**
-     * Direct suspend function to fetch all payments for the month in one single query.
-     */
     suspend fun getMonthlyPaymentsList(year: Int, month: Int): List<LessonPayment>
+    suspend fun fetchMonthlyPaymentsResult(year: Int, month: Int): Result<List<LessonPayment>> =
+        runCatching { getMonthlyPaymentsList(year, month) }
 
-    /**
-     * Observes all recorded monthly payments for a specific student ordered newest-first.
-     */
     fun observePaymentsByStudent(studentId: String): Flow<List<LessonPayment>> = flowOf(emptyList())
-
-    /**
-     * Fetches all recorded monthly payments for a specific student ordered newest-first.
-     */
     suspend fun getPaymentsForStudentHistory(studentId: String): List<LessonPayment> = emptyList()
+    suspend fun fetchPaymentsForStudentHistoryResult(studentId: String): Result<List<LessonPayment>> =
+        runCatching { getPaymentsForStudentHistory(studentId) }
 
-    /**
-     * Retrieves the payment record for a single student for a specific month and year.
-     */
     suspend fun getPaymentForStudent(studentId: String, year: Int, month: Int): LessonPayment?
+    suspend fun fetchPaymentForStudentResult(studentId: String, year: Int, month: Int): Result<LessonPayment?> =
+        runCatching { getPaymentForStudent(studentId, year, month) }
 
-    /**
-     * Sets the payment status (Paid / Unpaid) for a student for a specific month and year.
-     */
     suspend fun setPaymentStatus(
         studentId: String,
         year: Int,
@@ -41,9 +27,6 @@ interface PaymentRepository {
         amount: Double = 0.0
     ): Result<LessonPayment>
 
-    /**
-     * Toggles the payment status for a student for a specific month and year.
-     */
     suspend fun togglePaymentStatus(
         studentId: String,
         year: Int,

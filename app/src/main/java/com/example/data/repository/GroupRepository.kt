@@ -9,6 +9,8 @@ interface GroupRepository {
     fun observeActiveGroups(teacherId: String): Flow<List<Group>>
     fun observeGroupsByGrade(teacherId: String, gradeId: String): Flow<List<Group>>
     suspend fun getGroupById(teacherId: String, groupId: String): Group?
+    suspend fun fetchGroupById(teacherId: String, groupId: String): Result<Group?> =
+        runCatching { getGroupById(teacherId, groupId) }
     suspend fun createGroup(group: Group): Result<Group>
     suspend fun updateGroup(group: Group): Result<Group>
     suspend fun deleteGroup(teacherId: String, groupId: String): Result<Unit>

@@ -4,13 +4,13 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.model.Grade
+import com.example.core.model.OnlineLoadState
 import com.example.core.model.Student
 import com.example.data.repository.GradeRepository
 import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
-import com.example.data.repository.SupabaseGradeRepository
-import com.example.data.repository.SupabaseStudentRepository
-import kotlinx.coroutines.Dispatchers
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,8 +28,11 @@ data class StudentListUiState(
     val grades: List<Grade> = emptyList(),
     val gradeMap: Map<String, String> = emptyMap(),
     val students: List<Student> = emptyList(),
-    val isLoading: Boolean = false,
-    val totalCount: Int = 0
+    val isLoading: Boolean = true,
+    val totalCount: Int = 0,
+    val loadState: OnlineLoadState<List<Student>> = OnlineLoadState.Loading,
+    val isOfflineError: Boolean = false,
+    val errorMessage: String? = null
 )
 
 @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
@@ -51,16 +54,65 @@ class StudentListViewModel(
     private val _uiState = MutableStateFlow(StudentListUiState(selectedGradeId = initialGradeId))
     val uiState: StateFlow<StudentListUiState> = _uiState.asStateFlow()
 
+    @Volatile
+    private var hasCompletedFetch = false
+
+    @Volatile
+    private var lastFetchSucceeded = false
+
     init {
-        loadData()
+        observeStreams()
+        refresh()
     }
 
-    private fun loadData() {
-        viewModelScope.launch {
-            gradeRepository.refreshGrades()
-            (studentRepository as? SupabaseStudentRepository)?.fetchStudents()
-        }
+    fun retry() {
+        refresh()
+    }
 
+    fun refresh() {
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isLoading = true,
+                    loadState = OnlineLoadState.Loading,
+                    isOfflineError = false,
+                    errorMessage = null
+                )
+            }
+
+            gradeRepository.refreshGrades()
+            val result = studentRepository.refreshStudents()
+            hasCompletedFetch = true
+
+            if (result.isSuccess) {
+                lastFetchSucceeded = true
+                val confirmedList = result.getOrDefault(emptyList()).filter { it.deletedAt == null }
+                _uiState.update { state ->
+                    state.copy(
+                        isLoading = false,
+                        isOfflineError = false,
+                        errorMessage = null,
+                        loadState = OnlineLoadState.Success(confirmedList)
+                    )
+                }
+            } else {
+                lastFetchSucceeded = false
+                val ex = result.exceptionOrNull()
+                val offline = ex?.isOfflineOrNetworkError() ?: true
+                val msg = ex?.toArabicErrorMessage() ?: "تعذر تحميل قائمة الطلاب من السيرفر."
+                _uiState.update { state ->
+                    state.copy(
+                        isLoading = false,
+                        isOfflineError = offline,
+                        errorMessage = msg,
+                        loadState = if (offline) OnlineLoadState.Offline(msg) else OnlineLoadState.Error(msg)
+                    )
+                }
+            }
+        }
+    }
+
+    private fun observeStreams() {
         viewModelScope.launch {
             combine(
                 gradeRepository.getGrades(),
@@ -70,7 +122,6 @@ class StudentListViewModel(
                 val countsByGrade = activeStudents.groupBy { it.gradeId }.mapValues { it.value.size }
                 val currentGradeMap = gradesList.associate { it.id to it.name }.toMutableMap()
 
-                // Check for students belonging to grades not in the current stage list
                 val missingGradeIds = activeStudents.map { it.gradeId }.toSet().filterNot { currentGradeMap.containsKey(it) }
                 for (legacyGradeId in missingGradeIds) {
                     val legacyGrade = gradeRepository.getGradeById(legacyGradeId)
@@ -87,11 +138,11 @@ class StudentListViewModel(
 
                 Pair(sortedGrades, currentGradeMap)
             }.collect { (updatedGrades, fullGradeMap) ->
-                _uiState.update { 
+                _uiState.update {
                     it.copy(
                         grades = updatedGrades,
                         gradeMap = fullGradeMap
-                    ) 
+                    )
                 }
             }
         }
@@ -111,22 +162,28 @@ class StudentListViewModel(
                     if (student.deletedAt != null) return@filter false
                     val matchesGrade = gradeId == null || student.gradeId == gradeId
                     val matchesQuery = q.isEmpty() ||
-                            student.fullName.lowercase().contains(q) ||
-                            student.studentCode.lowercase().contains(q) ||
-                            student.parentPhone.contains(q)
+                        student.fullName.lowercase().contains(q) ||
+                        student.studentCode.lowercase().contains(q) ||
+                        student.parentPhone.contains(q)
                     matchesGrade && matchesQuery
                 }
             }
-            .flowOn(defaultDispatcher)
-            .collect { studentsList ->
-                _uiState.update {
-                    it.copy(
-                        students = studentsList,
-                        totalCount = studentsList.size,
-                        isLoading = false
-                    )
+                .flowOn(defaultDispatcher)
+                .collect { studentsList ->
+                    _uiState.update { current ->
+                        val nextLoadState = when {
+                            !hasCompletedFetch -> current.loadState
+                            lastFetchSucceeded -> OnlineLoadState.Success(studentsList)
+                            else -> current.loadState
+                        }
+                        current.copy(
+                            students = studentsList,
+                            totalCount = studentsList.size,
+                            isLoading = if (hasCompletedFetch) false else current.isLoading,
+                            loadState = nextLoadState
+                        )
+                    }
                 }
-            }
         }
     }
 

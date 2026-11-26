@@ -2,48 +2,36 @@ package com.example.data.auth
 
 import android.util.Log
 import com.example.data.SupabaseClientProvider
-import com.example.data.local.DatabaseProvider
 import com.example.data.repository.RepositoryProvider
-import com.example.data.repository.SupabaseGradeRepository
-import com.example.data.repository.SupabaseStudentRepository
-import com.example.data.repository.SupabaseTeacherRepository
-import com.example.data.sync.OutboxSyncScheduler
 import io.github.jan.supabase.auth.auth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Coordinates secure account session teardown and multi-tenant data isolation.
- *
- * Two distinct teardown modes:
- *
- * [logout] - the teacher explicitly signs out:
- * 1. Background WorkManager synchronization is immediately cancelled.
- * 2. In-flight background fetch and sync writes are rejected immediately.
- * 3. All cached Room tables scoped to that teacher are atomically deleted via Room transaction.
- * 4. Repository in-memory caches are reset to empty.
- * 5. Pending Outbox operations of that teacher are purged.
- * 6. Supabase Auth session is terminated.
- *
- * [onSessionTerminated] - the session ended involuntarily (expiry, revocation, no stored session,
- * or a spoofed deep link). Steps 1, 2 and 4 run, but local data and the Outbox are KEPT:
- * they are tenant-scoped (every query and the sync worker filter by teacher_id), so they can
- * never be read or executed under another account, and they are synced after the same
- * teacher signs in again. Wiping them here silently destroyed unsynced offline work.
+ * Coordinates Online-Only account session teardown, session epoch tracking, and multi-tenant isolation.
  */
 object AccountSessionManager {
 
     private const val TAG = "AccountSessionManager"
     private val mutex = Mutex()
+    private val sessionEpoch = AtomicLong(0L)
+
     @Volatile
     private var activeTeacherId: String? = null
+
     @Volatile
     private var isTeardownInProgress = false
 
+    fun currentSessionEpoch(): Long = sessionEpoch.get()
+
     fun setActiveTeacherId(teacherId: String?) {
+        if (activeTeacherId != teacherId) {
+            sessionEpoch.incrementAndGet()
+        }
         activeTeacherId = teacherId
         if (com.example.BuildConfig.DEBUG) Log.d(TAG, "Active teacher set")
     }
@@ -67,15 +55,12 @@ object AccountSessionManager {
             return false
         }
 
-        // If explicitly tracked, must match tracked ID
         val tracked = activeTeacherId
         return tracked == null || tracked == teacherId
     }
 
     /**
-     * Shared Session Write Gate:
-     * Coordinates local Room entity + Outbox operations with session teardown.
-     * Uses [mutex] to guarantee atomic check and write execution without race conditions against logout.
+     * Shared Session Gate: rejects stale writes if the active teacher session changed or was torn down.
      */
     suspend fun <T> runIfSessionActive(
         teacherId: String,
@@ -91,103 +76,41 @@ object AccountSessionManager {
         }
     }
 
-    /** Explicit sign-out: wipes this teacher's local data and Outbox, then signs out remotely. */
-    suspend fun logout(force: Boolean = false): Result<Unit> =
-        handleSessionTermination(remoteSignOut = true, wipeLocalData = true, force = force)
+    /** Explicit sign-out: clears all in-memory session caches, bumps session epoch, and signs out remotely. */
+    suspend fun logout(@Suppress("UNUSED_PARAMETER") force: Boolean = false): Result<Unit> =
+        handleSessionTermination(remoteSignOut = true)
 
-    /**
-     * Signs out remotely but keeps local data and the Outbox. Used right after e-mail confirmation
-     * (the user must log in explicitly), where there is no prior teacher data to protect or wipe.
-     */
+    /** Signs out remotely and clears in-memory session caches (used right after e-mail confirmation). */
     suspend fun endSessionKeepingLocalData(): Result<Unit> =
-        handleSessionTermination(remoteSignOut = true, wipeLocalData = false, force = false)
+        handleSessionTermination(remoteSignOut = true)
 
-    /**
-     * Involuntary end of session. Never deletes Room data or pending Outbox operations.
-     */
+    /** Involuntary end of session (expiry, revocation, spoofed deep link): clears all in-memory caches immediately. */
     suspend fun onSessionTerminated(): Result<Unit> =
-        handleSessionTermination(remoteSignOut = false, wipeLocalData = false, force = false)
+        handleSessionTermination(remoteSignOut = false)
 
     private suspend fun handleSessionTermination(
-        remoteSignOut: Boolean,
-        wipeLocalData: Boolean,
-        force: Boolean = false
+        remoteSignOut: Boolean
     ): Result<Unit> = withContext(NonCancellable + Dispatchers.IO) {
         mutex.withLock {
             try {
                 isTeardownInProgress = true
-                val targetTeacherId = getActiveTeacherId()
-                Log.d(TAG, "Starting session teardown (remoteSignOut=$remoteSignOut, wipeLocalData=$wipeLocalData, force=$force)")
+                Log.d(TAG, "Starting Online-Only session teardown (remoteSignOut=$remoteSignOut)")
 
-                // P0 Data Loss Prevention: Check for unsynced Outbox operations before any destructive logout actions
-                if (wipeLocalData && !force && !targetTeacherId.isNullOrBlank()) {
-                    val db = try { DatabaseProvider.getDatabase() } catch (e: Exception) { null }
-                    if (db == null) {
-                        isTeardownInProgress = false
-                        val msg = "تعذر الوصول لقاعدة البيانات للتحقق من العمليات قبل تسجيل الخروج لضمان عدم فقد البيانات."
-                        Log.e(TAG, "Logout aborted: DatabaseProvider.getDatabase() returned null")
-                        return@withContext Result.failure(IllegalStateException(msg))
-                    }
-
-                    val unsynced = try {
-                        db.outboxDao().getUnsyncedOperationsForTeacher(targetTeacherId)
-                    } catch (e: Exception) {
-                        isTeardownInProgress = false
-                        val msg = "تعذر فحص عمليات Outbox قبل تسجيل الخروج: ${e.localizedMessage}"
-                        Log.e(TAG, "Logout aborted due to exception in outbox query", e)
-                        return@withContext Result.failure(IllegalStateException(msg, e))
-                    }
-
-                    if (unsynced.isNotEmpty()) {
-                        isTeardownInProgress = false
-                        val hasPermanent = unsynced.any { op ->
-                            op.status == "FAILED" && (op.retryCount >= 5 || isPermanentErrorText(op.lastError))
-                        }
-                        val msg = if (hasPermanent) {
-                            "توجد عمليات فشلت بشكل دائم ولم تتم مزامنتها. يرجى معالجة الأخطاء أو محاولة المزامنة قبل تسجيل الخروج لضمان عدم فقدان البيانات."
-                        } else {
-                            "توجد بيانات تنتظر المزامنة. يرجى الانتظار حتى اكتمال المزامنة أو المحاولة لاحقاً قبل تسجيل الخروج."
-                        }
-                        Log.w(TAG, "Logout aborted due to ${unsynced.size} unsynced outbox operations (hasPermanent=$hasPermanent)")
-                        return@withContext Result.failure(IllegalStateException(msg))
-                    }
-                }
-
-                // 1. Immediately cancel active and queued WorkManager synchronization jobs
-                try {
-                    OutboxSyncScheduler.cancelSync()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to cancel sync scheduler", e)
-                }
-
-                // 2. Invalidate active teacher tracking to reject any in-flight coroutine writes immediately
+                sessionEpoch.incrementAndGet()
                 activeTeacherId = null
                 SupabaseClientProvider.mockTeacherId = null
 
-                // 3. Wipe tenant-scoped Room data + Outbox ONLY on explicit logout.
-                if (wipeLocalData && !targetTeacherId.isNullOrBlank()) {
-                    try {
-                        DatabaseProvider.clearDataForTeacher(targetTeacherId)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to clear Room database during logout", e)
-                    }
-                }
-
-                // 4. Clear in-memory repository caches
                 try {
-                    (RepositoryProvider.studentRepository as? SupabaseStudentRepository)?.clearCache()
-                    (RepositoryProvider.gradeRepository as? SupabaseGradeRepository)?.clearCache()
-                    (RepositoryProvider.teacherRepository as? SupabaseTeacherRepository)?.clearCache()
+                    RepositoryProvider.clearAllSessionCaches()
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to clear repository in-memory caches", e)
                 }
 
-                // 5. Terminate remote Supabase Auth session if requested
                 if (remoteSignOut) {
                     try {
                         SupabaseClientProvider.client.auth.signOut()
                     } catch (e: Exception) {
-                        Log.w(TAG, "Remote signOut failed or device offline. Local tenant data cleared successfully.", e)
+                        Log.w(TAG, "Remote signOut failed or device offline. In-memory caches cleared.", e)
                     }
                 }
 
@@ -199,22 +122,5 @@ object AccountSessionManager {
                 isTeardownInProgress = false
             }
         }
-    }
-
-    private val PERMANENT_PHRASES = listOf(
-        "violates foreign key",
-        "violates unique constraint",
-        "duplicate key value",
-        "bad request",
-        "unprocessable"
-    )
-    private val PERMANENT_SQLSTATE = Regex("""\b(23503|23505|23502|42p01|42703)\b""", RegexOption.IGNORE_CASE)
-    private val PERMANENT_HTTP = Regex("""\b(400|404|422)\b\s*[:\-]?\s*(bad request|not found|unprocessable)""", RegexOption.IGNORE_CASE)
-
-    private fun isPermanentErrorText(raw: String?): Boolean {
-        val msg = raw?.lowercase() ?: return false
-        return PERMANENT_PHRASES.any { msg.contains(it) } ||
-            PERMANENT_SQLSTATE.containsMatchIn(msg) ||
-            PERMANENT_HTTP.containsMatchIn(msg)
     }
 }

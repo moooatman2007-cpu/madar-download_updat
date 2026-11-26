@@ -9,7 +9,10 @@ import kotlinx.coroutines.flow.Flow
 interface StudentRepository {
     fun getStudents(): Flow<List<Student>>
     fun getStudentsByGrade(gradeId: String): Flow<List<Student>>
+    suspend fun refreshStudents(): Result<List<Student>> = Result.success(emptyList())
     suspend fun getStudentById(studentId: String): Student?
+    suspend fun fetchStudentById(studentId: String): Result<Student?> =
+        runCatching { getStudentById(studentId) }
     suspend fun getStudentByCode(studentCode: String): Student?
     suspend fun addStudent(
         fullName: String,

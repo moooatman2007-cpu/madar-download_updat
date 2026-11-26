@@ -5,14 +5,20 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.model.Grade
 import com.example.core.model.Student
+import com.example.core.model.OnlineLoadState
+import com.example.core.model.SupabaseStudentInsertDto
+import com.example.core.model.UpdateStudentOnlineDto
+import com.example.data.auth.AccountSessionManager
 import com.example.data.local.AppDatabase
 import com.example.data.local.entity.GradeEntity
 import com.example.data.local.entity.StudentEntity
 import com.example.data.local.mapper.toDomain
 import com.example.data.local.mapper.toEntity
+import com.example.data.repository.StudentRemoteDataSource
 import com.example.data.repository.SupabaseGradeRepository
 import com.example.data.repository.SupabaseStudentRepository
 import com.example.ui.students.StudentListViewModel
+import java.net.UnknownHostException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -111,8 +117,9 @@ class GradeOfflineCacheTest {
     }
 
     @Test
-    fun test4_studentsScreenCanAccessStudentsAndGradesOffline() = runBlocking {
+    fun test4_gradesStayCachedOfflineWhileStudentsFollowOnlineOnly() = runBlocking {
         com.example.data.SupabaseClientProvider.mockTeacherId = "teacher_100"
+        AccountSessionManager.setActiveTeacherId("teacher_100")
         val gradeDao = db.gradeDao()
         val studentDao = db.studentDao()
 
@@ -124,6 +131,7 @@ class GradeOfflineCacheTest {
         )
         gradeDao.upsertGrade(gradeEntity)
 
+        // Stale student in Room should NEVER be displayed by Online-Only StudentRepository
         val studentEntity = StudentEntity(
             studentId = "student-1",
             studentCode = "ST001",
@@ -135,25 +143,37 @@ class GradeOfflineCacheTest {
         )
         studentDao.upsertStudent(studentEntity)
 
+        val offlineStudentRemote = object : StudentRemoteDataSource {
+            override suspend fun fetchStudents(teacherId: String): List<Student> = throw UnknownHostException("offline")
+            override suspend fun fetchStudentById(teacherId: String, studentId: String): Student? = throw UnknownHostException("offline")
+            override suspend fun fetchStudentByCode(teacherId: String, studentCode: String): Student? = throw UnknownHostException("offline")
+            override suspend fun insertStudent(dto: SupabaseStudentInsertDto): Student = throw UnknownHostException("offline")
+            override suspend fun updateStudent(teacherId: String, studentId: String, request: UpdateStudentOnlineDto): Student = throw UnknownHostException("offline")
+            override suspend fun softDeleteStudent(teacherId: String, studentId: String, deletedAtIso: String) = throw UnknownHostException("offline")
+        }
+
         val gradeRepo = SupabaseGradeRepository(gradeDao = gradeDao)
-        val studentRepo = SupabaseStudentRepository(studentDao = studentDao)
+        val studentRepo = SupabaseStudentRepository(
+            remoteDataSource = offlineStudentRemote,
+            teacherIdProvider = { "teacher_100" },
+            sessionActiveChecker = { true }
+        )
 
         val viewModel = StudentListViewModel(
             studentRepository = studentRepo,
             gradeRepository = gradeRepo
         )
 
-        // Wait or read uiState
-        val uiState = viewModel.uiState.value
-        // Verify students and grades are available
+        // Phase 2 Grades are still available from Room
         val grades = gradeRepo.getGrades().first()
-        val students = studentRepo.getStudents().first()
-
         assertEquals(1, grades.size)
         assertEquals("grade-prep-1", grades[0].id)
-        assertEquals(1, students.size)
-        assertEquals("student-1", students[0].studentId)
-        assertEquals("عمر أحمد", students[0].fullName)
+
+        // Phase 1 Students are Online-Only and must NOT read stale Room cache
+        val students = studentRepo.getStudents().first()
+        assertTrue(students.isEmpty())
+        assertTrue(studentRepo.refreshStudents().isFailure)
+        AccountSessionManager.setActiveTeacherId(null)
     }
 
     @Test

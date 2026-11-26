@@ -9,6 +9,8 @@ import com.example.data.repository.GradeRepository
 import com.example.data.repository.RepositoryProvider
 import com.example.data.repository.StudentRepository
 import com.example.data.repository.TeacherRepository
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
 import io.github.jan.supabase.auth.auth
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,12 +28,15 @@ data class GradesUiState(
     val educationalStage: String = EducationalStages.PREPARATORY,
     val isLoading: Boolean = true,
     val isSaving: Boolean = false,
+    val errorMessage: String? = null,
+    val isOfflineError: Boolean = false,
     val showAddEditDialog: Boolean = false,
     val gradeToEdit: Grade? = null,
     val gradeNameInput: String = "",
     val gradeOrderInput: String = "",
     val inputError: String? = null,
-    val gradeToDelete: Grade? = null
+    val gradeToDelete: Grade? = null,
+    val deleteError: String? = null
 )
 
 sealed class GradesEvent {
@@ -95,12 +100,38 @@ class GradesViewModel(
 
     fun refresh() {
         viewModelScope.launch {
-            _uiState.update { it.copy(isLoading = true) }
+            _uiState.update { it.copy(isLoading = true, errorMessage = null, isOfflineError = false) }
             try {
                 val teacher = teacherRepository.fetchCurrentTeacher()
-                gradeRepository.refreshGrades(teacher?.educationalStage)
-            } finally {
-                _uiState.update { it.copy(isLoading = false) }
+                val gradesRes = gradeRepository.refreshGradesResult(teacher?.educationalStage)
+                val studentsRes = studentRepository.refreshStudents()
+                val firstErr = gradesRes.exceptionOrNull() ?: studentsRes.exceptionOrNull()
+                if (firstErr != null) {
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            errorMessage = firstErr.toArabicErrorMessage(),
+                            isOfflineError = firstErr.isOfflineOrNetworkError()
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            errorMessage = null,
+                            isOfflineError = false
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = e.toArabicErrorMessage(),
+                        isOfflineError = e.isOfflineOrNetworkError()
+                    )
+                }
             }
         }
     }
@@ -177,7 +208,7 @@ class GradesViewModel(
         _uiState.update { it.copy(isSaving = true, inputError = null) }
         viewModelScope.launch {
             try {
-                val success = if (editing == null) {
+                val result = if (editing == null) {
                     val newGrade = Grade(
                         id = UUID.randomUUID().toString(),
                         name = name,
@@ -185,9 +216,9 @@ class GradesViewModel(
                         studentCount = 0,
                         teacherId = currentTeacherId
                     )
-                    gradeRepository.addGrade(newGrade)
+                    gradeRepository.addGradeResult(newGrade)
                 } else {
-                    gradeRepository.updateGrade(
+                    gradeRepository.updateGradeResult(
                         editing.copy(
                             name = name,
                             displayOrder = order,
@@ -196,7 +227,7 @@ class GradesViewModel(
                     )
                 }
 
-                if (success) {
+                if (result.isSuccess) {
                     dismissAddEditDialog()
                     _events.emit(
                         GradesEvent.ShowMessage(
@@ -204,8 +235,13 @@ class GradesViewModel(
                         )
                     )
                 } else {
-                    _events.emit(GradesEvent.ShowMessage("تعذر حفظ الصف الدراسي، يرجى المحاولة مرة أخرى"))
+                    val errMsg = result.exceptionOrNull()?.toArabicErrorMessage()
+                        ?: "تعذر حفظ الصف الدراسي، يرجى المحاولة مرة أخرى"
+                    _uiState.update { it.copy(inputError = errMsg) }
                 }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                _uiState.update { it.copy(inputError = e.toArabicErrorMessage()) }
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }
@@ -223,26 +259,31 @@ class GradesViewModel(
             }
             return
         }
-        _uiState.update { it.copy(gradeToDelete = grade) }
+        _uiState.update { it.copy(gradeToDelete = grade, deleteError = null) }
     }
 
     fun dismissDeleteDialog() {
-        _uiState.update { it.copy(gradeToDelete = null) }
+        _uiState.update { it.copy(gradeToDelete = null, deleteError = null) }
     }
 
     fun confirmDeleteGrade() {
         if (_uiState.value.isSaving) return
         val grade = _uiState.value.gradeToDelete ?: return
-        _uiState.update { it.copy(isSaving = true) }
+        _uiState.update { it.copy(isSaving = true, deleteError = null) }
         viewModelScope.launch {
             try {
-                dismissDeleteDialog()
-                val success = gradeRepository.deleteGrade(grade.id)
-                if (success) {
+                val result = gradeRepository.deleteGradeResult(grade.id)
+                if (result.isSuccess) {
+                    dismissDeleteDialog()
                     _events.emit(GradesEvent.ShowMessage("تم حذف الصف بنجاح"))
                 } else {
-                    _events.emit(GradesEvent.ShowMessage("تعذر حذف الصف الدراسي"))
+                    val errMsg = result.exceptionOrNull()?.toArabicErrorMessage()
+                        ?: "تعذر حذف الصف الدراسي"
+                    _uiState.update { it.copy(deleteError = errMsg) }
                 }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                _uiState.update { it.copy(deleteError = e.toArabicErrorMessage()) }
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }
@@ -255,7 +296,17 @@ class GradesViewModel(
         viewModelScope.launch {
             try {
                 gradeRepository.ensureGradesForStage(_uiState.value.educationalStage)
-                _events.emit(GradesEvent.ShowMessage("تم تحديث صفوف المرحلة (${_uiState.value.educationalStage})"))
+                val refreshRes = gradeRepository.refreshGradesResult(_uiState.value.educationalStage)
+                if (refreshRes.isSuccess) {
+                    _uiState.update { it.copy(errorMessage = null, isOfflineError = false) }
+                    _events.emit(GradesEvent.ShowMessage("تم تحديث صفوف المرحلة (${_uiState.value.educationalStage})"))
+                } else {
+                    val err = refreshRes.exceptionOrNull()
+                    _events.emit(GradesEvent.ShowMessage(err?.toArabicErrorMessage() ?: "تعذر تحديث صفوف المرحلة"))
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                _events.emit(GradesEvent.ShowMessage(e.toArabicErrorMessage()))
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
             }

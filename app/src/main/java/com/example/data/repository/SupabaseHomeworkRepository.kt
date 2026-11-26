@@ -1,235 +1,309 @@
 package com.example.data.repository
 
+import android.util.Log
 import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Homework
 import com.example.core.model.HomeworkStatus
 import com.example.core.model.SupabaseHomeworkDto
 import com.example.core.model.SyncResult
 import com.example.data.SupabaseClientProvider
-import com.example.data.local.DatabaseProvider
-import com.example.data.local.dao.HomeworkDao
-import com.example.data.local.dao.OutboxDao
-import com.example.data.local.entity.OutboxEntity
-import com.example.data.local.mapper.toDomain
-import com.example.data.local.mapper.toEntity
-import com.example.data.sync.OutboxSyncScheduler
-import androidx.room.withTransaction
+import com.example.data.auth.AccountSessionManager
 import com.example.util.DateUtils
+import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.query.Order
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 import java.util.UUID
 
+interface HomeworkRemoteDataSource {
+    suspend fun fetchHomeworkForStudent(teacherId: String, studentId: String): List<Homework>
+    suspend fun fetchHomeworkForStudentByMonth(
+        teacherId: String,
+        studentId: String,
+        startDate: String,
+        endDate: String
+    ): List<Homework>
+    suspend fun fetchHomeworkForTeacher(teacherId: String): List<Homework>
+    suspend fun insertHomework(dto: SupabaseHomeworkDto): Homework
+    suspend fun updateHomework(teacherId: String, dto: SupabaseHomeworkDto): Homework
+    suspend fun deleteHomework(teacherId: String, homeworkId: String)
+    suspend fun fetchHomeworkById(teacherId: String, homeworkId: String): Homework?
+}
+
+class SupabaseHomeworkRemoteDataSource(
+    private val client: SupabaseClient = SupabaseClientProvider.client
+) : HomeworkRemoteDataSource {
+
+    override suspend fun fetchHomeworkForStudent(teacherId: String, studentId: String): List<Homework> {
+        return client.postgrest["homework"]
+            .select {
+                filter {
+                    eq("student_id", studentId)
+                    eq("teacher_id", teacherId)
+                }
+                order("homework_date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseHomeworkDto>()
+            .map { it.toHomework(teacherId) }
+    }
+
+    override suspend fun fetchHomeworkForStudentByMonth(
+        teacherId: String,
+        studentId: String,
+        startDate: String,
+        endDate: String
+    ): List<Homework> {
+        return client.postgrest["homework"]
+            .select {
+                filter {
+                    eq("student_id", studentId)
+                    eq("teacher_id", teacherId)
+                    gte("homework_date", startDate)
+                    lte("homework_date", endDate)
+                }
+                order("homework_date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseHomeworkDto>()
+            .map { it.toHomework(teacherId) }
+    }
+
+    override suspend fun fetchHomeworkForTeacher(teacherId: String): List<Homework> {
+        return client.postgrest["homework"]
+            .select {
+                filter { eq("teacher_id", teacherId) }
+                order("homework_date", order = Order.DESCENDING)
+            }
+            .decodeList<SupabaseHomeworkDto>()
+            .map { it.toHomework(teacherId) }
+    }
+
+    override suspend fun insertHomework(dto: SupabaseHomeworkDto): Homework {
+        val inserted = client.postgrest["homework"]
+            .insert(dto) { select() }
+            .decodeSingle<SupabaseHomeworkDto>()
+        return inserted.toHomework(dto.teacherId ?: "")
+    }
+
+    override suspend fun updateHomework(teacherId: String, dto: SupabaseHomeworkDto): Homework {
+        val updated = client.postgrest["homework"]
+            .update(dto) {
+                filter {
+                    eq("id", dto.id ?: "")
+                    eq("teacher_id", teacherId)
+                }
+                select()
+            }
+            .decodeSingle<SupabaseHomeworkDto>()
+        return updated.toHomework(teacherId)
+    }
+
+    override suspend fun deleteHomework(teacherId: String, homeworkId: String) {
+        client.postgrest["homework"].delete {
+            filter {
+                eq("id", homeworkId)
+                eq("teacher_id", teacherId)
+            }
+        }
+    }
+
+    override suspend fun fetchHomeworkById(teacherId: String, homeworkId: String): Homework? {
+        return client.postgrest["homework"]
+            .select {
+                filter {
+                    eq("id", homeworkId)
+                    eq("teacher_id", teacherId)
+                }
+            }
+            .decodeSingleOrNull<SupabaseHomeworkDto>()
+            ?.toHomework(teacherId)
+    }
+}
+
 class SupabaseHomeworkRepository(
-    private val homeworkDao: HomeworkDao? = try { DatabaseProvider.getDatabase().homeworkDao() } catch (_: Exception) { null },
-    private val outboxDao: OutboxDao? = try { DatabaseProvider.getDatabase().outboxDao() } catch (_: Exception) { null }
+    private val remoteDataSource: HomeworkRemoteDataSource = SupabaseHomeworkRemoteDataSource(),
+    private val teacherIdProvider: () -> String? = {
+        SupabaseClientProvider.mockTeacherId
+            ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
+    },
+    private val sessionActiveChecker: (String) -> Boolean = { teacherId ->
+        AccountSessionManager.isSessionActive(teacherId)
+    },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : HomeworkRepository {
-    private val client = SupabaseClientProvider.client
 
-    private suspend fun fetchAndCacheHomeworkForStudent(studentId: String) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return
-        try {
-            val list = client.postgrest["homework"]
-                .select {
-                    filter {
-                        eq("student_id", studentId)
-                        eq("teacher_id", teacherId)
-                    }
-                    order("homework_date", order = Order.DESCENDING)
-                }
-                .decodeList<SupabaseHomeworkDto>()
-                .map { it.toHomework(teacherId) }
+    private val _sessionHomework = MutableStateFlow<Pair<String?, List<Homework>>>(null to emptyList())
 
-            if (!com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) return
-            homeworkDao?.upsertHomeworkList(list.map { it.toEntity() })
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            e.printStackTrace()
-        }
+    private fun resolveActiveTeacherId(): String? {
+        val teacherId = teacherIdProvider()?.takeIf { it.isNotBlank() } ?: return null
+        return if (sessionActiveChecker(teacherId)) teacherId else null
     }
 
-    private suspend fun fetchAndCacheHomeworkForTeacher() {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return
-        try {
-            val list = client.postgrest["homework"]
-                .select {
-                    filter {
-                        eq("teacher_id", teacherId)
-                    }
-                    order("homework_date", order = Order.DESCENDING)
-                }
-                .decodeList<SupabaseHomeworkDto>()
-                .map { it.toHomework(teacherId) }
+    private fun isStillAuthorized(teacherId: String): Boolean =
+        sessionActiveChecker(teacherId) && teacherIdProvider() == teacherId
 
-            if (!com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) return
-            homeworkDao?.upsertHomeworkList(list.map { it.toEntity() })
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            e.printStackTrace()
-        }
+    fun clearCache() {
+        _sessionHomework.value = null to emptyList()
     }
 
-    override fun getHomeworkForStudent(studentId: String): Flow<List<Homework>> {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    private fun replaceScopedHomeworkInMemory(
+        teacherId: String,
+        fetched: List<Homework>,
+        predicateToReplace: (Homework) -> Boolean
+    ) {
+        val (owner, current) = _sessionHomework.value
+        val base = if (owner == teacherId) current.filterNot(predicateToReplace) else emptyList()
+        val combined = (fetched + base).distinctBy { it.homeworkId }.sortedByDescending { it.date }
+        _sessionHomework.value = teacherId to combined
+    }
 
-        if (teacherId != null && homeworkDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    fetchAndCacheHomeworkForStudent(studentId)
-                }
-                homeworkDao.getHomeworkByStudent(teacherId, studentId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
-            }
+    private fun upsertHomeworkInMemory(teacherId: String, homework: Homework) {
+        val (owner, current) = _sessionHomework.value
+        val base = if (owner == teacherId) current else emptyList()
+        _sessionHomework.value = teacherId to (listOf(homework) + base.filterNot { it.homeworkId == homework.homeworkId })
+            .sortedByDescending { it.date }
+    }
+
+    override fun getHomeworkForStudent(studentId: String): Flow<List<Homework>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
-            }
+        launch(ioDispatcher) {
             try {
-                val list = client.postgrest["homework"]
-                    .select {
-                        filter {
-                            eq("student_id", studentId)
-                            eq("teacher_id", teacherId)
-                        }
-                        order("homework_date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseHomeworkDto>()
-                    .map { it.toHomework() }
-                emit(list)
+                val list = remoteDataSource.fetchHomeworkForStudent(teacherId, studentId)
+                if (!isStillAuthorized(teacherId)) {
+                    clearCache()
+                    return@launch
+                }
+                replaceScopedHomeworkInMemory(teacherId, list) { it.studentId == studentId }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
+                Log.e("SupabaseHomeworkRepo", "getHomeworkForStudent failed: ${e.message}", e)
             }
-        }.flowOn(Dispatchers.IO)
-    }
+        }
+
+        _sessionHomework
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList()
+                else list.filter { it.studentId == studentId }.sortedByDescending { it.date }
+            }
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
 
     override fun getHomeworkForStudentByMonth(
         studentId: String,
         year: Int,
         month: Int
-    ): Flow<List<Homework>> {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    ): Flow<List<Homework>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
+        }
+
         val dateRange = DateUtils.getMonthDateRange(year, month)
         val startDate = dateRange.startDate
         val endDate = dateRange.endDate
 
-        if (teacherId != null && homeworkDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    try {
-                        val list = client.postgrest["homework"]
-                            .select {
-                                filter {
-                                    eq("student_id", studentId)
-                                    eq("teacher_id", teacherId)
-                                    gte("homework_date", startDate)
-                                    lte("homework_date", endDate)
-                                }
-                                order("homework_date", order = Order.DESCENDING)
-                            }
-                            .decodeList<SupabaseHomeworkDto>()
-                            .map { it.toHomework(teacherId) }
-                        if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                            homeworkDao.upsertHomeworkList(list.map { it.toEntity() })
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                homeworkDao.getHomeworkByStudent(teacherId, studentId).map { entities ->
-                    entities.filter { it.date >= startDate && it.date <= endDate }.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
-            }.flowOn(Dispatchers.IO)
+        launch(ioDispatcher) {
+            fetchHomeworkForStudentByMonthResult(studentId, year, month)
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
+        _sessionHomework
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList()
+                else list.filter { it.studentId == studentId && it.date in startDate..endDate }
+                    .sortedByDescending { it.date }
             }
-            try {
-                val list = client.postgrest["homework"]
-                    .select {
-                        filter {
-                            eq("student_id", studentId)
-                            eq("teacher_id", teacherId)
-                            gte("homework_date", startDate)
-                            lte("homework_date", endDate)
-                        }
-                        order("homework_date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseHomeworkDto>()
-                    .map { it.toHomework(teacherId) }
-                emit(list)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
+
+    override suspend fun fetchHomeworkForStudentByMonthResult(
+        studentId: String,
+        year: Int,
+        month: Int
+    ): Result<List<Homework>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
+
+        val dateRange = DateUtils.getMonthDateRange(year, month)
+        val startDate = dateRange.startDate
+        val endDate = dateRange.endDate
+
+        try {
+            val list = remoteDataSource.fetchHomeworkForStudentByMonth(teacherId, studentId, startDate, endDate)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب الواجبات."))
             }
-        }.flowOn(Dispatchers.IO)
+            replaceScopedHomeworkInMemory(teacherId, list) {
+                it.studentId == studentId && it.date in startDate..endDate
+            }
+            Result.success(list)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseHomeworkRepo", "fetchHomeworkForStudentByMonthResult failed: ${e.message}", e)
+            Result.failure(e)
+        }
     }
 
-    override fun getHomeworkForTeacher(): Flow<List<Homework>> {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
+    override suspend fun refreshHomeworkForTeacher(): Result<List<Homework>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى تسجيل الدخول أولاً."))
 
-        if (teacherId != null && homeworkDao != null) {
-            return channelFlow {
-                launch(Dispatchers.IO) {
-                    fetchAndCacheHomeworkForTeacher()
-                }
-                homeworkDao.getAllHomeworkByTeacher(teacherId).map { entities ->
-                    entities.map { it.toDomain() }
-                }.collect { list ->
-                    send(list)
-                }
+        try {
+            val list = remoteDataSource.fetchHomeworkForTeacher(teacherId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء جلب الواجبات."))
             }
+            _sessionHomework.value = teacherId to list.sortedByDescending { it.date }
+            Result.success(list)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("SupabaseHomeworkRepo", "refreshHomeworkForTeacher failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    override fun getHomeworkForTeacher(): Flow<List<Homework>> = channelFlow {
+        val teacherId = resolveActiveTeacherId()
+        if (teacherId == null) {
+            clearCache()
+            send(emptyList())
+            return@channelFlow
         }
 
-        return flow {
-            if (teacherId == null) {
-                emit(emptyList())
-                return@flow
+        launch(ioDispatcher) {
+            refreshHomeworkForTeacher()
+        }
+
+        _sessionHomework
+            .map { (owner, list) ->
+                val current = resolveActiveTeacherId()
+                if (current == null || owner != current) emptyList() else list
             }
-            try {
-                val list = client.postgrest["homework"]
-                    .select {
-                        filter {
-                            eq("teacher_id", teacherId)
-                        }
-                        order("homework_date", order = Order.DESCENDING)
-                    }
-                    .decodeList<SupabaseHomeworkDto>()
-                    .map { it.toHomework(teacherId) }
-                emit(list)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                emit(emptyList())
-            }
-        }.flowOn(Dispatchers.IO)
-    }
+            .collect { send(it) }
+    }.flowOn(ioDispatcher)
 
     override suspend fun addHomework(
         studentId: String,
@@ -237,292 +311,116 @@ class SupabaseHomeworkRepository(
         title: String,
         status: HomeworkStatus,
         note: String?
-    ): Result<SyncResult<Homework>> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
-            ?: return@withContext Result.failure(Exception("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
-        
-        val generatedId = UUID.randomUUID().toString()
+    ): Result<SyncResult<Homework>> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
+
+        if (title.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("عنوان الواجب مطلوب"))
+        }
+
         val dto = SupabaseHomeworkDto(
-            id = generatedId,
+            id = UUID.randomUUID().toString(),
             teacherId = teacherId,
             studentId = studentId,
-            homeworkDate = date,
-            title = title,
+            homeworkDate = date.trim(),
+            title = title.trim(),
             status = status.toSupabaseStatus(),
-            description = note ?: ""
+            description = note?.trim() ?: ""
         )
 
         try {
-            val inserted = client.postgrest["homework"]
-                .insert(dto) {
-                    select()
-                }
-                .decodeSingle<SupabaseHomeworkDto>()
-            
-            val homework = inserted.toHomework(teacherId)
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                homeworkDao?.upsertSingleHomework(homework.toEntity())
+            val homework = remoteDataSource.insertHomework(dto)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حفظ الواجب."))
             }
+            upsertHomeworkInMemory(teacherId, homework)
             Result.success(SyncResult(homework, BatchSyncStatus.SAVED_TO_CLOUD))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            val exceptionClass = e.javaClass.name
-            val errorMsg = e.message ?: "No message"
-            val restInfo = (e as? io.github.jan.supabase.exceptions.RestException)?.let {
-                " | RestException[error=${it.error}, description=${it.description}]"
-            } ?: ""
-            val causeInfo = e.cause?.let { " | Cause: ${it.javaClass.name}: ${it.message}" } ?: ""
-            val fullDiagnostic = ">>> POSTGREST_HOMEWORK_ERROR <<< Class: $exceptionClass | Message: $errorMsg$restInfo$causeInfo"
-            android.util.Log.e("SupabaseHomeworkDiag", fullDiagnostic)
-            android.util.Log.e("SupabaseHomeworkDiag", android.util.Log.getStackTraceString(e))
-            android.util.Log.e("SupabaseHomeworkRepo", "addHomework PostgREST call failed: $fullDiagnostic")
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val homework = dto.toHomework(teacherId)
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            homeworkDao?.upsertSingleHomework(homework.toEntity())
-                            val payload = Json.encodeToString(dto)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "INSERT",
-                                    entityType = "HOMEWORK",
-                                    entityId = generatedId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        homeworkDao?.upsertSingleHomework(homework.toEntity())
-                        val payload = Json.encodeToString(dto)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "INSERT",
-                                entityType = "HOMEWORK",
-                                entityId = generatedId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر إضافة الواجب محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-                Result.success(SyncResult(homework, BatchSyncStatus.QUEUED_OFFLINE))
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل إضافة الواجب: ${ex.message}"))
-            }
+            Log.e("SupabaseHomeworkRepo", "addHomework failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun updateHomework(homework: Homework): Result<Homework> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
-            ?: return@withContext Result.failure(Exception("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
-        try {
-            val dto = SupabaseHomeworkDto(
-                id = homework.homeworkId,
-                teacherId = teacherId,
-                studentId = homework.studentId,
-                homeworkDate = homework.date,
-                title = homework.title,
-                status = homework.status.toSupabaseStatus(),
-                description = homework.note ?: ""
-            )
-            val updated = client.postgrest["homework"].update(dto) {
-                filter {
-                    eq("id", homework.homeworkId)
-                    eq("teacher_id", teacherId)
-                }
-                select()
-            }.decodeSingle<SupabaseHomeworkDto>()
+    override suspend fun updateHomework(homework: Homework): Result<Homework> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
 
-            val result = updated.toHomework(teacherId)
-            if (com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                homeworkDao?.upsertSingleHomework(result.toEntity())
+        if (homework.teacherId.isNotBlank() && homework.teacherId != teacherId) {
+            return@withContext Result.failure(SecurityException("غير مصرح بتعديل واجب تابع لحساب آخر."))
+        }
+        if (homework.title.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("عنوان الواجب مطلوب"))
+        }
+
+        val dto = SupabaseHomeworkDto(
+            id = homework.homeworkId,
+            teacherId = teacherId,
+            studentId = homework.studentId,
+            homeworkDate = homework.date.trim(),
+            title = homework.title.trim(),
+            status = homework.status.toSupabaseStatus(),
+            description = homework.note?.trim() ?: ""
+        )
+
+        try {
+            val result = remoteDataSource.updateHomework(teacherId, dto)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء تعديل الواجب."))
             }
+            upsertHomeworkInMemory(teacherId, result)
             Result.success(result)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val homeworkWithTeacher = if (homework.teacherId.isBlank()) homework.copy(teacherId = teacherId) else homework
-                val written = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            homeworkDao?.upsertSingleHomework(homeworkWithTeacher.toEntity())
-                            val dto = SupabaseHomeworkDto(
-                                id = homework.homeworkId,
-                                teacherId = teacherId,
-                                studentId = homework.studentId,
-                                homeworkDate = homework.date,
-                                title = homework.title,
-                                status = homework.status.toSupabaseStatus(),
-                                description = homework.note ?: ""
-                            )
-                            val payload = Json.encodeToString(dto)
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "UPDATE",
-                                    entityType = "HOMEWORK",
-                                    entityId = homework.homeworkId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        homeworkDao?.upsertSingleHomework(homeworkWithTeacher.toEntity())
-                        val dto = SupabaseHomeworkDto(
-                            id = homework.homeworkId,
-                            teacherId = teacherId,
-                            studentId = homework.studentId,
-                            homeworkDate = homework.date,
-                            title = homework.title,
-                            status = homework.status.toSupabaseStatus(),
-                            description = homework.note ?: ""
-                        )
-                        val payload = Json.encodeToString(dto)
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "UPDATE",
-                                entityType = "HOMEWORK",
-                                entityId = homework.homeworkId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (written == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر تعديل الواجب محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-                Result.success(homeworkWithTeacher)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل تعديل الواجب: ${ex.message}"))
-            }
+            Log.e("SupabaseHomeworkRepo", "updateHomework failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun deleteHomework(homeworkId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id
-            ?: return@withContext Result.failure(Exception("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
+    override suspend fun deleteHomework(homeworkId: String): Result<Unit> = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId()
+            ?: return@withContext Result.failure(IllegalStateException("انتهت الجلسة، يرجى إعادة تسجيل الدخول."))
+
         try {
-            client.postgrest["homework"].delete {
-                filter {
-                    eq("id", homeworkId)
-                    eq("teacher_id", teacherId)
-                }
+            remoteDataSource.deleteHomework(teacherId, homeworkId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext Result.failure(IllegalStateException("انتهت الجلسة أثناء حذف الواجب."))
             }
-            homeworkDao?.deleteById(teacherId, homeworkId)
+            val (owner, current) = _sessionHomework.value
+            if (owner == teacherId) {
+                _sessionHomework.value = teacherId to current.filterNot { it.homeworkId == homeworkId }
+            }
             Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
-            // Offline fallback
-            try {
-                val db = try { DatabaseProvider.getDatabase() } catch (_: Exception) { null }
-                val deleted = com.example.data.auth.AccountSessionManager.runIfSessionActive(teacherId) {
-                    if (db != null) {
-                        db.withTransaction {
-                            homeworkDao?.deleteById(teacherId, homeworkId)
-                            val payload = "{\"id\":\"$homeworkId\"}"
-                            outboxDao?.insertOperation(
-                                OutboxEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    operationType = "DELETE",
-                                    entityType = "HOMEWORK",
-                                    entityId = homeworkId,
-                                    payload = payload,
-                                    createdAt = System.currentTimeMillis(),
-                                    status = "PENDING",
-                                    teacherId = teacherId
-                                )
-                            )
-                        }
-                    } else {
-                        homeworkDao?.deleteById(teacherId, homeworkId)
-                        val payload = "{\"id\":\"$homeworkId\"}"
-                        outboxDao?.insertOperation(
-                            OutboxEntity(
-                                id = UUID.randomUUID().toString(),
-                                operationType = "DELETE",
-                                entityType = "HOMEWORK",
-                                entityId = homeworkId,
-                                payload = payload,
-                                createdAt = System.currentTimeMillis(),
-                                status = "PENDING",
-                                teacherId = teacherId
-                            )
-                        )
-                    }
-                    true
-                }
-                if (deleted == null) {
-                    return@withContext Result.failure(Exception("انتهت الجلسة، تعذر حذف الواجب محلياً."))
-                }
-
-                OutboxSyncScheduler.scheduleSync()
-                Result.success(Unit)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-                Result.failure(Exception("فشل حذف الواجب: ${ex.message}"))
-            }
+            Log.e("SupabaseHomeworkRepo", "deleteHomework failed: ${e.message}", e)
+            Result.failure(e)
         }
     }
 
-    override suspend fun getHomeworkById(homeworkId: String): Homework? = withContext(Dispatchers.IO) {
-        val user = client.auth.currentUserOrNull()
-        val teacherId = SupabaseClientProvider.mockTeacherId ?: user?.id ?: return@withContext null
-
-        val cached = homeworkDao?.getHomeworkByIdSync(teacherId, homeworkId)
-        if (cached != null) {
-            return@withContext cached.toDomain()
-        }
-
+    override suspend fun getHomeworkById(homeworkId: String): Homework? = withContext(ioDispatcher) {
+        val teacherId = resolveActiveTeacherId() ?: return@withContext null
         try {
-            val dto = client.postgrest["homework"]
-                .select {
-                    filter {
-                        eq("id", homeworkId)
-                        eq("teacher_id", teacherId)
-                    }
-                }
-                .decodeSingleOrNull<SupabaseHomeworkDto>()
-            
-            val homework = dto?.toHomework(teacherId)
-            if (homework != null && com.example.data.auth.AccountSessionManager.isSessionActive(teacherId)) {
-                homeworkDao?.upsertSingleHomework(homework.toEntity())
+            val homework = remoteDataSource.fetchHomeworkById(teacherId, homeworkId)
+            if (!isStillAuthorized(teacherId)) {
+                clearCache()
+                return@withContext null
+            }
+            if (homework != null) {
+                upsertHomeworkInMemory(teacherId, homework)
             }
             homework
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("SupabaseHomeworkRepo", "getHomeworkById failed: ${e.message}", e)
             null
         }
     }

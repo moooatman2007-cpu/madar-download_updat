@@ -1,6 +1,5 @@
 package com.example.data.repository
 
-import com.example.core.model.BatchSyncStatus
 import com.example.core.model.Exam
 import com.example.core.model.ExamSummary
 import com.example.core.model.SyncResult
@@ -10,8 +9,14 @@ interface ExamRepository {
     fun getExamsForStudent(studentId: String): Flow<List<Exam>>
     fun getExamsForStudentByMonth(studentId: String, year: Int, month: Int): Flow<List<Exam>>
     suspend fun getExamSummaryForStudent(studentId: String, year: Int, month: Int): ExamSummary
+    suspend fun fetchExamsForStudentByMonthResult(studentId: String, year: Int, month: Int): Result<List<Exam>> =
+        runCatching { emptyList() }
     suspend fun getExamsCountThisMonth(year: Int, month: Int): Int
+    suspend fun fetchExamsCountThisMonthResult(year: Int, month: Int): Result<Int> =
+        runCatching { getExamsCountThisMonth(year, month) }
     fun getAllExamsForTeacher(): Flow<List<Exam>>
+    suspend fun refreshAllExamsForTeacher(): Result<List<Exam>> =
+        runCatching { emptyList() }
     suspend fun addExam(
         studentId: String,
         date: String,

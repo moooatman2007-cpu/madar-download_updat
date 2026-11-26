@@ -5,12 +5,24 @@ import androidx.lifecycle.viewModelScope
 import com.example.core.model.EducationalStages
 import com.example.core.model.Grade
 import com.example.core.model.Group
-import com.example.core.model.GroupDay
+import com.example.core.model.OnlineLoadState
+import com.example.data.SupabaseClientProvider
 import com.example.data.repository.GradeRepository
+import com.example.data.repository.GroupDeletionBlockedException
 import com.example.data.repository.GroupRepository
 import com.example.data.repository.RepositoryProvider
+import com.example.data.repository.StudentRepository
 import com.example.data.repository.TeacherRepository
-import kotlinx.coroutines.flow.*
+import com.example.util.isOfflineOrNetworkError
+import com.example.util.toArabicErrorMessage
+import io.github.jan.supabase.auth.auth
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -19,7 +31,7 @@ import java.util.Locale
 import java.util.UUID
 
 data class GroupsUiState(
-    val isLoading: Boolean = false,
+    val isLoading: Boolean = true,
     val isRefreshing: Boolean = false,
     val groups: List<Group> = emptyList(),
     val filteredGroups: List<Group> = emptyList(),
@@ -28,7 +40,11 @@ data class GroupsUiState(
     val grades: List<Grade> = emptyList(),
     val selectedStage: String? = null,
     val selectedGradeId: String? = null,
-    
+
+    // Online-Only state
+    val loadState: OnlineLoadState<List<Group>> = OnlineLoadState.Loading,
+    val isOfflineError: Boolean = false,
+
     // Create/Edit Group form state
     val showAddEditDialog: Boolean = false,
     val editingGroup: Group? = null,
@@ -43,8 +59,9 @@ data class GroupsUiState(
     val formError: String? = null,
     val isSaving: Boolean = false,
 
-    // Delete group state
+    // Delete / Blocked-Delete Deactivate group state
     val groupToDelete: Group? = null,
+    val groupBlockedToDeactivate: Group? = null,
     val isDeleting: Boolean = false,
     val actionMessage: String? = null,
     val errorMessage: String? = null
@@ -54,7 +71,7 @@ class GroupsViewModel(
     private val groupRepository: GroupRepository = RepositoryProvider.groupRepository,
     private val gradeRepository: GradeRepository = RepositoryProvider.gradeRepository,
     private val teacherRepository: TeacherRepository = RepositoryProvider.teacherRepository,
-    private val studentRepository: com.example.data.repository.StudentRepository = RepositoryProvider.studentRepository
+    private val studentRepository: StudentRepository = RepositoryProvider.studentRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(GroupsUiState())
@@ -62,46 +79,135 @@ class GroupsViewModel(
 
     private var teacherId: String? = null
 
+    @Volatile
+    private var hasCompletedFetch = false
+
+    @Volatile
+    private var lastFetchSucceeded = false
+
     init {
         loadData()
     }
 
+    fun retry() {
+        val tId = teacherId
+        if (tId == null) {
+            loadData()
+        } else {
+            refresh()
+        }
+    }
+
     fun refresh() {
-        val tId = teacherId ?: return
+        val tId = teacherId ?: run {
+            loadData()
+            return
+        }
         viewModelScope.launch {
-            _uiState.update { it.copy(isRefreshing = true) }
-            launch { groupRepository.refreshGroups(tId) }
-            launch {
+            _uiState.update {
+                it.copy(
+                    isRefreshing = true,
+                    isLoading = it.groups.isEmpty(),
+                    loadState = if (it.groups.isEmpty()) OnlineLoadState.Loading else it.loadState,
+                    isOfflineError = false,
+                    errorMessage = null
+                )
+            }
+            val groupsDeferred = async { groupRepository.refreshGroups(tId) }
+            val studentsDeferred = async { studentRepository.refreshStudents() }
+            val gradesDeferred = async {
                 val teacher = teacherRepository.fetchCurrentTeacher()
                 gradeRepository.refreshGrades(teacher?.educationalStage)
             }
-            _uiState.update { it.copy(isRefreshing = false) }
+
+            val groupsRes = groupsDeferred.await()
+            studentsDeferred.await()
+            gradesDeferred.await()
+            hasCompletedFetch = true
+
+            if (groupsRes.isSuccess) {
+                lastFetchSucceeded = true
+                _uiState.update {
+                    it.copy(
+                        isRefreshing = false,
+                        isLoading = false,
+                        isOfflineError = false,
+                        errorMessage = null,
+                        loadState = OnlineLoadState.Success(it.groups)
+                    )
+                }
+            } else {
+                lastFetchSucceeded = false
+                val ex = groupsRes.exceptionOrNull()
+                val offline = ex?.isOfflineOrNetworkError() ?: true
+                val msg = ex?.toArabicErrorMessage() ?: "تعذر تحميل المجموعات من السيرفر."
+                _uiState.update {
+                    it.copy(
+                        isRefreshing = false,
+                        isLoading = false,
+                        isOfflineError = offline,
+                        errorMessage = msg,
+                        loadState = if (offline) OnlineLoadState.Offline(msg) else OnlineLoadState.Error(msg)
+                    )
+                }
+            }
         }
+    }
+
+    private fun resolveFallbackTeacherId(): String? {
+        return SupabaseClientProvider.mockTeacherId
+            ?: try { SupabaseClientProvider.client.auth.currentUserOrNull()?.id } catch (_: Exception) { null }
     }
 
     private fun loadData() {
         viewModelScope.launch {
-            _uiState.update { it.copy(isLoading = true) }
+            _uiState.update {
+                it.copy(
+                    isLoading = true,
+                    loadState = OnlineLoadState.Loading,
+                    isOfflineError = false,
+                    errorMessage = null
+                )
+            }
             val teacher = teacherRepository.fetchCurrentTeacher()
-            if (teacher != null) {
-                teacherId = teacher.id
+            val resolvedTeacherId = teacher?.id ?: resolveFallbackTeacherId()
 
-                // Sync remote groups and grades on start
-                launch {
-                    groupRepository.refreshGroups(teacher.id)
-                }
-                launch {
-                    gradeRepository.refreshGrades(teacher.educationalStage)
+            if (resolvedTeacherId != null) {
+                teacherId = resolvedTeacherId
+
+                val groupsDeferred = async { groupRepository.refreshGroups(resolvedTeacherId) }
+                val studentsDeferred = async { studentRepository.refreshStudents() }
+                val gradesDeferred = async { gradeRepository.refreshGrades(teacher?.educationalStage) }
+
+                val groupsRes = groupsDeferred.await()
+                studentsDeferred.await()
+                gradesDeferred.await()
+                hasCompletedFetch = true
+
+                if (groupsRes.isFailure) {
+                    lastFetchSucceeded = false
+                    val ex = groupsRes.exceptionOrNull()
+                    val offline = ex?.isOfflineOrNetworkError() ?: true
+                    val msg = ex?.toArabicErrorMessage() ?: "تعذر تحميل المجموعات من السيرفر."
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            isOfflineError = offline,
+                            errorMessage = msg,
+                            loadState = if (offline) OnlineLoadState.Offline(msg) else OnlineLoadState.Error(msg)
+                        )
+                    }
+                } else {
+                    lastFetchSucceeded = true
                 }
 
-                // Observe groups, students and group days
                 combine(
-                    groupRepository.observeGroups(teacher.id),
+                    groupRepository.observeGroups(resolvedTeacherId),
                     studentRepository.getStudents(),
-                    groupRepository.observeAllGroupDays(teacher.id)
+                    groupRepository.observeAllGroupDays(resolvedTeacherId)
                 ) { groups, students, days ->
                     val studentCountMap = groups.associate { group ->
-                        group.id to students.filter { it.teacherId == teacher.id || it.teacherId.isNullOrBlank() }
+                        group.id to students.filter { it.teacherId == resolvedTeacherId || it.teacherId.isNullOrBlank() }
                             .distinctBy { it.studentId }
                             .count { it.groupId == group.id && it.deletedAt == null }
                     }
@@ -111,21 +217,35 @@ class GroupsViewModel(
                     Triple(groups, studentCountMap, daysMap)
                 }.collectLatest { (groups, studentCounts, daysMap) ->
                     _uiState.update { current ->
+                        val nextLoadState = when {
+                            !hasCompletedFetch -> current.loadState
+                            lastFetchSucceeded -> OnlineLoadState.Success(groups)
+                            else -> current.loadState
+                        }
                         current.copy(
                             groups = groups,
                             groupStudentCounts = studentCounts,
                             groupDays = daysMap,
-                            isLoading = false
+                            isLoading = if (hasCompletedFetch) false else current.isLoading,
+                            loadState = nextLoadState
                         )
                     }
                     filterGroups()
                 }
             } else {
-                _uiState.update { it.copy(isLoading = false) }
+                val msg = "انتهت الجلسة، يرجى تسجيل الدخول لعرض المجموعات."
+                hasCompletedFetch = true
+                lastFetchSucceeded = false
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = msg,
+                        loadState = OnlineLoadState.Error(msg)
+                    )
+                }
             }
         }
 
-        // Get grades list and ensure formGradeId defaults to the first available grade
         viewModelScope.launch {
             gradeRepository.getGrades().collectLatest { gradesList ->
                 _uiState.update { current ->
@@ -171,9 +291,9 @@ class GroupsViewModel(
     }
 
     fun openAddDialog() {
-        val defaultGrade = _uiState.value.selectedGradeId 
+        val defaultGrade = _uiState.value.selectedGradeId
             ?: _uiState.value.formGradeId.ifBlank { null }
-            ?: _uiState.value.grades.firstOrNull()?.id 
+            ?: _uiState.value.grades.firstOrNull()?.id
             ?: ""
         _uiState.update {
             it.copy(
@@ -255,7 +375,11 @@ class GroupsViewModel(
     }
 
     fun clearActionMessage() {
-        _uiState.update { it.copy(actionMessage = null, errorMessage = null) }
+        _uiState.update { it.copy(actionMessage = null) }
+    }
+
+    fun clearErrorMessage() {
+        _uiState.update { it.copy(errorMessage = null) }
     }
 
     fun requestDeleteGroup(group: Group) {
@@ -264,6 +388,10 @@ class GroupsViewModel(
 
     fun dismissDeleteGroup() {
         _uiState.update { it.copy(groupToDelete = null) }
+    }
+
+    fun dismissDeactivateBlockedGroup() {
+        _uiState.update { it.copy(groupBlockedToDeactivate = null) }
     }
 
     fun confirmDeleteGroup() {
@@ -283,12 +411,52 @@ class GroupsViewModel(
                     )
                 }
             } else {
-                val errorMsg = result.exceptionOrNull()?.message ?: "فشل في حذف المجموعة."
+                val ex = result.exceptionOrNull()
+                if (ex is GroupDeletionBlockedException) {
+                    _uiState.update {
+                        it.copy(
+                            isDeleting = false,
+                            groupToDelete = null,
+                            groupBlockedToDeactivate = group
+                        )
+                    }
+                } else {
+                    val errorMsg = ex?.toArabicErrorMessage() ?: "فشل في حذف المجموعة."
+                    _uiState.update {
+                        it.copy(
+                            isDeleting = false,
+                            groupToDelete = null,
+                            errorMessage = errorMsg
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun confirmDeactivateBlockedGroup() {
+        val group = _uiState.value.groupBlockedToDeactivate ?: return
+        val tId = teacherId ?: return
+
+        _uiState.update { it.copy(isDeleting = true) }
+
+        viewModelScope.launch {
+            val result = groupRepository.deactivateGroup(tId, group.id)
+            if (result.isSuccess) {
                 _uiState.update {
                     it.copy(
                         isDeleting = false,
-                        groupToDelete = null,
-                        errorMessage = errorMsg
+                        groupBlockedToDeactivate = null,
+                        actionMessage = "تم تعطيل مجموعة \"${group.name}\" بنجاح مع الحفاظ على جميع بيانات الطلاب والحضور."
+                    )
+                }
+            } else {
+                val msg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر تعطيل المجموعة."
+                _uiState.update {
+                    it.copy(
+                        isDeleting = false,
+                        groupBlockedToDeactivate = null,
+                        errorMessage = msg
                     )
                 }
             }
@@ -311,7 +479,6 @@ class GroupsViewModel(
             return
         }
 
-        // Validate time
         val timeError = validateTimes(state.formStartTime.trim(), state.formEndTime.trim())
         if (timeError != null) {
             _uiState.update { it.copy(formError = timeError) }
@@ -321,7 +488,9 @@ class GroupsViewModel(
         _uiState.update { it.copy(isSaving = true, formError = null) }
 
         viewModelScope.launch {
-            val tId = teacherId ?: teacherRepository.fetchCurrentTeacher()?.also { teacherId = it.id }?.id
+            val tId = teacherId
+                ?: teacherRepository.fetchCurrentTeacher()?.also { teacherId = it.id }?.id
+                ?: resolveFallbackTeacherId()?.also { teacherId = it }
             if (tId == null) {
                 _uiState.update { it.copy(isSaving = false, formError = "انتهت الجلسة، يرجى إعادة تسجيل الدخول") }
                 return@launch
@@ -350,9 +519,8 @@ class GroupsViewModel(
             }
 
             if (result.isSuccess) {
-                // Save/replace group days
-                val daysResult = groupRepository.replaceGroupDays(tId, id, state.formDays)
-                groupRepository.refreshGroups(tId)
+                val savedGroup = result.getOrNull() ?: group
+                val daysResult = groupRepository.replaceGroupDays(tId, savedGroup.id, state.formDays)
                 if (daysResult.isSuccess) {
                     _uiState.update {
                         it.copy(
@@ -362,18 +530,21 @@ class GroupsViewModel(
                         )
                     }
                 } else {
+                    // Keep dialog in edit mode for the saved group so user can retry days without duplicate insert
+                    val errMsg = daysResult.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر حفظ أيام المجموعة."
                     _uiState.update {
                         it.copy(
-                            showAddEditDialog = false,
+                            editingGroup = savedGroup,
                             isSaving = false,
-                            actionMessage = "تم حفظ المجموعة مع تعذر حفظ بعض الأيام."
+                            formError = "تم حفظ بيانات المجموعة، لكن تعذر حفظ الأيام على السيرفر: $errMsg"
                         )
                     }
                 }
             } else {
+                val errMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "خطأ غير معروف"
                 _uiState.update {
                     it.copy(
-                        formError = "فشل في حفظ المجموعة: ${result.exceptionOrNull()?.message ?: "خطأ غير معروف"}",
+                        formError = "فشل في حفظ المجموعة: $errMsg",
                         isSaving = false
                     )
                 }
@@ -384,10 +555,20 @@ class GroupsViewModel(
     fun toggleGroupActive(group: Group) {
         val tId = teacherId ?: return
         viewModelScope.launch {
-            if (group.active) {
+            val result = if (group.active) {
                 groupRepository.deactivateGroup(tId, group.id)
             } else {
-                groupRepository.updateGroup(group.copy(active = true))
+                groupRepository.updateGroup(group.copy(active = true)).map { }
+            }
+            if (result.isSuccess) {
+                _uiState.update {
+                    it.copy(
+                        actionMessage = if (group.active) "تم تعطيل المجموعة" else "تم تفعيل المجموعة"
+                    )
+                }
+            } else {
+                val errMsg = result.exceptionOrNull()?.toArabicErrorMessage() ?: "تعذر تحديث حالة المجموعة."
+                _uiState.update { it.copy(errorMessage = errMsg) }
             }
         }
     }
@@ -401,7 +582,6 @@ class GroupsViewModel(
         val endMinutes = parseTimeToMinutes(endStr)
 
         if (startMinutes == null || endMinutes == null) {
-            // If custom text cannot be parsed to standard time, require non-blank
             return null
         }
 
@@ -427,10 +607,10 @@ class GroupsViewModel(
             try {
                 val time = LocalTime.parse(trimmed, formatter)
                 return time.hour * 60 + time.minute
-            } catch (_: DateTimeParseException) {}
+            } catch (_: DateTimeParseException) {
+            }
         }
 
-        // Try manual colon split e.g. "1:00"
         val parts = trimmed.split(":")
         if (parts.size == 2) {
             val h = parts[0].filter { it.isDigit() }.toIntOrNull()

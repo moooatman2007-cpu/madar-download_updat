@@ -24,6 +24,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CalendarToday
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -46,8 +48,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.core.model.OnlineLoadState
 import com.example.ui.components.EmptyStateView
 import com.example.ui.components.GradeCard
+import com.example.ui.components.OnlineInlineErrorBanner
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.components.SearchHeader
 import com.example.ui.components.StudentCard
 import com.example.ui.theme.ActionAttendanceBg
@@ -89,6 +94,7 @@ fun StudentListScreen(
 
     val isSearching = uiState.searchQuery.isNotBlank()
     val isGradeSelected = selectedGrade != null
+    val hasTerminalLoadError = uiState.loadState is OnlineLoadState.Offline || uiState.loadState is OnlineLoadState.Error
 
     Scaffold(
         topBar = {
@@ -213,6 +219,17 @@ fun StudentListScreen(
                                         modifier = Modifier.size(22.dp)
                                     )
                                 }
+
+                                IconButton(
+                                    onClick = { viewModel.refresh() },
+                                    modifier = Modifier.testTag("students_refresh_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "تحديث الطلاب",
+                                        tint = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
                             }
 
                             // Title on Right
@@ -253,20 +270,83 @@ fun StudentListScreen(
                 )
             }
 
-            // If user is searching or a specific grade is selected: show students list
-            if (isGradeSelected || isSearching) {
-                if (uiState.students.isEmpty()) {
-                    EmptyStateView(
-                        title = if (isSearching) "لا توجد نتائج بحث" else "لا يوجد طلاب في هذا الصف",
-                        description = if (isSearching)
-                            "لم يتم العثور على طالب يطابق \"${uiState.searchQuery}\""
-                        else
-                            "ابدأ بإضافة أول طالب إلى ${selectedGrade?.name ?: "القائمة"}",
-                        buttonText = "+ إضافة طالب",
-                        onButtonClick = { onNavigateToAddStudent(selectedGrade?.id) },
-                        modifier = Modifier.weight(1f)
-                    )
-                } else {
+            if (hasTerminalLoadError && uiState.students.isNotEmpty()) {
+                OnlineInlineErrorBanner(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.errorMessage ?: "تعذر تحديث بيانات الطلاب من السيرفر.",
+                    onRetry = viewModel::retry,
+                    modifier = Modifier.padding(horizontal = Dimens.Spacing20, vertical = Dimens.Spacing4)
+                )
+            }
+
+            when {
+                uiState.isLoading && uiState.students.isEmpty() -> {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(
+                            color = PrimaryIndigo,
+                            modifier = Modifier.testTag("students_loading_indicator")
+                        )
+                    }
+                }
+
+                hasTerminalLoadError && uiState.students.isEmpty() -> {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        OnlineStatusStateView(
+                            isOffline = uiState.isOfflineError,
+                            message = uiState.errorMessage ?: "تعذر الاتصال بالسيرفر، يرجى التحقق من الإنترنت وإعادة المحاولة.",
+                            onRetry = viewModel::retry
+                        )
+                    }
+                }
+
+                // If user is searching or a specific grade is selected: show students list
+                isGradeSelected || isSearching -> {
+                    if (uiState.students.isEmpty()) {
+                        EmptyStateView(
+                            title = if (isSearching) "لا توجد نتائج بحث" else "لا يوجد طلاب في هذا الصف",
+                            description = if (isSearching)
+                                "لم يتم العثور على طالب يطابق \"${uiState.searchQuery}\""
+                            else
+                                "ابدأ بإضافة أول طالب إلى ${selectedGrade?.name ?: "القائمة"}",
+                            buttonText = "+ إضافة طالب",
+                            onButtonClick = { onNavigateToAddStudent(selectedGrade?.id) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(
+                                start = Dimens.Spacing20,
+                                end = Dimens.Spacing20,
+                                bottom = Dimens.Spacing32,
+                                top = Dimens.Spacing4
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12)
+                        ) {
+                            items(uiState.students, key = { it.studentId }) { student ->
+                                val gradeName = gradeMap[student.gradeId] ?: "صف غير محدد"
+                                StudentCard(
+                                    student = student,
+                                    gradeName = gradeName,
+                                    onClick = { onNavigateToStudentDetail(student.studentId) }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                else -> {
+                    // Otherwise show Grades Selector List (Matching Screenshot 4)
                     LazyColumn(
                         modifier = Modifier.weight(1f),
                         contentPadding = PaddingValues(
@@ -277,57 +357,36 @@ fun StudentListScreen(
                         ),
                         verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12)
                     ) {
-                        items(uiState.students, key = { it.studentId }) { student ->
-                            val gradeName = gradeMap[student.gradeId] ?: "صف غير محدد"
-                            StudentCard(
-                                student = student,
-                                gradeName = gradeName,
-                                onClick = { onNavigateToStudentDetail(student.studentId) }
-                            )
+                        item {
+                            Column {
+                                Text(
+                                    text = "الصفوف الدراسية",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "اختر الصف لعرض قائمة الطلاب",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(Dimens.Spacing8))
                         }
-                    }
-                }
-            } else {
-                // Otherwise show Grades Selector List (Matching Screenshot 4)
-                LazyColumn(
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(
-                        start = Dimens.Spacing20,
-                        end = Dimens.Spacing20,
-                        bottom = Dimens.Spacing32,
-                        top = Dimens.Spacing4
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(Dimens.Spacing12)
-                ) {
-                    item {
-                        Column {
-                            Text(
-                                text = "الصفوف الدراسية",
-                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "اختر الصف لعرض قائمة الطلاب",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(Dimens.Spacing8))
-                    }
 
-                    items(uiState.grades, key = { it.id }) { grade ->
-                        val accentColor = when ((grade.displayOrder - 1) % 4) {
-                            0 -> PrimaryIndigo
-                            1 -> ElectricBlue
-                            2 -> EmeraldGreen
-                            else -> VioletPurple
+                        items(uiState.grades, key = { it.id }) { grade ->
+                            val accentColor = when ((grade.displayOrder - 1) % 4) {
+                                0 -> PrimaryIndigo
+                                1 -> ElectricBlue
+                                2 -> EmeraldGreen
+                                else -> VioletPurple
+                            }
+                            GradeCard(
+                                grade = grade,
+                                accentColor = accentColor,
+                                onClick = { viewModel.onGradeSelected(grade.id) }
+                            )
                         }
-                        GradeCard(
-                            grade = grade,
-                            accentColor = accentColor,
-                            onClick = { viewModel.onGradeSelected(grade.id) }
-                        )
                     }
                 }
             }

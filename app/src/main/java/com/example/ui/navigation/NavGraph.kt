@@ -99,8 +99,6 @@ fun MainAppNavigation(
             val user = try { SupabaseClientProvider.client.auth.currentUserOrNull() } catch (_: Exception) { null }
             if (user != null) {
                 AccountSessionManager.setActiveTeacherId(user.id)
-                // Flush any offline work kept from an earlier (expired) session of this teacher
-                com.example.data.sync.OutboxSyncScheduler.scheduleSync()
                 try {
                     val teacher = RepositoryProvider.teacherRepository.fetchCurrentTeacher()
                     val status = teacher?.accountStatus ?: "pending"
@@ -247,39 +245,13 @@ fun MainAppNavigation(
             composable("status/{status}") { backStackEntry ->
                 val status = backStackEntry.arguments?.getString("status") ?: "pending"
                 val scope = rememberCoroutineScope()
-                val context = androidx.compose.ui.platform.LocalContext.current
-                var statusLogoutError by remember { mutableStateOf<String?>(null) }
                 StatusScreen(
                     status = status,
-                    logoutError = statusLogoutError,
-                    onDismissLogoutError = { statusLogoutError = null },
-                    onRetrySync = {
-                        com.example.data.sync.OutboxSyncScheduler.retryNow()
-                        statusLogoutError = null
-                        android.widget.Toast.makeText(context, "تم إرسال طلب المزامنة الفورية", android.widget.Toast.LENGTH_SHORT).show()
-                    },
-                    onForceLogout = {
-                        scope.launch {
-                            val res = AccountSessionManager.logout(force = true)
-                            statusLogoutError = null
-                            if (res.isSuccess) {
-                                navController.navigate(Screen.Auth.route) {
-                                    popUpTo(0) { inclusive = true }
-                                }
-                            } else {
-                                statusLogoutError = res.exceptionOrNull()?.localizedMessage ?: "حدث خطأ أثناء تسجيل الخروج القسري"
-                            }
-                        }
-                    },
                     onLogout = {
                         scope.launch {
-                            val result = AccountSessionManager.logout()
-                            if (result.isSuccess) {
-                                navController.navigate(Screen.Auth.route) {
-                                    popUpTo(0) { inclusive = true }
-                                }
-                            } else {
-                                statusLogoutError = result.exceptionOrNull()?.localizedMessage ?: "حدث خطأ أثناء تسجيل الخروج"
+                            AccountSessionManager.logout()
+                            navController.navigate(Screen.Auth.route) {
+                                popUpTo(0) { inclusive = true }
                             }
                         }
                     }

@@ -22,11 +22,7 @@ object SupabaseClientProvider {
     }
 
     private fun getSettings(): Settings? {
-        val ctx = appContext ?: try {
-            com.example.data.local.DatabaseProvider.context
-        } catch (_: Throwable) {
-            null
-        }
+        val ctx = appContext
         return ctx?.let {
             try {
                 val encryptedSettings = com.example.data.auth.KeystoreEncryptedSettings(it)

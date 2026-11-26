@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.components.DeleteConfirmationBottomSheet
+import com.example.ui.components.OnlineStatusStateView
 import com.example.ui.student_detail.dialogs.AddEditAttendanceDialog
 import com.example.ui.student_detail.dialogs.AddEditExamDialog
 import com.example.ui.student_detail.dialogs.AddEditHomeworkDialog
@@ -392,6 +393,19 @@ fun StudentDetailScreen(
                     studentName = student.fullName,
                     onDismiss = viewModel::closeDeleteBottomSheet,
                     onConfirmDelete = viewModel::deleteStudent
+                )
+            }
+        } else {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+            ) {
+                OnlineStatusStateView(
+                    isOffline = uiState.isOfflineError,
+                    message = uiState.error ?: "عذراً، لم يتم العثور على بيانات الطالب.",
+                    onRetry = { viewModel.loadStudent(studentId) }
                 )
             }
         }

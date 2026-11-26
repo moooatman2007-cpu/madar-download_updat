@@ -17,6 +17,9 @@ import com.example.data.auth.AccountSessionManager
 import com.example.data.local.AppDatabase
 import com.example.data.local.DatabaseProvider
 import com.example.data.local.mapper.toEntity
+import com.example.core.model.SupabaseStudentInsertDto
+import com.example.core.model.UpdateStudentOnlineDto
+import com.example.data.repository.StudentRemoteDataSource
 import com.example.data.repository.SupabaseAttendanceRepository
 import com.example.data.repository.SupabaseExamRepository
 import com.example.data.repository.SupabaseGradeRepository
@@ -216,7 +219,15 @@ class StaleNetworkWritesProtectionTest {
         val requestTeacherId = teacherA
 
         // Repositories initialized
-        val studentRepo = SupabaseStudentRepository(database.studentDao(), database.outboxDao())
+        val fakeStudentRemote = object : StudentRemoteDataSource {
+            override suspend fun fetchStudents(teacherId: String): List<Student> = emptyList()
+            override suspend fun fetchStudentById(teacherId: String, studentId: String): Student? = null
+            override suspend fun fetchStudentByCode(teacherId: String, studentCode: String): Student? = null
+            override suspend fun insertStudent(dto: SupabaseStudentInsertDto): Student = error("offline")
+            override suspend fun updateStudent(teacherId: String, studentId: String, request: UpdateStudentOnlineDto): Student = error("offline")
+            override suspend fun softDeleteStudent(teacherId: String, studentId: String, deletedAtIso: String) = error("offline")
+        }
+        val studentRepo = SupabaseStudentRepository(remoteDataSource = fakeStudentRemote)
         val attendanceRepo = SupabaseAttendanceRepository(database.attendanceDao(), database.outboxDao(), database.studentDao())
         val examRepo = SupabaseExamRepository(database.examDao(), database.outboxDao())
         val recitationRepo = SupabaseRecitationRepository(database.recitationDao(), database.outboxDao())

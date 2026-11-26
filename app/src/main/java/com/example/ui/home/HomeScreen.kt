@@ -65,7 +65,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.example.core.model.SystemMonitoringAlert
-import com.example.ui.components.SyncStatusIndicator
+import com.example.ui.components.OnlineInlineErrorBanner
 import com.example.ui.monitoring.SystemMonitoringViewModel
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.DarkNavyCard
@@ -165,6 +165,17 @@ fun HomeScreen(
                             )
                         }
                     }
+                }
+            }
+
+            // Online Error Banner (with Retry)
+            if (uiState.errorMessage != null) {
+                item {
+                    OnlineInlineErrorBanner(
+                        isOffline = uiState.isOfflineError,
+                        message = uiState.errorMessage!!,
+                        onRetry = { viewModel.retry() }
+                    )
                 }
             }
 
@@ -602,7 +613,7 @@ fun HomeScreen(
             }
 
             // ==========================================
-            // 7. COMPACT SYNC STATUS
+            // 7. ONLINE-ONLY FOOTER BADGE
             // ==========================================
             item {
                 Surface(
@@ -618,10 +629,20 @@ fun HomeScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        SyncStatusIndicator(
-                            syncStatus = uiState.syncStatus,
-                            onRetry = { viewModel.retrySync() }
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = EmeraldGreen,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "متصل مباشرة بالسحابة",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
 
                         Text(
                             text = "مدار • v1.0.6",
