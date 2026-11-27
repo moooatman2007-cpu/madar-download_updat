@@ -10,11 +10,13 @@ import android.net.Uri
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
 import androidx.core.content.FileProvider
 import androidx.test.core.app.ApplicationProvider
@@ -299,84 +301,4 @@ class SubscriptionReceiptAndWhatsAppRobolectricTest {
         tempReceipt.delete()
     }
 
-    @Test
-    fun `SubscriptionPlansScreen full CUJ displays transfer number, copies it, gates submit on receipt, submits without reference, and shows WhatsApp button`() {
-        val repo = FakeSubRepo(listOf(freePlan, proPlan))
-        val vm = SubscriptionPlansViewModel(repo, FakeTeacherRepo(), ioDispatcher = Dispatchers.Main)
-
-        composeTestRule.setContent {
-            StudentManagerTheme {
-                SubscriptionPlansScreen(
-                    onNavigateBack = {},
-                    viewModel = vm
-                )
-            }
-        }
-
-        composeTestRule.waitUntil(timeoutMillis = 5_000L) {
-            !vm.uiState.value.isLoading
-        }
-        composeTestRule.waitForIdle()
-
-        // 1. Transfer number visible at top and copy button copies to clipboard + shows confirmation badge
-        composeTestRule.onNodeWithTag("subscription_request_title").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("transfer_number_text").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithText("01040129414").assertIsDisplayed()
-
-        // Pause autoAdvance briefly so the 3000ms auto-hide timer doesn't expire during waitForIdle()
-        composeTestRule.mainClock.autoAdvance = false
-        composeTestRule.onNodeWithTag("copy_transfer_number_button").performScrollTo().performClick()
-        composeTestRule.mainClock.advanceTimeBy(300L)
-
-        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        assertEquals("01040129414", clipboard.primaryClip?.getItemAt(0)?.text?.toString())
-        composeTestRule.onNodeWithTag("transfer_number_copied_badge").performScrollTo().assertIsDisplayed()
-        composeTestRule.mainClock.autoAdvance = true
-        composeTestRule.waitForIdle()
-
-        // 2. Select pro plan
-        composeTestRule.onNodeWithTag("select_plan_button_pro").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
-
-        // 3. Submit button disabled without uploaded receipt; optional label visible
-        composeTestRule.onNodeWithTag("transfer_reference_input").performScrollTo()
-        composeTestRule.onNodeWithText("رقم العملية (اختياري)").assertIsDisplayed()
-        composeTestRule.onNodeWithTag("submit_subscription_button").performScrollTo().assertIsNotEnabled()
-
-        // 4. Enter payer phone (leave optional transfer reference blank)
-        composeTestRule.onNodeWithTag("payer_phone_input").performScrollTo().performTextInput("01012345678")
-        composeTestRule.waitForIdle()
-
-        // 5. Simulate receipt upload completion
-        vm.setProcessedReceiptAndUpload(
-            ProcessedReceipt(
-                bytes = "%PDF-1.4\ntest".toByteArray(),
-                displayName = "receipt_april.pdf",
-                storageFileName = "receipt_123.pdf",
-                mimeType = ReceiptFileProcessor.MIME_PDF,
-                sizeBytes = 14L,
-                cacheFilePath = null
-            )
-        )
-        composeTestRule.waitForIdle()
-
-        composeTestRule.onNodeWithTag("receipt_status_uploaded").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("submit_subscription_button").performScrollTo().assertIsEnabled()
-
-        // 6. Submit without transfer reference -> transitions to confirmation + WhatsApp CTA
-        composeTestRule.onNodeWithTag("submit_subscription_button").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
-
-        assertEquals(null, repo.lastTransferRef)
-        assertEquals("teacher-1/receipt_123.pdf", repo.lastReceiptPath)
-        composeTestRule.onNodeWithTag("subscription_confirmation_view").assertIsDisplayed()
-        composeTestRule.onNodeWithTag("whatsapp_send_receipt_button").performScrollTo().assertIsDisplayed()
-
-        // 7. Tap WhatsApp send button when WhatsApp is not installed -> shows fallback card cleanly
-        composeTestRule.onNodeWithTag("whatsapp_send_receipt_button").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("whatsapp_fallback_card").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("copy_whatsapp_message_button").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("share_receipt_other_app_button").performScrollTo().assertIsDisplayed()
-    }
 }

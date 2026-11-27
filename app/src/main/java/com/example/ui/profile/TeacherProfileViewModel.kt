@@ -177,59 +177,84 @@ class TeacherProfileViewModel(
         _uiState.update { it.copy(educationalStage = value) }
     }
 
+    private var avatarUploadJob: kotlinx.coroutines.Job? = null
+    private var pendingAvatarReceipt: com.example.util.ProcessedReceipt? = null
+
     fun uploadAvatarFromUri(context: Context, uri: Uri) {
-        viewModelScope.launch {
+        if (_uiState.value.isUploadingAvatar) return
+        avatarUploadJob?.cancel()
+        avatarUploadJob = viewModelScope.launch {
             _uiState.update { it.copy(isUploadingAvatar = true, errorMessage = null, successMessage = null) }
             try {
-                val contentResolver = context.contentResolver
-                val mimeType = contentResolver.getType(uri) ?: "image/jpeg"
-                val inputStream = contentResolver.openInputStream(uri)
-                val bytes = inputStream?.readBytes()
-                inputStream?.close()
-
-                if (bytes == null || bytes.isEmpty()) {
-                    _uiState.update { it.copy(isUploadingAvatar = false, errorMessage = "تعذر قراءة ملف الصورة المحدد.") }
+                val processResult = com.example.util.ReceiptFileProcessor.processUri(context, uri)
+                val processed = processResult.getOrElse { error ->
+                    _uiState.update {
+                        it.copy(
+                            isUploadingAvatar = false,
+                            errorMessage = error.localizedMessage ?: "تعذر قراءة ملف الصورة المحدد."
+                        )
+                    }
                     return@launch
                 }
 
-                if (bytes.size > 5 * 1024 * 1024) {
-                    _uiState.update { it.copy(isUploadingAvatar = false, errorMessage = "حجم الصورة يتجاوز الحد المسموح به (5 ميجابايت).") }
+                if (processed.isPdf) {
+                    com.example.util.ReceiptFileProcessor.cleanupCacheFile(processed.cacheFilePath)
+                    _uiState.update {
+                        it.copy(
+                            isUploadingAvatar = false,
+                            errorMessage = "يرجى اختيار صورة (JPG, PNG, WEBP) وليس ملف PDF."
+                        )
+                    }
                     return@launch
                 }
 
-                val extension = when {
-                    mimeType.contains("png", ignoreCase = true) -> "png"
-                    mimeType.contains("webp", ignoreCase = true) -> "webp"
-                    mimeType.contains("gif", ignoreCase = true) -> "gif"
-                    else -> "jpg"
-                }
-
-                val fileName = "avatar_${System.currentTimeMillis()}.$extension"
-                val result = teacherRepository.uploadAvatar(bytes, fileName, mimeType)
-
-                result.onSuccess { url ->
-                    _uiState.update { 
-                        it.copy(
-                            avatarUrl = url,
-                            isUploadingAvatar = false,
-                            successMessage = "تم رفع الصورة بنجاح"
-                        ) 
-                    }
-                }.onFailure { error ->
-                    _uiState.update { 
-                        it.copy(
-                            isUploadingAvatar = false,
-                            errorMessage = error.localizedMessage ?: "حدث خطأ أثناء رفع الصورة."
-                        ) 
-                    }
-                }
+                pendingAvatarReceipt = processed
+                performAvatarUpload(processed)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                _uiState.update { 
+                _uiState.update {
                     it.copy(
                         isUploadingAvatar = false,
                         errorMessage = "حدث خطأ غير متوقع أثناء المعالجة: ${e.localizedMessage}"
-                    ) 
+                    )
                 }
+            }
+        }
+    }
+
+    fun retryAvatarUpload() {
+        val pending = pendingAvatarReceipt ?: return
+        if (_uiState.value.isUploadingAvatar) return
+        avatarUploadJob?.cancel()
+        avatarUploadJob = viewModelScope.launch {
+            _uiState.update { it.copy(isUploadingAvatar = true, errorMessage = null, successMessage = null) }
+            performAvatarUpload(pending)
+        }
+    }
+
+    private suspend fun performAvatarUpload(processed: com.example.util.ProcessedReceipt) {
+        val result = teacherRepository.uploadAvatar(
+            bytes = processed.bytes,
+            fileName = processed.storageFileName,
+            mimeType = processed.mimeType
+        )
+        result.onSuccess { url ->
+            com.example.util.ReceiptFileProcessor.cleanupCacheFile(processed.cacheFilePath)
+            pendingAvatarReceipt = null
+            _uiState.update {
+                it.copy(
+                    avatarUrl = url,
+                    isUploadingAvatar = false,
+                    successMessage = "تم رفع الصورة بنجاح"
+                )
+            }
+        }.onFailure { error ->
+            _uiState.update {
+                it.copy(
+                    isUploadingAvatar = false,
+                    errorMessage = error.localizedMessage ?: "حدث خطأ أثناء رفع الصورة."
+                )
             }
         }
     }
