@@ -10,6 +10,10 @@ import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.storage.storage
+import com.example.util.isOfflineOrNetworkError
+import io.ktor.http.ContentType
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -183,12 +187,52 @@ class SupabaseTeacherRepository(
         val teacherId = resolveActiveTeacherId()
             ?: return@withContext Result.failure(IllegalStateException("جلسة تسجيل الدخول غير صحيحة أو انتهت."))
 
+        if (bytes.isEmpty()) {
+            return@withContext Result.failure(IllegalArgumentException("ملف الصورة فارغ أو تالف."))
+        }
+        if (bytes.size > com.example.util.ReceiptFileProcessor.MAX_UPLOAD_BYTES) {
+            return@withContext Result.failure(IllegalArgumentException("حجم الصورة يتجاوز الحد المسموح به (5 ميجابايت)."))
+        }
+
+        val normalizedMime = mimeType.lowercase().trim()
+        val resolvedContentType = when (normalizedMime) {
+            "image/jpeg", "image/jpg" -> ContentType.Image.JPEG
+            "image/png" -> ContentType.Image.PNG
+            "image/webp" -> ContentType.parse("image/webp")
+            else -> return@withContext Result.failure(
+                IllegalArgumentException("نوع الملف غير مدعوم. يرجى اختيار صورة (JPG, PNG, WEBP).")
+            )
+        }
+
+        val expectedExt = when (normalizedMime) {
+            "image/png" -> "png"
+            "image/webp" -> "webp"
+            else -> "jpg"
+        }
+        val cleanName = fileName
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .trim('_')
+            .let { base ->
+                if (base.isBlank()) {
+                    com.example.util.ReceiptFileProcessor.buildSafeStorageFileName(expectedExt)
+                } else if (base.contains('.')) {
+                    base
+                } else {
+                    "$base.$expectedExt"
+                }
+            }
+
         try {
             val bucket = client.storage.from("teacher-avatars")
-            val filePath = "$teacherId/$fileName"
+            val filePath = "$teacherId/$cleanName"
 
-            bucket.upload(filePath, bytes) {
-                upsert = true
+            withTimeout(45_000L) {
+                bucket.upload(filePath, bytes) {
+                    upsert = false
+                    contentType = resolvedContentType
+                }
             }
             if (!isStillAuthorized(teacherId)) {
                 clearCache()
@@ -196,12 +240,29 @@ class SupabaseTeacherRepository(
             }
             val publicUrl = bucket.publicUrl(filePath)
             Result.success(publicUrl)
+        } catch (_: TimeoutCancellationException) {
+            Result.failure(Exception("انتهت مهلة رفع الصورة. يرجى التحقق من سرعة الإنترنت والمحاولة مرة أخرى."))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.e("SupabaseTeacherRepo", "uploadAvatar failed: ${e.message}", e)
-            val rawMsg = e.localizedMessage ?: e.message ?: e.toString()
-            Result.failure(Exception("فشل رفع الصورة: $rawMsg"))
+            val msg = e.message?.lowercase().orEmpty()
+            val userMsg = when {
+                msg.contains("401") || msg.contains("unauthorized") || msg.contains("jwt") ->
+                    "انتهت الجلسة. يرجى تسجيل الدخول مرة أخرى."
+                msg.contains("403") || msg.contains("forbidden") || msg.contains("policy") || msg.contains("rls") ->
+                    "لا توجد صلاحية لرفع الصورة الشخصية."
+                msg.contains("404") || msg.contains("not found") ->
+                    "مجلد تخزين الصور غير موجود."
+                msg.contains("413") || msg.contains("too large") || msg.contains("payload") ->
+                    "حجم الصورة يتجاوز الحد المسموح به."
+                msg.contains("429") || msg.contains("too many") ->
+                    "تم إرسال طلبات كثيرة. يرجى الانتظار قليلاً والمحاولة مرة أخرى."
+                e.isOfflineOrNetworkError() ->
+                    "تعذر الاتصال بالإنترنت. يرجى التحقق من الشبكة والمحاولة مرة أخرى."
+                else -> "فشل رفع الصورة: ${e.localizedMessage ?: e.message ?: "خطأ غير معروف"}"
+            }
+            Result.failure(Exception(userMsg, e))
         }
     }
 
